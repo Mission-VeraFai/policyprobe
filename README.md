@@ -1,5 +1,4 @@
-
-# PolicyProbe trigge
+# PolicyProbe trigger
 
 **AI-powered policy evaluation and remediation demo application**
 
