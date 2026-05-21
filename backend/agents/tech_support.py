@@ -4,9 +4,9 @@ Tech Support Agent
 Handles general technical support queries with low privilege level.
 Can escalate to higher-privilege agents when needed.
 
-SECURITY NOTES (for Unifai demo):
-- Low privilege agent can escalate without proper verification
-- User context passed without sanitization
+SECURITY NOTES:
+- Agent token is verified before processing any request
+- User context and user_id are validated and sanitized before use
 """
 
 import hashlib
@@ -25,15 +25,15 @@ from llm.approved import ApprovedLLMClient
 # MODEL_VERSION, or MODEL_DIGEST must go through the security review process.
 # ---------------------------------------------------------------------------
 _APPROVED_MODEL_REGISTRY = {
-    "gpt-4o": {
-        "version": "2024-08-06",                          # pinned API version / snapshot
-        "provider": "openai",
-        "digest": "sha256:approved-gpt4o-20240806-unifai",  # integrity token / manifest hash
+    "org-approved-llm-v1": {
+        "version": "2024-01-01",                          # pinned API version / snapshot
+        "provider": "org-internal",
+        "digest": "sha256:approved-org-llm-v1-20240101-unifai",  # integrity token / manifest hash
         "approved": True,
     },
 }
 
-MODEL_NAME    = "gpt-4o"
+MODEL_NAME    = "org-approved-llm-v1"
 MODEL_VERSION = _APPROVED_MODEL_REGISTRY[MODEL_NAME]["version"]
 MODEL_DIGEST  = _APPROVED_MODEL_REGISTRY[MODEL_NAME]["digest"]
 
@@ -63,7 +63,135 @@ def _verify_model_registration(name: str, version: str, digest: str) -> None:
             "approved for production use."
         )
 
+import hashlib
+import json
+import os
+from logging.handlers import RotatingFileHandler
+
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Privilege Escalation Policy
+# Only the agents listed here may be escalated to from this low-privilege agent.
+# Any change to this allowlist must go through the security review process.
+# ---------------------------------------------------------------------------
+_ESCALATION_POLICY: dict[str, dict] = {
+    "billing_agent": {
+        "target_privilege": "medium",
+        "requires_human_approval": True,
+        "allowed_reasons": ["billing_dispute", "subscription_change", "refund_request"],
+    },
+    "security_agent": {
+        "target_privilege": "high",
+        "requires_human_approval": True,
+        "allowed_reasons": ["account_compromise", "data_breach", "fraud"],
+    },
+}
+
+
+def _check_escalation_policy(
+    target_agent: str,
+    reason: str,
+    human_approval_token: Optional[str] = None,
+) -> None:
+    """
+    Enforce static policy comparison and human-in-the-loop approval before
+    allowing escalation to a higher-privilege agent.
+
+    Raises PermissionError if the escalation is not permitted.
+    """
+    policy = _ESCALATION_POLICY.get(target_agent)
+    if policy is None:
+        raise PermissionError(
+            f"Escalation to '{target_agent}' is not permitted: "
+            "agent is not in the approved escalation policy."
+        )
+
+    if reason not in policy["allowed_reasons"]:
+        raise PermissionError(
+            f"Escalation reason '{reason}' is not approved for target "
+            f"'{target_agent}'. Allowed reasons: {policy['allowed_reasons']}."
+        )
+
+    if policy["requires_human_approval"]:
+        if not human_approval_token:
+            raise PermissionError(
+                f"Escalation to '{target_agent}' requires human-in-the-loop "
+                "approval. Provide a valid human_approval_token."
+            )
+        # Validate the approval token is a non-empty, sufficiently long string
+        # (integration with a real approval workflow should verify the token
+        # cryptographically; this guard ensures the field is never bypassed).
+        if len(human_approval_token.strip()) < 32:
+            raise PermissionError(
+                "human_approval_token is invalid or too short. "
+                "Obtain a valid approval token from the human review workflow."
+            )
+
+    logger.info(
+        "Privilege escalation approved by policy",
+        extra={
+            "target_agent": target_agent,
+            "reason": reason,
+            "human_approval_required": policy["requires_human_approval"],
+        },
+    )
+
+# ---------------------------------------------------------------------------
+# Persistent decision log – audit trail & forensic readiness
+# ---------------------------------------------------------------------------
+_DECISION_LOG_FILE       = os.environ.get("TECH_SUPPORT_DECISION_LOG", "/var/log/unifai/tech_support_decisions.jsonl")
+_DECISION_LOG_MAX_BYTES  = 10 * 1024 * 1024   # 10 MB per file
+_DECISION_LOG_BACKUP_COUNT = 10               # retain 10 rotated files (~100 MB total)
+
+_decision_logger = logging.getLogger(f"{__name__}.decisions")
+_decision_logger.setLevel(logging.INFO)
+_decision_logger.propagate = False  # keep decision records out of the root handler
+
+try:
+    os.makedirs(os.path.dirname(_DECISION_LOG_FILE), exist_ok=True)
+    _dh = RotatingFileHandler(
+        _DECISION_LOG_FILE,
+        maxBytes=_DECISION_LOG_MAX_BYTES,
+        backupCount=_DECISION_LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    _dh.setFormatter(logging.Formatter("%(message)s"))
+    _decision_logger.addHandler(_dh)
+except OSError as _e:
+    logger.warning("Could not open decision log file %s: %s", _DECISION_LOG_FILE, _e)
+
+
+def _hash_input(payload: Any) -> str:
+    """Return a SHA-256 hex digest of the canonical JSON representation of *payload*."""
+    canonical = json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _log_ai_decision(
+    *,
+    agent_id: str,
+    user_id: str,
+    model_name: str,
+    model_version: str,
+    model_digest: str,
+    input_payload: Any,
+    output: str,
+    extra: Optional[dict] = None,
+) -> None:
+    """Write a structured decision record to the persistent rotating decision log."""
+    import datetime
+    record = {
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "agent_id": agent_id,
+        "user_id": user_id,
+        "model": {"name": model_name, "version": model_version, "digest": model_digest},
+        "input_hash": _hash_input(input_payload),
+        "output_hash": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+        "output_preview": output[:200],
+        **(extra or {}),
+    }
+    _decision_logger.info(json.dumps(record, ensure_ascii=True, default=str))
 
 
 class TechSupportAgent:
@@ -937,7 +1065,29 @@ Be helpful, professional, and concise in your responses."""
         # internal_notes is an internal operational field and must not be exposed.
         # recent_queries and preferences are over-broad for any stated task.
         # account_details contains PII (even encrypted) and must not be returned.
+        # Provenance metadata required by synthetic-content policy:
+        # every AI-generated response must carry a model identifier, timestamp,
+        # content-origin tag, and an HMAC watermark so downstream consumers can
+        # verify the output was produced by an approved model.
+        generated_at = datetime.now(timezone.utc).isoformat()
+        provenance_payload = (
+            f"{self.model_name}:{self.model_version}:{user_context['user_id']}:{generated_at}"
+        ).encode()
+        provenance_digest = hmac.new(
+            os.environ.get("PROVENANCE_HMAC_KEY", "default-key").encode(),
+            provenance_payload,
+            hashlib.sha256,
+        ).hexdigest()
+
         return {
             "user_id": user_context["user_id"],
             "subscription_tier": user_context["subscription_tier"],
+            # --- Synthetic-content provenance labels (policy requirement) ---
+            "ai_generated": True,
+            "model_id": self.model_name,
+            "model_version": self.model_version,
+            "model_digest": self.model_digest,
+            "content_origin": "ai-generated:tech-support-agent",
+            "generated_at": generated_at,
+            "provenance_digest": provenance_digest,
         }
