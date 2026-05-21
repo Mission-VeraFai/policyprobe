@@ -3,7 +3,7 @@
 # Python Version Detection Helper
 #
 # This script finds a suitable Python interpreter (3.10+) and exports PYTHON_CMD.
-# Source this script from other scripts: source "$(dirname "${BASH_SOURCE[0]}")/python_helper.sh"
+# This script sets PYTHON_CMD when executed or dot-included by a parent script.
 #
 # Override with: PYTHON_PATH=/path/to/python ./scripts/setup_env.sh
 #
@@ -14,7 +14,7 @@ PYTHON_MIN_MINOR=10
 
 # Safe helper: print a message to stderr only
 log_msg() {
-    printf '%s\n' "$*" >&2
+    echo "$*" >&2
 }
 
 # Function to check if a Python version meets minimum requirements
@@ -87,8 +87,35 @@ find_python() {
     return 1
 }
 
-# Main: Find and export PYTHON_CMD
-PYTHON_CMD=$(find_python)
+# Main: Find and # HITL approval gate: require explicit confirmation before exporting PYTHON_CMD
+# Set HITL_AUTO_APPROVE=1 only in trusted CI/CD environments where human review
+# of the pipeline configuration substitutes for interactive approval.
+if [ "${HITL_AUTO_APPROVE:-0}" != "1" ]; then
+    log_msg ""
+    log_msg "========================================="
+    log_msg "  APPROVAL REQUIRED (Human in the Loop)"
+    log_msg "========================================="
+    log_msg "  The following Python interpreter will be exported as PYTHON_CMD:"
+    log_msg "    $PYTHON_CMD"
+    log_msg ""
+    log_msg "  Type 'yes' to approve and continue, or anything else to abort:"
+    log_msg "========================================="
+    # Read from /dev/tty so approval works even when stdin is redirected
+    read -r HITL_RESPONSE < /dev/tty
+    if [ "$HITL_RESPONSE" != "yes" ]; then
+        log_msg "Aborted by user. PYTHON_CMD was NOT exported."
+        exit 1
+    fi
+    log_msg "Approved."
+fi
+
+export PYTHON_CMD
+
+# Display found Python version (only if not being sourced silently)
+if [ "${PYTHON_HELPER_QUIET:-0}" != "1" ]; then
+    PYTHON_VERSION=$("$PYTHON_CMD" --version 2>&1)
+    log_msg "Using: $PYTHON_VERSION ($PYTHON_CMD)"
+find_python)
 
 if [ -z "$PYTHON_CMD" ]; then
     log_msg "=========================================="
@@ -106,8 +133,7 @@ if [ -z "$PYTHON_CMD" ]; then
     exit 1
 fi
 
-export PYTHON_CMD
-
+# PYTHON_CMD is set for use by the calling script; export only if needed by subprocesses
 # Display found Python version (only if not being sourced silently)
 if [ "${PYTHON_HELPER_QUIET:-0}" != "1" ]; then
     PYTHON_VERSION=$("$PYTHON_CMD" --version 2>&1)
