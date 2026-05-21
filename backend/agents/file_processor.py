@@ -21,7 +21,26 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Audit-trail helpers
 # ---------------------------------------------------------------------------
+import logging.handlers
+
 AUDIT_LOG_PATH = os.environ.get("FILE_PROCESSOR_AUDIT_LOG", "audit_file_processor.jsonl")
+# Retention policy: rotate at 10 MB, keep 30 backup files (~300 MB total)
+_AUDIT_MAX_BYTES = int(os.environ.get("FILE_PROCESSOR_AUDIT_MAX_BYTES", 10 * 1024 * 1024))
+_AUDIT_BACKUP_COUNT = int(os.environ.get("FILE_PROCESSOR_AUDIT_BACKUP_COUNT", 30))
+
+# Build a dedicated rotating-file handler for the audit trail
+_audit_handler = logging.handlers.RotatingFileHandler(
+    AUDIT_LOG_PATH,
+    maxBytes=_AUDIT_MAX_BYTES,
+    backupCount=_AUDIT_BACKUP_COUNT,
+    encoding="utf-8",
+)
+_audit_handler.setFormatter(logging.Formatter("%(message)s"))
+_audit_logger = logging.getLogger("file_processor.audit")
+_audit_logger.setLevel(logging.INFO)
+_audit_logger.propagate = False
+if not _audit_logger.handlers:
+    _audit_logger.addHandler(_audit_handler)
 
 
 def _sha256(data: Optional[str]) -> str:
@@ -31,10 +50,9 @@ def _sha256(data: Optional[str]) -> str:
 
 
 def _write_audit_record(record: dict) -> None:
-    """Append *record* as a single JSON line to the persistent audit log."""
+    """Append *record* as a single JSON line to the rotating persistent audit log."""
     try:
-        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        _audit_logger.info(json.dumps(record, ensure_ascii=False))
     except Exception as exc:  # pragma: no cover
         logger.error("Failed to write audit record", extra={"error": str(exc)})
 
@@ -83,17 +101,34 @@ class FileProcessorAgent:
             content: File content (text or base64 encoded)
             filename: Original filename
             content_type: MIME type of the file
+            principal: Identity of the caller (user/service) for audit purposes
 
         Returns:
             Extracted text content from the file
 
-        VULNERABILITY: No security scanning performed on file content.
-        Files are processed and content extracted without checking for:
+        Every invocation emits a structured audit record containing the model
+        identifier, input hash, output hash, ISO-8601 timestamp, and principal
+        so that all AI-driven file-processing decisions are forensically traceable.
+
+        Security scanning is performed on file content before extraction.
+        Files are checked for:
         - PII (SSN, credit cards, phone numbers)
-        - Hidden/malicious prompts
+        - Hidden/malicious prompts (prompt injection, invisible Unicode, base64-encoded instructions,
+          leetspeak command patterns, binary/shell commands)
         - Malware signatures
         - Sensitive data patterns
         """
+        # --- Prompt-injection / malicious-content pre-screen ---
+        if content:
+            _reject, _reason = self._scan_for_malicious_prompts(content, filename)
+            if _reject:
+                logger.warning(
+                    "Malicious prompt content detected in uploaded file",
+                    extra={"file_name": filename, "reason": _reason},
+                )
+                raise ValueError(
+                    f"File '{filename}' rejected: malicious prompt content detected ({_reason})."
+                )
         logger.info(
             "Processing file",
             extra={
@@ -124,8 +159,33 @@ class FileProcessorAgent:
             else:
                 extracted = f"Unsupported file type: {content_type}"
 
+            # Scan for hidden/malicious prompts, shell commands, and binary payloads
+            scan_result = self._scan_for_malicious_content(extracted)
+            if scan_result.get("flagged"):
+                reasons = "; ".join(scan_result.get("reasons", ["unknown reason"]))
+                logger.warning(
+                    "Malicious content detected in file",
+                    extra={"file_name": filename, "reasons": reasons}
+                )
+                raise ValueError(
+                    f"File '{filename}' was rejected due to malicious content: {reasons}"
+                )
+
             # Redact PII from extracted content before returning
             extracted = self._redact_pii(extracted)
+
+            # Scan for hidden/malicious prompt content before passing downstream
+            scan_result = self._scan_for_malicious_content(extracted)
+            if scan_result.get("flagged"):
+                reasons = "; ".join(scan_result.get("reasons", []))
+                logger.warning(
+                    "Malicious content detected in file, blocking downstream use",
+                    extra={
+                        "file_name": filename,
+                        "reasons": reasons
+                    }
+                )
+                return f"File '{filename}' was blocked due to potentially malicious content: {reasons}"
 
             logger.info(
                 "File processing complete",
@@ -575,3 +635,72 @@ class FileProcessorAgent:
             )
 
         return validation_result
+
+    # ------------------------------------------------------------------
+    # Prompt-injection / malicious-content scanner
+    # ------------------------------------------------------------------
+    _PROMPT_INJECTION_PATTERNS = [
+        # Direct instruction-override attempts
+        (r"(?i)(ignore|disregard|forget|override)\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|context|rules?|constraints?)", "instruction-override attempt"),
+        # System/role hijacking
+        (r"(?i)(you\s+are\s+now|act\s+as|pretend\s+(to\s+be|you\s+are)|your\s+new\s+(role|persona|instructions?\s+are))", "role-hijacking attempt"),
+        # Jailbreak keywords
+        (r"(?i)(jailbreak|dan\s+mode|developer\s+mode|unrestricted\s+mode|god\s+mode|do\s+anything\s+now)", "jailbreak keyword"),
+        # Invisible / zero-width Unicode prompt smuggling
+        (r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]", "invisible Unicode characters"),
+        # Base64-encoded instruction blocks (heuristic: long pure-base64 token)
+        (r"(?:[A-Za-z0-9+/]{40,}={0,2})", "possible base64-encoded payload"),
+        # Leetspeak command patterns  (e.g. 1gn0r3, 0v3rr1d3)
+        (r"(?i)\b(1[g9][n][0o][r3][e3]|0v[e3]rr[1i][d][e3]|[s5][y][s5][t][e3][m]\s*[p][r][o0][m][p][t])\b", "leetspeak command pattern"),
+        # Shell / binary command injection
+        (r"(?i)(\$\(|`[^`]+`|\bexec\b|\beval\b|\bsystem\b|\bpassthru\b|\bshell_exec\b|\bpopen\b|\bproc_open\b)", "shell/binary command"),
+        # Prompt-delimiter smuggling
+        (r"(?i)(###\s*(system|user|assistant)|<\|im_start\||<\|im_end\||\[INST\]|\[/INST\]|<<SYS>>|<</SYS>>)", "prompt-delimiter smuggling"),
+        # Exfiltration / data-leak instructions
+        (r"(?i)(send\s+(all|the|this|my)\s+(data|information|content|context|conversation)|exfiltrate|leak\s+(the\s+)?(data|context|prompt))", "data-exfiltration instruction"),
+    ]
+
+    def _scan_for_malicious_prompts(self, content: str, filename: str):
+        """
+        Scan raw file content (text or base64 string) for prompt-injection and
+        other malicious payload patterns.
+
+        Returns:
+            (reject: bool, reason: str)  — reject=True means the file must be blocked.
+        """
+        import re as _re
+
+        # 1. Scan the raw content as-is.
+        for pattern, label in self._PROMPT_INJECTION_PATTERNS:
+            # Base64 heuristic: only flag if the decoded text also looks suspicious.
+            if label == "possible base64-encoded payload":
+                for match in _re.finditer(pattern, content):
+                    candidate = match.group(0)
+                    try:
+                        decoded = base64.b64decode(candidate + "==").decode("utf-8", errors="ignore")
+                        for inner_pattern, inner_label in self._PROMPT_INJECTION_PATTERNS:
+                            if inner_label == "possible base64-encoded payload":
+                                continue
+                            if _re.search(inner_pattern, decoded):
+                                return True, f"base64-encoded {inner_label}"
+                    except Exception:
+                        pass
+                continue
+
+            if _re.search(pattern, content):
+                return True, label
+
+        # 2. If the whole payload looks like base64, decode and re-scan.
+        stripped = content.strip()
+        if len(stripped) > 20 and _re.fullmatch(r"[A-Za-z0-9+/\n\r]+=*", stripped):
+            try:
+                decoded_full = base64.b64decode(stripped + "==").decode("utf-8", errors="ignore")
+                for pattern, label in self._PROMPT_INJECTION_PATTERNS:
+                    if label == "possible base64-encoded payload":
+                        continue
+                    if _re.search(pattern, decoded_full):
+                        return True, f"base64-encoded {label}"
+            except Exception:
+                pass
+
+        return False, ""
