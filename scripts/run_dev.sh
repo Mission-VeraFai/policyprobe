@@ -20,20 +20,26 @@ echo ""
 
 # Find suitable Python interpreter (3.10+)
 # Source python helper only if it exists within the project root
-if [ -f "$PROJECT_ROOT/scripts/python_helper.sh" ]; then
-    . "$PROJECT_ROOT/scripts/python_helper.sh"
+HELPER_SCRIPT="$PROJECT_ROOT/scripts/python_helper.sh"
+case "$HELPER_SCRIPT" in
+    "$PROJECT_ROOT"/*) ;;
+    *) printf 'ERROR: python_helper.sh path escapes project root\n' >&2; exit 1 ;;
+esac
+if [ -f "$HELPER_SCRIPT" ] && [ ! -L "$HELPER_SCRIPT" ]; then
+    # shellcheck source=scripts/python_helper.sh
+    . "$HELPER_SCRIPT"
 else
-    printf 'ERROR: python_helper.sh not found at expected path\n' >&2
+    printf 'ERROR: python_helper.sh not found or is a symlink at expected path\n' >&2
     exit 1
 fi
 echo ""
 
 # Check for required environment variables
 if [ -z "$OPENROUTER_API_KEY" ]; then
-    echo "WARNING: OPENROUTER_API_KEY not set"
-    echo "The LLM features will not work without it."
-    echo "Set it with: export OPENROUTER_API_KEY=your_key_here"
-    echo ""
+    printf 'WARNING: OPENROUTER_API_KEY not set\n' >&2
+    printf 'The LLM features will not work without it.\n' >&2
+    printf 'Set it with: export OPENROUTER_API_KEY=your_key_here\n' >&2
+    printf '\n' >&2
 fi
 
 # Function to cleanup background processes on exit
@@ -56,14 +62,27 @@ echo "Starting Python backend..."
 cd "$PROJECT_ROOT/backend"
 
 # Check if virtual environment exists
-if [ ! -d ".venv" ]; then
+VENV_ACTIVATE="$PROJECT_ROOT/backend/.venv/bin/activate"
+if [ ! -d "$PROJECT_ROOT/backend/.venv" ]; then
     echo "Creating Python virtual environment..."
-    "$PYTHON_CMD" -m venv .venv
-    . .venv/bin/activate
+    "$PYTHON_CMD" -m venv "$PROJECT_ROOT/backend/.venv"
+    if [ -f "$VENV_ACTIVATE" ] && [ ! -L "$VENV_ACTIVATE" ]; then
+        # shellcheck source=/dev/null
+        . "$VENV_ACTIVATE"
+    else
+        printf 'ERROR: venv activate script missing or is a symlink\n' >&2
+        exit 1
+    fi
     printf 'Installing Python dependencies...\n'
     pip install -r requirements.txt
 else
-    . .venv/bin/activate
+    if [ -f "$VENV_ACTIVATE" ] && [ ! -L "$VENV_ACTIVATE" ]; then
+        # shellcheck source=/dev/null
+        . "$VENV_ACTIVATE"
+    else
+        printf 'ERROR: venv activate script missing or is a symlink\n' >&2
+        exit 1
+    fi
 fi
 
 # Start uvicorn in background
@@ -94,7 +113,12 @@ elif [ ! -f "node_modules/.bin/next" ]; then
         kill $BACKEND_PID 2>/dev/null || true
         exit 1
     fi
-    rm -rf node_modules
+    TARGET_DIR="$PROJECT_ROOT/frontend/node_modules"
+    case "$TARGET_DIR" in
+        "$PROJECT_ROOT/frontend/"*) ;;
+        *) printf 'ERROR: node_modules path escapes frontend directory\n' >&2; kill "$BACKEND_PID" 2>/dev/null || true; exit 1 ;;
+    esac
+    rm -rf -- "$TARGET_DIR"
     npm install
 fi
 
