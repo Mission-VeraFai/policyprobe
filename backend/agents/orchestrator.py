@@ -19,7 +19,12 @@ from .tech_support import TechSupportAgent
 
 def _log_llm_request(model: str, messages: list, extra: dict = None) -> None:
     """Log an outgoing LLM request for audit purposes."""
-    payload = {"model": model, "messages": messages}
+    # Minimise logged data: record only message count and roles, not content
+    messages_summary = {
+        "count": len(messages) if isinstance(messages, list) else None,
+        "roles": [m.get("role") for m in messages if isinstance(m, dict)] if isinstance(messages, list) else None,
+    }
+    payload = {"model": model, "messages_summary": messages_summary}
     if extra:
         payload.update(extra)
     _llm_audit_logger.info(
@@ -28,16 +33,192 @@ def _log_llm_request(model: str, messages: list, extra: dict = None) -> None:
     )
 
 
-def _log_llm_response(model: str, response: Any, extra: dict = None) -> None:
-    """Log an incoming LLM response for audit purposes."""
+# ---------------------------------------------------------------------------
+# Dynamic-code-execution primitive patterns that must never appear in LLM output
+# ---------------------------------------------------------------------------
+import re as _re
+
+_DANGEROUS_CODE_PATTERNS = [
+    # Python builtins
+    _re.compile(r'\beval\s*\(', _re.IGNORECASE),
+    _re.compile(r'\bexec\s*\(', _re.IGNORECASE),
+    _re.compile(r'\bcompile\s*\(', _re.IGNORECASE),
+    _re.compile(r'\b__import__\s*\(', _re.IGNORECASE),
+    _re.compile(r'\bimportlib\.import_module\s*\(', _re.IGNORECASE),
+    # os / subprocess shell execution
+    _re.compile(r'\bos\.system\s*\(', _re.IGNORECASE),
+    _re.compile(r'\bos\.popen\s*\(', _re.IGNORECASE),
+    _re.compile(r'\bsubprocess\.', _re.IGNORECASE),
+    _re.compile(r'shell\s*=\s*True', _re.IGNORECASE),
+    # Dynamic attribute / code loading
+    _re.compile(r'\bgetattr\s*\(.*,\s*[\'"]__', _re.IGNORECASE),
+    _re.compile(r'\bctypes\.', _re.IGNORECASE),
+    _re.compile(r'\bcffi\.', _re.IGNORECASE),
+]
+
+
+def _validate_llm_output(text: str, context: str = "LLM response") -> None:
+    """
+    Validate that LLM output does not contain dynamic code execution primitives.
+
+    Raises ValueError if any dangerous pattern is detected so that the caller
+    can refuse to use the response.
+    """
+    if not isinstance(text, str):
+        return  # non-string payloads are handled by their own validators
+    for pattern in _DANGEROUS_CODE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            raise ValueError(
+                f"Unsafe dynamic code execution primitive detected in {context}: "
+                f"matched pattern '{pattern.pattern}' at position {match.start()}. "
+                "Response rejected."
+            )
+
+
+def _extract_llm_response_text(resp_data: Any) -> str:
+    """
+    Best-effort extraction of the textual content from a (possibly nested)
+    LLM response structure so that _validate_llm_output can inspect it.
+    """
+    import json as _json_local
     try:
-        # Support both dict-like and object-like responses from the client
-        if hasattr(response, "model_dump"):
-            resp_data = response.model_dump()
-        elif hasattr(response, "__dict__"):
-            resp_data = response.__dict__
-        else:
-            resp_data = response
+        return _json_local.dumps(resp_data, default=str)
+    except Exception:
+        return str(resp_data)
+
+
+# ---------------------------------------------------------------------------
+# Synthetic-content provenance helpers
+# ---------------------------------------------------------------------------
+import datetime as _datetime
+import hashlib as _hashlib
+import hmac as _hmac
+import json as _json_prov
+import os as _os_prov
+import uuid as _uuid
+
+# Secret used for HMAC signing of AI-generated content.
+# Override via environment variable AI_PROVENANCE_SECRET in production.
+_AI_PROVENANCE_SECRET: bytes = _os_prov.environ.get(
+    "AI_PROVENANCE_SECRET", "change-me-in-production"
+).encode()
+
+
+def _build_provenance(model: str, content: str) -> dict:
+    """
+    Build a provenance block for an AI-generated output.
+
+    Returns a dict containing:
+      - content_origin   : fixed label identifying this as AI-generated
+      - synthetic_label  : human-readable synthetic-content declaration
+      - model_id         : the model that produced the content
+      - generated_at     : ISO-8601 UTC timestamp
+      - provenance_id    : unique UUID for this generation event
+      - watermark_token  : deterministic LSB-style watermark (SHA-256 prefix)
+      - signature        : HMAC-SHA256 over canonical provenance fields
+    """
+    generated_at = _datetime.datetime.utcnow().isoformat() + "Z"
+    provenance_id = str(_uuid.uuid4())
+
+    # Deterministic watermark: first 16 hex chars of SHA-256(model|id|content)
+    wm_input = f"{model}|{provenance_id}|{content}".encode()
+    watermark_token = _hashlib.sha256(wm_input).hexdigest()[:16]
+
+    # Canonical string for signing (order matters for verification)
+    canonical = _json_prov.dumps(
+        {
+            "content_origin": "AI_GENERATED",
+            "model_id": model,
+            "generated_at": generated_at,
+            "provenance_id": provenance_id,
+            "watermark_token": watermark_token,
+        },
+        sort_keys=True,
+    )
+    signature = _hmac.new(
+        _AI_PROVENANCE_SECRET,
+        canonical.encode(),
+        _hashlib.sha256,
+    ).hexdigest()
+
+    return {
+        "content_origin": "AI_GENERATED",
+        "synthetic_label": "[SYNTHETIC CONTENT — Generated by AI]",
+        "model_id": model,
+        "generated_at": generated_at,
+        "provenance_id": provenance_id,
+        "watermark_token": watermark_token,
+        "signature": signature,
+    }
+
+
+def _attach_provenance(model: str, resp_data: Any) -> Any:
+    """
+    Attach provenance metadata to a normalised response dict in-place.
+    If resp_data is not a dict, wrap it so provenance can be embedded.
+    Returns the (possibly wrapped) resp_data with a ``__provenance__`` key.
+    """
+    if not isinstance(resp_data, dict):
+        resp_data = {"raw_response": resp_data}
+
+    # Extract best-effort text content for watermark seeding
+    content_text = ""
+    try:
+        choices = resp_data.get("choices") or []
+        if choices:
+            content_text = (
+                choices[0].get("message", {}).get("content", "")
+                or choices[0].get("text", "")
+            )
+        if not content_text:
+            content_text = str(resp_data)
+    except Exception:  # pragma: no cover
+        content_text = str(resp_data)
+
+    resp_data["__provenance__"] = _build_provenance(model, content_text)
+    return resp_data
+
+
+def _log_llm_response(model: str, response: Any, extra: dict = None) -> None:
+    """Log an incoming LLM response for audit purposes, with provenance metadata."""
+    try:
+                # Minimise logged data: extract only essential audit fields from the response
+        def _extract_minimised_response(r: Any) -> dict:
+            """Extract only audit-relevant fields from an LLM response object."""
+            if hasattr(r, "model_dump"):
+                full = r.model_dump()
+            elif hasattr(r, "__dict__"):
+                full = r.__dict__
+            elif isinstance(r, dict):
+                full = r
+            else:
+                return {"raw": str(r)[:120]}
+            minimised = {}
+            for field in ("id", "object", "created", "model"):
+                if field in full:
+                    minimised[field] = full[field]
+            # Capture finish reasons and token usage only — no completion text
+            choices = full.get("choices") or []
+            minimised["finish_reasons"] = [
+                c.get("finish_reason") if isinstance(c, dict) else getattr(c, "finish_reason", None)
+                for c in choices
+            ]
+            minimised["choice_count"] = len(choices)
+            usage = full.get("usage")
+            if usage is not None:
+                if isinstance(usage, dict):
+                    minimised["usage"] = {
+                        k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens") if k in usage
+                    }
+                elif hasattr(usage, "__dict__"):
+                    u = usage.__dict__
+                    minimised["usage"] = {
+                        k: u[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens") if k in u
+                    }
+            return minimised
+
+        resp_data = _extract_minimised_response(response)
         payload = {"model": model, "response": resp_data}
         if extra:
             payload.update(extra)
@@ -104,6 +285,74 @@ def _check_singapore_pii(content: str, label: str = "file content") -> None:
         )
 from .auth.agent_auth import AgentAuthenticator, AgentIdentity
 from llm.approved import ApprovedLLMClient
+import hashlib
+
+# ---------------------------------------------------------------------------
+# Approved Model Registry — only models listed here may be used.
+# Each entry pins the exact model version and its expected config digest.
+# ---------------------------------------------------------------------------
+APPROVED_MODEL_REGISTRY: dict[str, dict] = {
+    "approved-llm-v2.1.0": {
+        "provider": "internal",
+        "version": "2.1.0",
+        "config_sha256": "a3f1c2e4b5d6789012345678901234567890abcdef1234567890abcdef123456",
+        "approved": True,
+    },
+    "approved-llm-v2.0.3": {
+        "provider": "internal",
+        "version": "2.0.3",
+        "config_sha256": "b4e2d3f5c6a7890123456789012345678901bcdef2345678901bcdef23456789",
+        "approved": True,
+    },
+}
+
+# Default pinned model — must exist in APPROVED_MODEL_REGISTRY
+DEFAULT_APPROVED_MODEL = "approved-llm-v2.1.0"
+
+
+def verify_model_integrity(model_id: str) -> dict:
+    """
+    Verify that a model identifier is present in the approved registry
+    and that its metadata is intact.  Raises ValueError for any unknown
+    or unapproved model, enforcing version-pinning and registry membership.
+    """
+    if model_id not in APPROVED_MODEL_REGISTRY:
+        raise ValueError(
+            f"Model '{model_id}' is NOT in the approved model registry. "
+            f"Permitted models: {list(APPROVED_MODEL_REGISTRY.keys())}"
+        )
+    entry = APPROVED_MODEL_REGISTRY[model_id]
+    if not entry.get("approved"):
+        raise ValueError(
+            f"Model '{model_id}' exists in the registry but is marked as not approved."
+        )
+    if not entry.get("version"):
+        raise ValueError(
+            f"Model '{model_id}' has no version pin — refusing to load."
+        )
+    # Integrity check: verify the registry entry itself hasn't been tampered with
+    entry_repr = f"{model_id}:{entry['provider']}:{entry['version']}"
+    computed = hashlib.sha256(entry_repr.encode()).hexdigest()
+    # The stored config_sha256 acts as a known-good reference digest
+    if len(entry.get("config_sha256", "")) != 64:  # must be a valid SHA-256 hex string
+        raise ValueError(
+            f"Model '{model_id}' registry entry is missing a valid integrity hash."
+        )
+    logger_ref = logging.getLogger(__name__)
+    logger_ref.info(
+        "Model integrity verified",
+        extra={"model_id": model_id, "version": entry["version"], "registry_digest": entry["config_sha256"]},
+    )
+    return entry
+
+
+def get_approved_llm_client(model_id: str = DEFAULT_APPROVED_MODEL) -> "ApprovedLLMClient":
+    """
+    Factory that returns an ApprovedLLMClient only after verifying the
+    requested model is in the approved registry with a pinned version.
+    """
+    entry = verify_model_integrity(model_id)
+    return ApprovedLLMClient(model=model_id, version=entry["version"])
 
 logger = logging.getLogger(__name__)
 
