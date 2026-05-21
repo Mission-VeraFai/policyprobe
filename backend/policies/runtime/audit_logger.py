@@ -117,8 +117,13 @@ class AuditLogger:
             input_hash = hashlib.sha256(
                 json.dumps(details, sort_keys=True, default=str).encode()
             ).hexdigest()
-        except Exception:
-            input_hash = "hash-error"
+        except Exception as hash_err:
+            logger.error(
+                "Audit hashing failure for event '%s': %s", event_type, hash_err
+            )
+            raise RuntimeError(
+                f"Audit hashing failure for event '{event_type}': {hash_err}"
+            ) from hash_err
 
         import uuid as _uuid
         event = {
