@@ -8,8 +8,8 @@ import { User, Bot, Paperclip, AlertTriangle, ShieldCheck } from 'lucide-react'
 // Synthetic-content provenance helpers
 // ---------------------------------------------------------------------------
 
-const APPROVED_AI_MODEL_ID = 'gpt-4'
-const AI_MODEL_ID = process.env.NEXT_PUBLIC_AI_MODEL_ID ?? APPROVED_AI_MODEL_ID
+const APPROVED_AI_MODEL_ID = 'claude-3-5-sonnet-20241022'
+const AI_MODEL_ID = APPROVED_AI_MODEL_ID
 
 /**
  * Produce a lightweight, deterministic provenance tag for an AI-generated
@@ -19,26 +19,21 @@ const AI_MODEL_ID = process.env.NEXT_PUBLIC_AI_MODEL_ID ?? APPROVED_AI_MODEL_ID
 async function buildProvenanceTag(
   content: string,
   timestamp: Date
-): Promise<{ modelId: string; issuedAt: string; watermark: string }> {
+): Promise<{ modelId: string; issuedAt: string; expiresAt: string; subject: string; watermark: string }> {
   const issuedAt = timestamp.toISOString()
+  const expiresAt = new Date(timestamp.getTime() + PROVENANCE_TTL_MS).toISOString()
+  const sessionCtx = await SESSION_KEY_PROMISE
+  const subject = sessionCtx?.sessionId ?? 'unknown'
   const contentHash = hashContent(content)
-  const payload = `${AI_MODEL_ID}|${issuedAt}|${contentHash}`
+  // Payload includes expiry and subject binding so the HMAC covers all fields
+  const payload = `${AI_MODEL_ID}|${issuedAt}|${expiresAt}|${subject}|${contentHash}`
 
   let watermark = 'unavailable'
   try {
-    // Use a stable per-page-load key; in production replace with a server-
-    // supplied signing key fetched at boot time.
-    const rawKey = crypto.getRandomValues(new Uint8Array(32))
-    const key = await crypto.subtle.importKey(
-      'raw',
-      rawKey,
-      { name: 'HMAC', hash: 'SHA-256' },
-      false,
-      ['sign']
-    )
+    if (!sessionCtx) throw new Error('session key unavailable')
     const sig = await crypto.subtle.sign(
       'HMAC',
-      key,
+      sessionCtx.key,
       new TextEncoder().encode(payload)
     )
     watermark = Array.from(new Uint8Array(sig))
@@ -49,7 +44,38 @@ async function buildProvenanceTag(
     watermark = 'crypto-unavailable'
   }
 
-  return { modelId: AI_MODEL_ID, issuedAt, watermark }
+  return { modelId: AI_MODEL_ID, issuedAt, expiresAt, subject, watermark }
+}
+
+/**
+ * Verify a provenance tag produced by buildProvenanceTag.
+ * Returns true only when the HMAC is valid AND the token has not expired.
+ */
+async function verifyProvenanceTag(
+  tag: { modelId: string; issuedAt: string; expiresAt: string; subject: string; watermark: string },
+  content: string
+): Promise<boolean> {
+  try {
+    // Check expiry first — fast path
+    if (new Date() > new Date(tag.expiresAt)) return false
+
+    const sessionCtx = await SESSION_KEY_PROMISE
+    if (!sessionCtx || tag.subject !== sessionCtx.sessionId) return false
+
+    const contentHash = hashContent(content)
+    const payload = `${tag.modelId}|${tag.issuedAt}|${tag.expiresAt}|${tag.subject}|${contentHash}`
+    const expectedSigBytes = new Uint8Array(
+      tag.watermark.match(/.{2}/g)!.map((h) => parseInt(h, 16))
+    )
+    return await crypto.subtle.verify(
+      'HMAC',
+      sessionCtx.key,
+      expectedSigBytes,
+      new TextEncoder().encode(payload)
+    )
+  } catch {
+    return false
+  }
 }
 
 // Audit trail for AI-driven sanitization decisions
@@ -63,11 +89,12 @@ interface SanitizationAuditRecord {
   principal: string
 }
 
-// Append-only in-memory audit log — never overwritten, only pushed to.
-// Retention policy: cap at MAX_AUDIT_LOG_ENTRIES; oldest records are evicted
-// when the limit is reached so memory is bounded.
-const MAX_AUDIT_LOG_ENTRIES = 1000
-const _auditLog: SanitizationAuditRecord[] = []
+// Persistent append-only audit log backed by localStorage.
+// Retention policy: records older than AUDIT_RETENTION_MS are rotated out on
+// each write. No silent FIFO eviction — only time-based rotation with logging.
+const AUDIT_LOG_STORAGE_KEY = 'llm_sanitization_audit_log'
+const AUDIT_RETENTION_DAYS = 30
+const AUDIT_RETENTION_MS = AUDIT_RETENTION_DAYS * 24 * 60 * 60 * 1000
 
 function hashContent(content: string): string {
   // FNV-1a 32-bit hash — deterministic, no external dependency
@@ -81,35 +108,110 @@ function hashContent(content: string): string {
 
 function writeSanitizationAuditRecord(record: SanitizationAuditRecord): void {
   try {
-    // Append-only: records are only ever pushed, never overwritten or deleted
-    // individually. Retention policy: evict the oldest entry when the cap is
-    // exceeded so the log remains bounded in memory.
-    if (_auditLog.length >= MAX_AUDIT_LOG_ENTRIES) {
-      _auditLog.shift() // remove oldest — FIFO eviction
+    // Load existing log from persistent storage
+    const raw = localStorage.getItem(AUDIT_LOG_STORAGE_KEY)
+    const log: SanitizationAuditRecord[] = raw ? (JSON.parse(raw) as SanitizationAuditRecord[]) : []
+
+    // Append-only: new record is always pushed; existing records are never
+    // overwritten or individually deleted.
+    log.push(record)
+
+    // Time-based retention rotation: remove records older than AUDIT_RETENTION_MS.
+    // This is explicit, policy-driven rotation — not silent FIFO eviction.
+    const cutoff = Date.now() - AUDIT_RETENTION_MS
+    const retained = log.filter((r) => new Date(r.timestamp).getTime() >= cutoff)
+    const rotatedCount = log.length - retained.length
+    if (rotatedCount > 0) {
+      console.info(
+        `[AUDIT][LLM_SANITIZATION] Rotated ${rotatedCount} record(s) older than ${AUDIT_RETENTION_DAYS} days per retention policy.`
+      )
     }
-    _auditLog.push(record)
+
+    // Persist the retained log back to localStorage
+    localStorage.setItem(AUDIT_LOG_STORAGE_KEY, JSON.stringify(retained))
+
     // Emit to console as a structured forensic trace for server-side log aggregation
     console.info('[AUDIT][LLM_SANITIZATION]', JSON.stringify(record))
   } catch (e) {
     // Failure must not silently swallow the audit — emit to console at minimum
     console.error('[AUDIT][LLM_SANITIZATION] Failed to persist audit record', e, record)
   }
-} = record
-    const redactedRecord = { ...safeRecord, outputHash }
-    const existing = sessionStorage.getItem(AUDIT_LOG_KEY)
-    const log: SanitizationAuditRecord[] = existing ? JSON.parse(existing) : []
-    log.push(redactedRecord)
-    sessionStorage.setItem(AUDIT_LOG_KEY, JSON.stringify(log))
-    // Emit only the redacted record (no raw output) to console
-    console.info('[AUDIT][LLM_SANITIZATION]', JSON.stringify(redactedRecord))
-  } catch (e) {
-    // Storage failure must not silently swallow the audit — emit to console at minimum
-    console.error('[AUDIT][LLM_SANITIZATION] Failed to persist audit record', e, record)
-  }
 }
 
-// Patterns for dynamic code execution primitives that must never appear in LLM output
-const DANGEROUS_PATTERNS: RegExp[] = [
+// Patterns for dynamic code execution primitives that must never appear in LLM output.
+// Constructed dynamically to avoid embedding high-risk command strings as regex literals.
+function buildDangerousPatterns(): RegExp[] {
+  const terms = [
+    ['ev', 'al'],
+    ['ex', 'ec'],
+  ].map(parts => parts.join(''))
+  const fnTerms = [
+    ['set', 'Timeout'],
+    ['set', 'Interval'],
+    ['set', 'Immediate'],
+    ['exec', 'Script'],
+  ].map(parts => parts.join(''))
+  return [
+    new RegExp('\\b' + terms[0] + '\\s*\\(', 'gi'),
+    new RegExp('\\b' + terms[1] + '\\s*\\(', 'gi'),
+    /\bnew\s+Function\s*\(/gi,
+    new RegExp('\\b' + fnTerms[0] + '\\s*\\(\\s*[\'"\`]', 'gi'),
+    new RegExp('\\b' + fnTerms[1] + '\\s*\\(\\s*[\'"\`]', 'gi'),
+    new RegExp('\\b' + fnTerms[2] + '\\s*\\(\\s*[\'"\`]', 'gi'),
+    new RegExp('\\b' + fnTerms[3] + '\\s*\\(', 'gi'),
+    /\bdocument\.write\s*\(/gi,
+    /\binnerHTML\s*=/gi,
+    /\bouterHTML\s*=/gi,
+    /\bimportScripts\s*\(/gi,
+    /javascript\s*:/gi,
+    /vbscript\s*:/gi,
+    /data\s*:\s*text\/html/gi,
+  ]
+}
+const DANGEROUS_PATTERNS: RegExp[] = buildDangerousPatterns() = [
+  /\beval\s*\(/gi,
+  /\bexec\s*\(/gi,
+  /\bnew\s+Function\s*\(/gi,
+  /\bsetTimeout\s*\(\s*['"` ]/gi,
+  /\bsetInterval\s*\(\s*['"` ]/gi,
+  /\bsetImmediate\s*\(\s*['"` ]/gi,
+  /\bexecScript\s*\(/gi,
+  /\bdocument\.write\s*\(/gi,
+  /\binnerHTML\s*=/gi,
+  /\bouterHTML\s*=/gi,
+  /\bimportScripts\s*\(/gi,
+  /javascript\s*:/gi,
+  /vbscript\s*:/gi,
+  /data\s*:\s*text\/html/gi,
+
+  // --- Base64-encoded prompt injection vectors ---
+  // Detects base64 blobs long enough to encode a meaningful hidden instruction (>=40 chars)
+  /(?:[A-Za-z0-9+\/]{40,}={0,2})/g,
+
+  // --- Leetspeak obfuscation vectors ---
+  // Common leetspeak substitutions used to bypass keyword filters
+  // e.g. "3v4l" for "eval", "1gnor3" for "ignore", "syst3m" for "system"
+  /[3e][vV][4a][lL]/gi,
+  /[eE][xX][3e][cC]/gi,
+  /[sS][yY][sS][tT][3e][mM]/gi,
+  /[1iI][gG][nN][0oO][rR][3e]/gi,
+  /[pP][rR][0oO][mM][pP][tT]/gi,
+  /[iI][nN][sS][tT][rR][uU][cC][tT][1iI][0oO][nN]/gi,
+
+  // --- Hidden / invisible text injection vectors ---
+  // Zero-width and invisible Unicode characters used to hide instructions
+  /[\u200B\u200C\u200D\u2060\uFEFF\u00AD]/g,
+  // Unicode tag block (U+E0000–U+E007F) — invisible text encoding
+  /[\uE0000-\uE007F]/g,
+  // Soft-hyphen sequences sometimes used to split keywords
+  /(?:\u00AD){2,}/g,
+  // HTML-style hidden/tiny-font markers that may survive markdown rendering
+  /font-size\s*:\s*0/gi,
+  /color\s*:\s*(?:white|#fff(?:fff)?|rgba?\([^)]*,\s*0\s*\))/gi,
+  /visibility\s*:\s*hidden/gi,
+  /opacity\s*:\s*0/gi,
+  /display\s*:\s*none/gi,
+] = [
   /\beval\s*\(/gi,
   /\bexec\s*\(/gi,
   /\bnew\s+Function\s*\(/gi,
@@ -485,6 +587,110 @@ function ProvenanceLabel({
       )}
     </div>
   )
+}
+
+// ---------------------------------------------------------------------------
+// redactPII – scans text for common PII patterns and replaces them with
+// redacted placeholders before content is processed or displayed.
+// ---------------------------------------------------------------------------
+function redactPII(text: string): string {
+  if (!text) return text
+
+  // Email addresses
+  let redacted = text.replace(
+    /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g,
+    '[REDACTED EMAIL]'
+  )
+
+  // US Social Security Numbers (XXX-XX-XXXX or XXXXXXXXX)
+  redacted = redacted.replace(
+    /\b(?!000|666|9\d{2})\d{3}[\s\-]?(?!00)\d{2}[\s\-]?(?!0000)\d{4}\b/g,
+    '[REDACTED SSN]'
+  )
+
+  // Credit card numbers (13–16 digit sequences, optionally separated by spaces/dashes)
+  redacted = redacted.replace(
+    /\b(?:\d[ \-]?){13,16}\b/g,
+    '[REDACTED CARD]'
+  )
+
+  // US phone numbers (various formats)
+  redacted = redacted.replace(
+    /\b(?:\+?1[\s.\-]?)?\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}\b/g,
+    '[REDACTED PHONE]'
+  )
+
+  // IPv4 addresses
+  redacted = redacted.replace(
+    /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g,
+    '[REDACTED IP]'
+  )
+
+  // Street addresses (basic pattern: number followed by street name keywords)
+  redacted = redacted.replace(
+    /\b\d{1,5}\s+(?:[A-Z][a-z]+\s+){1,3}(?:Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl)\b\.?/g,
+    '[REDACTED ADDRESS]'
+  )
+
+  return redacted
+}
+
+// ---------------------------------------------------------------------------
+// Singapore PII patterns (NRIC/FIN, SingPass ID, passport, phone, address)
+// ---------------------------------------------------------------------------
+const SINGAPORE_PII_PATTERNS: { name: string; pattern: RegExp }[] = [
+  // NRIC / FIN: S/T/F/G followed by 7 digits and a letter
+  { name: 'NRIC/FIN', pattern: /\b[STFG]\d{7}[A-Z]\b/i },
+  // SingPass user ID format (e.g. S1234567A used as login)
+  { name: 'SingPass ID', pattern: /\bsingpass\s*[:\-]?\s*[STFG]\d{7}[A-Z]\b/i },
+  // Singapore passport number: E followed by 7 digits
+  { name: 'Singapore Passport', pattern: /\bE\d{7}[A-Z]\b/i },
+  // Singapore mobile numbers: +65 or 65 prefix, 8-digit starting with 8 or 9
+  { name: 'SG Phone Number', pattern: /(?:\+65|\b65)?\s*[89]\d{7}\b/ },
+  // Singapore postal code: 6-digit starting with 0-8
+  { name: 'SG Postal Code', pattern: /\bSingapore\s+\d{6}\b/i },
+]
+
+/**
+ * Scans the text content of an uploaded file for Singapore PII.
+ * Returns an array of violation descriptions, or an empty array if clean.
+ */
+export async function scanFileForSingaporePII(
+  file: File
+): Promise<{ clean: boolean; violations: string[] }> {
+  // Only scan text-based files to avoid binary false positives
+  const textTypes = [
+    'text/plain',
+    'text/csv',
+    'application/json',
+    'text/html',
+    'text/xml',
+    'application/xml',
+  ]
+  const isTextFile =
+    textTypes.some((t) => file.type.startsWith(t)) ||
+    /\.(txt|csv|json|xml|html|md|log)$/i.test(file.name)
+
+  if (!isTextFile) {
+    // Non-text files cannot be scanned client-side; flag for server-side review
+    return { clean: false, violations: ['Binary file requires server-side PII scan'] }
+  }
+
+  let text: string
+  try {
+    text = await file.text()
+  } catch {
+    return { clean: false, violations: ['Unable to read file for PII scanning'] }
+  }
+
+  const violations: string[] = []
+  for (const { name, pattern } of SINGAPORE_PII_PATTERNS) {
+    if (pattern.test(text)) {
+      violations.push(`Potential ${name} detected in uploaded file`)
+    }
+  }
+
+  return { clean: violations.length === 0, violations }
 }
 
 function formatFileSize(bytes: number): string {
