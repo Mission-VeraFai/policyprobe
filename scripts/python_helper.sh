@@ -87,24 +87,8 @@ find_python() {
     return 1
 }
 
-# Main: Find and # HITL approval flow: require explicit confirmation before exporting and using PYTHON_CMD
-if [ "${PYTHON_HELPER_AUTO_APPROVE:-0}" != "1" ]; then
-    echo "[HITL] About to export PYTHON_CMD='$PYTHON_CMD' and set it as the active Python interpreter."
-    printf "[HITL] Do you approve this operation? (yes/no): "
-    read -r HITL_RESPONSE
-    if [ "$HITL_RESPONSE" != "yes" ]; then
-        echo "[HITL] Operation rejected by user. Aborting."
-        exit 1
-    fi
-fi
-
-export PYTHON_CMD
-
-# Display found Python version (only if not being sourced silently)
-if [ "${PYTHON_HELPER_QUIET:-0}" != "1" ]; then
-    PYTHON_VERSION=$("$PYTHON_CMD" --version 2>&1)
-    echo "Using: $PYTHON_VERSION ($PYTHON_CMD)"
-find_python)
+# Main: Find and export PYTHON_CMD
+PYTHON_CMD=$(find_python)
 
 if [ -z "$PYTHON_CMD" ]; then
     log_msg "=========================================="
