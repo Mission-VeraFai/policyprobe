@@ -14,6 +14,24 @@ const SG_PII_PATTERNS: { name: string; pattern: RegExp }[] = [
   { name: 'SG Phone', pattern: /(?:\+65|\b65)[ -]?[689]\d{3}[ -]?\d{4}\b/ },
   // Singapore postal code: 6-digit code (preceded by "Singapore" or "S(" to reduce false positives)
   { name: 'SG Postal Code', pattern: /\b(?:Singapore\s+|S\()\d{6}\b/i },
+  // Full Name: common salutation + capitalised words (e.g. Mr John Tan)
+  { name: 'Full Name', pattern: /\b(?:Mr|Mrs|Ms|Miss|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b/ },
+  // Date of Birth: common date formats (DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD)
+  { name: 'Date of Birth', pattern: /\b(?:dob|date\s+of\s+birth|born\s+on)[:\s]+\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}\b/i },
+  // Generic date pattern near DOB keywords
+  { name: 'Date (generic)', pattern: /\b(?:0?[1-9]|[12]\d|3[01])[\/-](?:0?[1-9]|1[0-2])[\/-](?:19|20)\d{2}\b/ },
+  // Email address
+  { name: 'Email', pattern: /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/ },
+  // Singapore bank account numbers: DBS/POSB (10 digits), OCBC (9 digits), UOB (10 digits) — generic 9-12 digit sequences near bank keywords
+  { name: 'Bank Account', pattern: /\b(?:account\s*(?:no|number|#)?[:\s]+)\d{9,12}\b/i },
+  // CPF account / contribution references
+  { name: 'CPF', pattern: /\b(?:cpf\s*(?:account|no|number|contribution)?[:\s]*)\d{7,9}[A-Z]?\b/i },
+  // Health / medical record indicators
+  { name: 'Health Record', pattern: /\b(?:diagnosis|medical\s+record|patient\s+id|prescription|medication|blood\s+type|allerg(?:y|ies))[:\s]+\S/i },
+  // Race / ethnicity (PDPA sensitive category in Singapore)
+  { name: 'Race/Ethnicity', pattern: /\b(?:race|ethnicity)[:\s]+(?:chinese|malay|indian|eurasian|others?)\b/i },
+  // Religion (PDPA sensitive category)
+  { name: 'Religion', pattern: /\b(?:religion|religious\s+belief)[:\s]+\S/i },
 ]
 
 async function readFileAsText(file: File): Promise<string> {
@@ -39,7 +57,9 @@ async function containsSingaporePII(file: File): Promise<string | null> {
     /\.(txt|html?|json)$/i.test(file.name)
 
   if (!isTextReadable) {
-    return null
+    // Binary files (PDF, DOC, images) cannot be scanned client-side and no
+    // server-side scanning is implemented. Block them to prevent PII leakage.
+    return 'binary file (cannot be scanned for PII — upload not permitted)'
   }
 
   let content: string
