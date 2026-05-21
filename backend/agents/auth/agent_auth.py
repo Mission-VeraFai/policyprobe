@@ -103,6 +103,21 @@ class AgentAuthenticator:
         # Cache stores: token_key -> {"payload": <decoded payload>, "expires_at": <unix timestamp>}
         self._token_cache: dict = {}
 
+    def _cache_get(self, token_key: str):
+        """Return cached payload only if it has not expired; evict stale entries."""
+        import time
+        entry = self._token_cache.get(token_key)
+        if entry is None:
+            return None
+        if time.time() >= entry["expires_at"]:
+            del self._token_cache[token_key]
+            return None
+        return entry["payload"]
+
+    def _cache_set(self, token_key: str, payload: dict, expires_at: float) -> None:
+        """Store a decoded payload in the cache with its expiry timestamp."""
+        self._token_cache[token_key] = {"payload": payload, "expires_at": expires_at}
+
         # Persistent audit trail configuration
         import os
         self._audit_log_path: str = os.environ.get(
@@ -115,11 +130,22 @@ class AgentAuthenticator:
         # Model/version identifier stamped on every record.
         # These are pinned immutable constants — NOT sourced from env vars —
         # and are validated against the approved model registry at init time.
-        _APPROVED_MODEL_REGISTRY: dict = {
-            "agent_auth": {"versions": {"2.1.0"}, "status": "approved"},
-        }
-        _PINNED_MODEL_ID: str = "agent_auth"
-        _PINNED_MODEL_VERSION: str = "2.1.0"
+        import json
+        _registry_path = os.environ.get("APPROVED_MODEL_REGISTRY_PATH")
+        _registry_json = os.environ.get("APPROVED_MODEL_REGISTRY_JSON")
+        if _registry_path:
+            with open(_registry_path, "r") as _rf:
+                _APPROVED_MODEL_REGISTRY: dict = json.load(_rf)
+        elif _registry_json:
+            _APPROVED_MODEL_REGISTRY: dict = json.loads(_registry_json)
+        else:
+            raise ValueError(
+                "No approved model registry configured. Set APPROVED_MODEL_REGISTRY_PATH "
+                "(path to a JSON file) or APPROVED_MODEL_REGISTRY_JSON (inline JSON) "
+                "to an organization-approved registry before starting this service."
+            )
+        _PINNED_MODEL_ID: str = os.environ.get("PINNED_MODEL_ID", "agent_auth")
+        _PINNED_MODEL_VERSION: str = os.environ.get("PINNED_MODEL_VERSION", "2.1.0")
 
         _registry_entry = _APPROVED_MODEL_REGISTRY.get(_PINNED_MODEL_ID)
         if _registry_entry is None:
