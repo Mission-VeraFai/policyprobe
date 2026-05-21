@@ -80,6 +80,19 @@ const PROMPT_INJECTION_PATTERNS: RegExp[] = [
   /developer\s+mode/i,
   // Hidden text via zero-width characters used to smuggle instructions
   /[\u200B-\u200D\uFEFF\u00AD]{3,}/,
+  // Base64-encoded prompt injection (common obfuscation technique)
+  /(?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?/,
+  // Leetspeak obfuscation of common injection phrases (e.g. 1gn0r3, d1sr3g4rd)
+  /[i1][g9][n][o0][r][e3]\s+.{0,30}[i1][n][s5][t][r][u][c][t][i1][o0][n][s5]/i,
+  /[d][i1][s5][r][e3][g9][a4][r][d]\s+.{0,30}[i1][n][s5][t][r][u][c][t][i1][o0][n][s5]/i,
+  // Shell command injection patterns
+  /(?:^|\s|;|\||&)(?:bash|sh|zsh|cmd|powershell|exec|eval|system|popen)\s*[\(\s]/im,
+  // Command substitution and subshell patterns
+  /(?:\$\(|`)[^)\`]{1,200}(?:\)|`)/,
+  // Common shell operators used for command chaining
+  /(?:&&|\|\||;;|\$\{IFS\})/,
+  // Path traversal combined with executable references
+  /(?:\.\.\/){2,}(?:bin|etc|usr|tmp)/i,
 ]
 
 /**
@@ -101,10 +114,37 @@ async function isContentSafe(file: File): Promise<boolean> {
     textMimeTypes.includes(file.type) ||
     textExtensions.some(ext => lowerName.endsWith(ext))
 
-  if (!isTextFile) {
-    // For binary formats (PDF, DOC, images) we cannot safely read content
-    // in the browser; rely on server-side scanning. Allow through here.
+    if (!isTextFile) {
+    // For binary formats, inspect magic bytes to reject known executable types
+    // that could be used to smuggle malicious payloads.
+    try {
+      const MAGIC_BYTE_SLICE = 8
+      const headerBuffer = await file.slice(0, MAGIC_BYTE_SLICE).arrayBuffer()
+      const bytes = new Uint8Array(headerBuffer)
+      const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('')
+      // ELF executables: 7f454c46
+      if (hex.startsWith('7f454c46')) {
+        console.warn(`File "${file.name}" rejected: ELF executable detected`)
+        return false
+      }
+      // Windows PE executables: 4d5a (MZ header)
+      if (hex.startsWith('4d5a')) {
+        console.warn(`File "${file.name}" rejected: PE executable detected`)
+        return false
+      }
+      // Shell scripts starting with #! (shebang): 2321
+      if (hex.startsWith('2321')) {
+        console.warn(`File "${file.name}" rejected: shell script (shebang) detected`)
+        return false
+      }
+    } catch {
+      console.warn(`File "${file.name}" rejected: unable to inspect binary content`)
+      return false
+    }
     return true
+  }" rejected: binary/non-text files are not permitted to prevent malicious content injection`
+    )
+    return false
   }
 
   try {
