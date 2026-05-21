@@ -6,10 +6,10 @@
 # Run from anywhere: ./scripts/stop_dev.sh
 #
 
-echo "=========================================="
-echo "  Stopping PolicyProbe Servers"
-echo "=========================================="
-echo ""
+printf '%s\n' "=========================================="
+printf '%s\n' "  Stopping PolicyProbe Servers"
+printf '%s\n' "=========================================="
+printf '\n'
 
 # Safely stop a process listening on a given port.
 # Usage: stop_port <port> <label>
@@ -54,7 +54,7 @@ stop_port 5500 "Backend"
 # Stop frontend on port 5001
 stop_port 5001 "Frontend"
 
-echo ""
-echo "=========================================="
-echo "  All servers stopped"
-echo "=========================================="
+printf '\n'
+printf '%s\n' "=========================================="
+printf '%s\n' "  All servers stopped"
+printf '%s\n' "=========================================="
