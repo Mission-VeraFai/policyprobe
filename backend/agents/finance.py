@@ -23,9 +23,14 @@ from .auth.agent_auth import AgentIdentity, AgentAuthenticator
 from llm.registry import RegistryLLMClient, ModelRegistry
 
 # Approved model registry entry — version-pinned and integrity-verified
-_APPROVED_MODEL_ID = "claude-3-5-sonnet-20241022"  # registry canonical name
-_APPROVED_MODEL_VERSION = "20241022"            # pinned release date / version tag
-_APPROVED_MODEL_SHA256 = ""                     # set to the approved artifact digest from the registry
+_APPROVED_MODEL_ID = "gpt-4o"                      # registry canonical name
+_APPROVED_MODEL_VERSION = "2024-08-06"           # pinned release date / version tag
+_APPROVED_MODEL_SHA256 = os.environ.get("APPROVED_MODEL_SHA256", "")  # must be set to the approved artifact digest from the registry
+if not _APPROVED_MODEL_SHA256:
+    raise ValueError(
+        "APPROVED_MODEL_SHA256 must be set to the approved artifact digest. "
+        "Integrity verification cannot be disabled."
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +65,53 @@ class FinanceAgent:
         )
         self.llm_client = llm_client
         self._llm_logger = logging.getLogger(__name__ + ".llm_audit")
+
+    def _call_llm(self, prompt: str, **kwargs) -> Any:
+        """Wrapper that logs every LLM request and response for audit compliance."""
+        interaction_id = str(uuid.uuid4())
+        model_id = getattr(self.llm_client, 'model_id', _APPROVED_MODEL_ID)
+        request_ts = datetime.now(timezone.utc).isoformat()
+        self._llm_logger.info(
+            json.dumps({
+                "event": "llm_request",
+                "interaction_id": interaction_id,
+                "agent": self.agent_id,
+                "model": model_id,
+                "timestamp": request_ts,
+                "prompt_length": len(prompt),
+                "prompt_preview": prompt[:200],
+                "kwargs": {k: str(v) for k, v in kwargs.items()},
+            })
+        )
+        try:
+            response = self.llm_client.complete(prompt, **kwargs)
+            response_ts = datetime.now(timezone.utc).isoformat()
+            response_text = response if isinstance(response, str) else str(response)
+            self._llm_logger.info(
+                json.dumps({
+                    "event": "llm_response",
+                    "interaction_id": interaction_id,
+                    "agent": self.agent_id,
+                    "model": model_id,
+                    "timestamp": response_ts,
+                    "response_length": len(response_text),
+                    "response_preview": response_text[:200],
+                })
+            )
+            return response
+        except Exception as exc:
+            error_ts = datetime.now(timezone.utc).isoformat()
+            self._llm_logger.error(
+                json.dumps({
+                    "event": "llm_error",
+                    "interaction_id": interaction_id,
+                    "agent": self.agent_id,
+                    "model": model_id,
+                    "timestamp": error_ts,
+                    "error": str(exc),
+                })
+            )
+            raise
         self.authenticator = AgentAuthenticator()
         self.agent_id = "finance"
         self.agent_name = "Finance Agent"
@@ -924,13 +976,45 @@ Format numbers clearly and provide relevant insights."""
         if not permitted_keys:
             return {"error": "Query not recognised or no data available for the requested scope."}
 
+        # --- Input sanitization before any LLM call or response inclusion ---
+        import re as _re
+
+        _MAX_QUERY_LEN = 512
+        # 1. Coerce to string and strip surrounding whitespace.
+        _safe_query: str = str(query).strip()
+        # 2. Remove null bytes and ASCII control characters (except tab/newline).
+        _safe_query = _re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", _safe_query)
+        # 3. Truncate to a safe maximum length to prevent prompt-stuffing.
+        _safe_query = _safe_query[:_MAX_QUERY_LEN]
+        # 4. Detect prompt-injection patterns and reject the request.
+        _INJECTION_PATTERNS = [
+            r"(?i)ignore\s+(all\s+)?(previous|prior|above)\s+instructions?",
+            r"(?i)disregard\s+(all\s+)?(previous|prior|above)\s+instructions?",
+            r"(?i)you\s+are\s+now",
+            r"(?i)act\s+as\s+(a\s+)?(?!financial)",  # allow 'act as a financial …'
+            r"(?i)system\s*:\s*",
+            r"(?i)<\s*/?\s*(system|user|assistant)\s*>",
+            r"(?i)\[INST\]",
+            r"(?i)###\s*instruction",
+        ]
+        for _pattern in _INJECTION_PATTERNS:
+            if _re.search(_pattern, _safe_query):
+                _audit_log.warning(
+                    "PROMPT_INJECTION_DETECTED | agent_id=%s | query=%r | timestamp=%s",
+                    requester.agent_id,
+                    query,
+                    datetime.datetime.utcnow().isoformat(),
+                )
+                return {"error": "Query rejected: potential prompt injection detected."}
+        # --- End of input sanitization ---
+
         scoped_data = {
             k: v for k, v in self._financial_data.items()
             if k in permitted_keys
         }
         return {
             "data": scoped_data,
-            "query": query  # query is already sanitized at method entry
+            "query": _safe_query  # sanitized: stripped, control-chars removed, truncated, injection-checked
         }
         filtered_data = {
             k: v for k, v in self._financial_data.items()
@@ -938,7 +1022,7 @@ Format numbers clearly and provide relevant insights."""
         }
         return {
             "data": filtered_data,
-            "query": query,  # query is already sanitized at method entry
+            "query": _safe_query,  # sanitized: stripped, control-chars removed, truncated, injection-checked
             "requester": requester.agent_id
         }
         # Audit log: record every financial data disclosure
