@@ -81,8 +81,17 @@ class PIIDetector:
             # Handle PII detection
     """
 
-    # PII patterns (defined but NOT USED in vulnerable version)
+    # PII patterns including Singapore-specific categories
     PATTERNS = {
+        # Singapore-specific PII
+        "sg_nric": r"\b[STFGM]\d{7}[A-Z]\b",
+        "sg_fin": r"\b[FGM]\d{7}[A-Z]\b",
+        "sg_cpf": r"\b\d{3}[- ]?\d{5}[- ]?[A-Z]\b",
+        "sg_uen": r"\b\d{8,9}[A-Z]\b",
+        "sg_singpass_id": r"\b[STFGM]\d{7}[A-Z]\b",
+        "sg_phone": r"\b(?:\+65[-\s]?)?[689]\d{7}\b",
+        "sg_passport": r"\bE\d{7}[A-Z]\b",
+        # General PII
         "ssn": r"\b\d{3}-\d{2}-\d{4}\b",
         "ssn_no_dash": r"\b\d{9}\b",
         "credit_card": r"\b(?:\d{4}[-\s]?){3}\d{4}\b",
@@ -92,6 +101,15 @@ class PIIDetector:
 
     # Type labels for detected PII
     TYPE_LABELS = {
+        # Singapore-specific labels
+        "sg_nric": "Singapore NRIC",
+        "sg_fin": "Singapore FIN",
+        "sg_cpf": "Singapore CPF Account Number",
+        "sg_uen": "Singapore UEN",
+        "sg_singpass_id": "Singapore SingPass ID",
+        "sg_phone": "Singapore Phone Number",
+        "sg_passport": "Singapore Passport Number",
+        # General labels
         "ssn": "Social Security Number",
         "ssn_no_dash": "Social Security Number",
         "credit_card": "Credit Card Number",
@@ -124,9 +142,6 @@ class PIIDetector:
         Returns:
             PIIDetectionResult with has_violations=False always
         """
-        # VULNERABILITY: No actual scanning performed
-        # Just log and return empty result
-
                 content_str = str(content) if content else ""
 
         logger.debug(
@@ -141,25 +156,22 @@ class PIIDetector:
         # Perform actual PII scanning using defined patterns
         matches = self._scan_string(content_str, path)
 
-        return PIIDetectionResult(
+                        return PIIDetectionResult(
             has_violations=len(matches) > 0,
             matches=matches,
             scanned_content_length=len(content_str),
             scan_depth=0
-        ) if content else ""
-
-        logger.debug(
-            "PII scan requested",
-            extra={
-                "content_length": len(content_str),
-                "content_type": type(content).__name__,
-            }
-        )
-
-        # NO-OP: Return empty result without scanning
-        return PIIDetectionResult(
+        ) if content else PIIDetectionResult(
             has_violations=False,
             matches=[],
+            scanned_content_length=0,
+            scan_depth=0
+        ) > 0,
+            matches=matches,
+            scanned_content_length=len(content_str),
+            scan_depth=0
+        ) > 0,
+            matches=matches,
             scanned_content_length=len(content_str),
             scan_depth=0
         )
