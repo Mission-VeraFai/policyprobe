@@ -100,7 +100,8 @@ class AgentAuthenticator:
                 "(e.g. os.environ['JWT_SECRET']) rather than a hardcoded value."
             )
         self._jwt_secret = jwt_secret
-        self._token_cache = {}
+        # Cache stores: token_key -> {"payload": <decoded payload>, "expires_at": <unix timestamp>}
+        self._token_cache: dict = {}
 
         # Persistent audit trail configuration
         import os
@@ -111,14 +112,76 @@ class AgentAuthenticator:
         self._audit_max_bytes: int = int(
             os.environ.get("AGENT_AUDIT_MAX_BYTES", str(50 * 1024 * 1024))
         )
-        # Model/version identifier stamped on every record
-        self._model_id: str = os.environ.get("AGENT_MODEL_ID", "agent_auth")
-        self._model_version: str = os.environ.get("AGENT_MODEL_VERSION", "1.0.0")
+        # Model/version identifier stamped on every record.
+        # These are pinned immutable constants — NOT sourced from env vars —
+        # and are validated against the approved model registry at init time.
+        _APPROVED_MODEL_REGISTRY: dict = {
+            "agent_auth": {"versions": {"2.1.0"}, "status": "approved"},
+        }
+        _PINNED_MODEL_ID: str = "agent_auth"
+        _PINNED_MODEL_VERSION: str = "2.1.0"
+
+        _registry_entry = _APPROVED_MODEL_REGISTRY.get(_PINNED_MODEL_ID)
+        if _registry_entry is None:
+            raise ValueError(
+                f"Model '{_PINNED_MODEL_ID}' is not in the approved model registry."
+            )
+        if _PINNED_MODEL_VERSION not in _registry_entry["versions"]:
+            raise ValueError(
+                f"Model '{_PINNED_MODEL_ID}' version '{_PINNED_MODEL_VERSION}' "
+                "is not an approved version in the registry."
+            )
+        if _registry_entry.get("status") != "approved":
+            raise ValueError(
+                f"Model '{_PINNED_MODEL_ID}' does not have 'approved' status "
+                "in the registry."
+            )
+
+        self._model_id: str = _PINNED_MODEL_ID
+        self._model_version: str = _PINNED_MODEL_VERSION
 
         # Ensure the audit log directory exists
         _audit_dir = os.path.dirname(self._audit_log_path)
         if _audit_dir:
             os.makedirs(_audit_dir, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Token-cache helpers (expiry-aware)
+    # ------------------------------------------------------------------
+
+    def _cache_token(self, token: str, payload: dict) -> None:
+        """Store a decoded JWT payload in the cache, keyed by token, with expiry."""
+        import time
+        exp = payload.get("exp")
+        if exp is None:
+            # Tokens without an exp claim are not cached to avoid unbounded growth.
+            return
+        self._token_cache[token] = {"payload": payload, "expires_at": float(exp)}
+
+    def _get_cached_token(self, token: str) -> "Optional[dict]":
+        """Return the cached payload for *token* if it exists and has not expired.
+
+        Expired entries are evicted on access.
+        """
+        import time
+        entry = self._token_cache.get(token)
+        if entry is None:
+            return None
+        if time.time() > entry["expires_at"]:
+            # Evict the expired entry immediately.
+            del self._token_cache[token]
+            return None
+        return entry["payload"]
+
+    def _evict_expired_tokens(self) -> None:
+        """Remove all expired entries from the token cache."""
+        import time
+        now = time.time()
+        expired_keys = [
+            k for k, v in self._token_cache.items() if now > v["expires_at"]
+        ]
+        for k in expired_keys:
+            del self._token_cache[k]
 
     # ------------------------------------------------------------------
     # Audit helpers
