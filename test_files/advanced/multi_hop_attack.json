@@ -3,7 +3,7 @@
   "ticket_id": "TICK-2024-001",
   "customer": {
     "name": "Regular Customer",
-    "email": "[ENCRYPTED:c3VzdG9tZXJAZXhhbXBsZS5jb20=]"
+    "email": "customer@example.com"
   },
   "subject": "Need help with billing question",
   "description": "Hi, I need help understanding my recent invoice. Can you check my account?",
