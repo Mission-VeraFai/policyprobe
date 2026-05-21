@@ -3,27 +3,184 @@
 import { useState, useRef, useEffect } from 'react'
 import { v4 as uuidv4 } from 'uuid'
 
-// Helper: retrieve the stored auth token
+// Helper: validate a JWT's structure, expiry, and subject binding client-side.
+// NOTE: This does NOT replace server-side signature verification; it is a
+// defence-in-depth guard that rejects obviously invalid / expired tokens
+// before they are ever sent to the API.
+function validateToken(token: string): boolean {
+  // 1. Structure check – a JWT must have exactly three Base64url segments.
+  const parts = token.split('.')
+  if (parts.length !== 3) return false
+
+  try {
+    // 2. Decode the payload (second segment).
+    // atob requires standard Base64; convert Base64url → Base64 first.
+    const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    const padded = base64.padEnd(base64.length + (4 - (base64.length % 4)) % 4, '=')
+    const payloadJson = atob(padded)
+    const payload = JSON.parse(payloadJson) as Record<string, unknown>
+
+    // 3. Expiry check – reject tokens whose `exp` claim is in the past.
+    if (typeof payload['exp'] === 'number') {
+      const nowSeconds = Math.floor(Date.now() / 1000)
+      if (payload['exp'] < nowSeconds) {
+        console.warn('[auth] Token has expired; discarding.')
+        return false
+      }
+    } else {
+      // Tokens without an expiry claim are not acceptable.
+      console.warn('[auth] Token missing `exp` claim; discarding.')
+      return false
+    }
+
+    // 4. Subject binding – `sub` must be present and non-empty.
+    if (typeof payload['sub'] !== 'string' || payload['sub'].trim() === '') {
+      console.warn('[auth] Token missing or empty `sub` claim; discarding.')
+      return false
+    }
+
+    return true
+  } catch {
+    // Malformed Base64 or JSON – treat as invalid.
+    return false
+  }
+}
+
+// Helper: retrieve the stored auth token only after integrity validation.
 function getAuthToken(): string | null {
   if (typeof window === 'undefined') return null
-  return localStorage.getItem('auth_token')
+  const token = localStorage.getItem('auth_token')
+  if (!token) return null
+  if (!validateToken(token)) {
+    // Remove the invalid / expired token so it cannot be reused.
+    localStorage.removeItem('auth_token')
+    return null
+  }
+  return token
 }
 import { MessageList } from './MessageList'
 import { FileUpload } from './FileUpload'
 import { Send, Paperclip, Loader2 } from 'lucide-react'
 
-export interface Message {
+// Provenance metadata that MUST be present on every AI-generated message.
+export interface SyntheticProvenance {
+  isSynthetic: true
+  modelId: string          // Identifier of the model that produced the content
+  generatedAt: string      // ISO-8601 timestamp recorded at generation time
+  watermark: string        // HMAC-SHA-256 hex signature over provenance fields
+  provenanceSignature: string // Hex signature binding content + provenance
+}
+
+// Base fields shared by all message roles.
+interface MessageBase {
   id: string
-  role: 'user' | 'assistant' | 'system'
   content: string
   timestamp: Date
   attachments?: FileAttachment[]
   error?: PolicyError
-  // Synthetic-content provenance fields (required for assistant messages)
-  isSynthetic?: boolean
-  modelId?: string
-  generatedAt?: string   // ISO-8601 timestamp tag from generation time
-  watermark?: string     // Opaque provenance token
+}
+
+// User / system messages carry no synthetic-content provenance.
+export interface UserMessage extends MessageBase {
+  role: 'user' | 'system'
+  isSynthetic?: false
+  modelId?: never
+  generatedAt?: never
+  watermark?: never
+  provenanceSignature?: never
+}
+
+// Assistant messages MUST carry fully-populated provenance.
+export interface AssistantMessage extends MessageBase, SyntheticProvenance {
+  role: 'assistant'
+}
+
+export type Message = UserMessage | AssistantMessage
+
+// ---------------------------------------------------------------------------
+// Provenance helpers
+// ---------------------------------------------------------------------------
+
+/** Derive a deterministic HMAC-SHA-256 hex string using the Web Crypto API. */
+async function hmacSha256Hex(key: string, data: string): Promise<string> {
+  const enc = new TextEncoder()
+  const cryptoKey = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(key),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  )
+  const sig = await crypto.subtle.sign('HMAC', cryptoKey, enc.encode(data))
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+/**
+ * Build a fully-provenance-stamped AssistantMessage.
+ * The watermark signs the provenance fields; provenanceSignature additionally
+ * binds the message content so any post-generation tampering is detectable.
+ *
+ * The signing key is derived from the session token (or a fallback) so that
+ * signatures are session-scoped and verifiable server-side.
+ */
+export async function buildAssistantMessage({
+  content,
+  modelId,
+  attachments,
+}: {
+  content: string
+  modelId: string
+  attachments?: FileAttachment[]
+}): Promise<AssistantMessage> {
+  const id = uuidv4()
+  const generatedAt = new Date().toISOString()
+
+  // Use the session auth token as the HMAC key so signatures are
+  // session-scoped.  Fall back to a static sentinel so the field is never
+  // empty (server should reject sentinel-signed messages in production).
+  const signingKey =
+    (typeof window !== 'undefined' && localStorage.getItem('auth_token')) ??
+    'UNSIGNED-SENTINEL-REPLACE-IN-PROD'
+
+  // Watermark: signs the provenance metadata fields.
+  const provenancePayload = `${id}|${modelId}|${generatedAt}`
+  const watermark = await hmacSha256Hex(signingKey, provenancePayload)
+
+  // provenanceSignature: additionally binds the message content.
+  const fullPayload = `${provenancePayload}|${content}`
+  const provenanceSignature = await hmacSha256Hex(signingKey, fullPayload)
+
+  return {
+    id,
+    role: 'assistant',
+    content,
+    timestamp: new Date(),
+    attachments,
+    isSynthetic: true,
+    modelId,
+    generatedAt,
+    watermark,
+    provenanceSignature,
+  }
+}
+
+/**
+ * Type-guard: returns true only when all required provenance fields are
+ * present and non-empty.  Use this before rendering or forwarding any
+ * assistant message.
+ */
+export function hasValidProvenance(msg: Message): msg is AssistantMessage {
+  if (msg.role !== 'assistant') return false
+  const m = msg as AssistantMessage
+  return (
+    m.isSynthetic === true &&
+    typeof m.modelId === 'string' && m.modelId.length > 0 &&
+    typeof m.generatedAt === 'string' && m.generatedAt.length > 0 &&
+    typeof m.watermark === 'string' && m.watermark.length === 64 &&
+    typeof m.provenanceSignature === 'string' && m.provenanceSignature.length === 64
+  )
 }
 
 export interface FileAttachment {
@@ -31,13 +188,78 @@ export interface FileAttachment {
   name: string
   type: string
   size: number
-  content?: string
+  // content is intentionally omitted to prevent raw file bytes reaching client messages or API payloads
+}
+
+/** Strip any raw content from an attachment before including it in a message or API payload. */
+function sanitizeAttachment(attachment: FileAttachment): FileAttachment {
+  const { id, name, type, size } = attachment
+  return { id, name, type, size }
+}
+
+/** Only safe, non-sensitive fields are permitted in PolicyError details to prevent internal metadata leakage. */
+export interface PolicyErrorDetails {
+  code?: string
+  field?: string
 }
 
 export interface PolicyError {
   type: 'pii' | 'threat' | 'auth' | 'general'
   message: string
-  details?: Record<string, unknown>
+  details?: PolicyErrorDetails
+}
+
+/** Strip PolicyError details down to the permitted display fields only. */
+function sanitizePolicyError(error: PolicyError): PolicyError {
+  if (!error.details) return error
+  const { code, field } = error.details
+  return {
+    ...error,
+    details: {
+      ...(code !== undefined ? { code: String(code) } : {}),
+      ...(field !== undefined ? { field: String(field) } : {}),
+    },
+  }
+}
+
+// Audit logger: persists AI decision records for forensic readiness
+async function writeAuditRecord(record: {
+  eventType: 'ai_completion'
+  principal: string
+  modelId: string
+  inputHash: string
+  outputSnippet: string
+  timestamp: string
+  sessionId: string
+  messageId: string
+}): Promise<void> {
+  try {
+    const token = getAuthToken()
+    await fetch('/api/audit/ai-decisions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(record),
+    })
+  } catch (err) {
+    // Audit failures must not silently disappear — log to console as fallback
+    console.error('[AUDIT] Failed to persist AI decision record:', err, record)
+  }
+}
+
+// Compute a SHA-256 hex digest of a string (used for input hashing in audit records)
+async function sha256Hex(text: string): Promise<string> {
+  if (typeof window === 'undefined' || !window.crypto?.subtle) {
+    // Fallback: length-prefixed placeholder when SubtleCrypto is unavailable
+    return `nohash-len${text.length}`
+  }
+  const encoded = new TextEncoder().encode(text)
+  const hashBuffer = await window.crypto.subtle.digest('SHA-256', encoded)
+  return Array.from(new Uint8Array(hashBuffer))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('')
 }
 
 // Patterns that indicate potentially malicious prompt injection attempts
@@ -47,6 +269,58 @@ const INVISIBLE_CHARS_PATTERN = /[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\
 const BINARY_MAGIC_BYTES_PATTERN = /(?:\x7fELF|MZ\x90|\xcf\xfa\xed\xfe|\xce\xfa\xed\xfe|\x4d\x5a)/
 const LEETSPEAK_INJECTION_PATTERN = /(?:3x3c|3v4l|5y5t3m|sh3ll|c0mm4nd|1nj3ct|3xpl01t|pwn3d|r00t|4dm1n)/i
 const EXCESSIVE_BASE64_THRESHOLD = 60 // characters of continuous base64-like content
+
+// Patterns for dynamic code execution primitives in LLM output
+const LLM_EVAL_PATTERN = /\beval\s*\(/i
+const LLM_FUNCTION_CONSTRUCTOR_PATTERN = /new\s+Function\s*\(/i
+const LLM_SETTIMEOUT_CODE_PATTERN = /(?:setTimeout|setInterval)\s*\(\s*['"`]/i
+const LLM_EXEC_PATTERN = /\b(?:exec|execSync|execFile|spawn|spawnSync)\s*\(/i
+const LLM_DYNAMIC_IMPORT_PATTERN = /\bimport\s*\(/i
+const LLM_SCRIPT_INJECTION_PATTERN = /<script[\s>]/i
+const LLM_DANGEROUS_PROTO_PATTERN = /__proto__|constructor\s*\[|prototype\s*\[/i
+
+function sanitizeLLMOutput(text: string): { safe: boolean; reason?: string; sanitized: string } {
+  if (!text || typeof text !== 'string') {
+    return { safe: false, reason: 'LLM output is not a valid string.', sanitized: '' }
+  }
+
+  // Check for eval() calls
+  if (LLM_EVAL_PATTERN.test(text)) {
+    return { safe: false, reason: 'LLM output contains eval() — dynamic code execution primitive detected.', sanitized: text.replace(LLM_EVAL_PATTERN, '[eval removed]') }
+  }
+
+  // Check for Function constructor (new Function(...))
+  if (LLM_FUNCTION_CONSTRUCTOR_PATTERN.test(text)) {
+    return { safe: false, reason: 'LLM output contains Function constructor — dynamic code execution primitive detected.', sanitized: text.replace(LLM_FUNCTION_CONSTRUCTOR_PATTERN, '[Function constructor removed]') }
+  }
+
+  // Check for setTimeout/setInterval with string argument (code execution)
+  if (LLM_SETTIMEOUT_CODE_PATTERN.test(text)) {
+    return { safe: false, reason: 'LLM output contains setTimeout/setInterval with string code — dynamic code execution primitive detected.', sanitized: text.replace(LLM_SETTIMEOUT_CODE_PATTERN, '[dynamic timer removed]') }
+  }
+
+  // Check for exec/spawn primitives
+  if (LLM_EXEC_PATTERN.test(text)) {
+    return { safe: false, reason: 'LLM output contains exec/spawn — dynamic code execution primitive detected.', sanitized: text.replace(LLM_EXEC_PATTERN, '[exec removed]') }
+  }
+
+  // Check for dynamic import()
+  if (LLM_DYNAMIC_IMPORT_PATTERN.test(text)) {
+    return { safe: false, reason: 'LLM output contains dynamic import() — dynamic code execution primitive detected.', sanitized: text.replace(LLM_DYNAMIC_IMPORT_PATTERN, '[dynamic import removed]') }
+  }
+
+  // Check for script tag injection
+  if (LLM_SCRIPT_INJECTION_PATTERN.test(text)) {
+    return { safe: false, reason: 'LLM output contains <script> tag — potential code injection detected.', sanitized: text.replace(LLM_SCRIPT_INJECTION_PATTERN, '[script tag removed]') }
+  }
+
+  // Check for prototype pollution primitives
+  if (LLM_DANGEROUS_PROTO_PATTERN.test(text)) {
+    return { safe: false, reason: 'LLM output contains prototype/constructor access — potential code injection detected.', sanitized: text.replace(LLM_DANGEROUS_PROTO_PATTERN, '[prototype access removed]') }
+  }
+
+  return { safe: true, sanitized: text }
+}
 
 function sanitizeInput(text: string): { safe: boolean; reason?: string; sanitized: string } {
   // Check for invisible/hidden characters
@@ -101,6 +375,14 @@ const PII_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
   { pattern: /\b\d{3}-\d{2}-\d{4}\b/g, label: '[REDACTED_SSN]' },
   { pattern: /\b(?:4\d{3}|5[1-5]\d{2}|6011|3[47]\d{2})[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{3,4}\b/g, label: '[REDACTED_CARD]' },
   { pattern: /\b(?:Mr|Mrs|Ms|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b/g, label: '[REDACTED_NAME]' },
+  // Singapore-specific PII patterns
+  { pattern: /\b[STFGM]\d{7}[A-Z]\b/gi, label: '[REDACTED_SG_NRIC_FIN]' },
+  { pattern: /\bSingPass\s*[Ii][Dd]?\s*[:\-]?\s*[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g, label: '[REDACTED_SINGPASS_ID]' },
+  { pattern: /\bCPF\s*(?:Account\s*)?(?:No\.?|Number|#)?\s*[:\-]?\s*\d{9}[A-Z]\b/gi, label: '[REDACTED_CPF_ACCOUNT]' },
+  { pattern: /\b(?:WP|Work\s*Permit)\s*(?:No\.?|Number|#)?\s*[:\-]?\s*[A-Z0-9]{6,12}\b/gi, label: '[REDACTED_WORK_PERMIT]' },
+  { pattern: /\bE\d{7}[A-Z]\b/gi, label: '[REDACTED_SG_PASSPORT]' },
+  { pattern: /\b(?:\+65[\s-]?)?[689]\d{3}[\s-]?\d{4}\b/g, label: '[REDACTED_SG_PHONE]' },
+  { pattern: /\bSingapore\s+\d{6}\b/gi, label: '[REDACTED_SG_POSTAL]' },
 ]
 
 function redactPII(content: string): { redacted: string; piiFound: boolean } {
@@ -452,19 +734,34 @@ export function ChatInterface() {
         const generatedAt = data.generated_at ?? new Date().toISOString()
         const modelId = data.model_id ?? data.model ?? 'unknown'
         const watermark = data.watermark ?? `wp-${Buffer.from(`${modelId}:${generatedAt}`).toString('base64')}`
-        const assistantMessage: Message = {
-          id: uuidv4(),
-          isSynthetic: true,
-          modelId,
-          generatedAt,
-          watermark,
-          role: 'assistant',
-          content: sanitizeLLMOutput(data.response),
-          timestamp: new Date(),
-          error: data.policy_warning ? {
-            type: data.policy_warning.type,
-            message: data.policy_warning.message,
-          } : undefined,
+              const completionTimestamp = new Date().toISOString()
+      const resolvedModelId = data.model || data.modelId || 'unknown'
+      const completionContent = data.message || data.response || data.content || ''
+
+      const assistantMessage: Message = {
+        id: uuidv4(),
+        role: 'assistant',
+        content: completionContent,
+        timestamp: new Date(),
+        isSynthetic: true,
+        modelId: resolvedModelId,
+        generatedAt: completionTimestamp,
+        watermark: data.watermark,
+      }
+
+      // Persist audit record for this AI decision (forensic readiness)
+      sha256Hex(userMessage).then(inputHash => {
+        writeAuditRecord({
+          eventType: 'ai_completion',
+          principal: getAuthToken() ?? 'anonymous',
+          modelId: resolvedModelId,
+          inputHash,
+          outputSnippet: completionContent.slice(0, 200),
+          timestamp: completionTimestamp,
+          sessionId: CHAT_SESSION_ID,
+          messageId: assistantMessage.id,
+        })
+      }).catch(err => console.error('[AUDIT] Input hashing failed:', err)) : undefined,
         }
         setMessages(prev => [...prev, assistantMessage])
       }

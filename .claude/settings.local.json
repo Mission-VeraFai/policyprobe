@@ -3,19 +3,25 @@
     "allow": [
       "Skill(superpowers:brainstorming)",
       "Bash(python3:./scripts/*.py)",
-      "Bash(pip install:-r requirements.txt)"
+      "Bash(pip install:-r requirements.txt)",
       "Bash(pip install:-r requirements-dev.txt)",
       "Bash(npm install)",
       "Bash(lsof:-i :3000)"
       "Bash(lsof:-i :8080)"
       "Bash(lsof:-i :8000)",
       "Bash(./scripts/stop_dev.sh)",
-      "Bash(ls:*)",
-      "Bash(git add:*)",
-      "Bash(git fetch:*)",
-      "Bash(git commit -m \"$\\(cat <<''EOF''\nUpdate README with policy violation and guardrail mapping table\n\nAdded clear mapping showing:\n- Policy category\n- Individual policy\n- Violation file \\(what Unifai scans\\)\n- Guardrail file \\(what Unifai instructs to apply\\)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(ls:.)",
+      "Bash(ls:-la)",
+      "Bash(ls:-la .)",
+      "Bash(git add:.)",
+      "Bash(git add:-A)",
+      "Bash(git fetch:origin)",
+      "Bash(git fetch:--all)",
+      "Bash(git commit -m:*)",
       "Bash(git push)",
-      "Bash(test:*)"
+      "Bash(test:-f)",
+      "Bash(test:-d)",
+      "Bash(test:-e)"
     ]
   }
 }

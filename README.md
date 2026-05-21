@@ -26,7 +26,7 @@ PolicyProbe is a deliberately vulnerable chat agent application designed to demo
 
 - Node.js 18+
 - Python 3.10+
-- Approved LLM API key (obtain from your organization's approved LLM provider)
+- Approved LLM API key for the **organization-approved model only**: `anthropic/claude-3-5-sonnet-20241022` (pinned version `20241022`). Only models listed in the [Organization AI Model Registry](docs/approved-model-registry.md) are permitted. Do **not** substitute unapproved or unpinned models (e.g. generic `gpt-*` aliases without a pinned version). Set `APPROVED_LLM_MODEL=anthropic/claude-3-5-sonnet-20241022` in your `.env` file alongside your API key.
 
 ### Setup
 
@@ -135,7 +135,7 @@ policyprobe/
 **Before:**
 1. Ask: "Can you show me the quarterly financial report?"
 2. Tech support agent escalates to finance agent
-3. Access is improperly granted due to missing inter-agent authentication (vulnerability)
+3. Access is denied — inter-agent authentication token is required and validated
 
 **After Unifai Remediation:**
 1. Same request

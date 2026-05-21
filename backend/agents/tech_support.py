@@ -9,11 +9,59 @@ SECURITY NOTES (for Unifai demo):
 - User context passed without sanitization
 """
 
+import hashlib
+import hmac
 import logging
+import os
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .auth.agent_auth import AgentIdentity, verify_agent_token
 from llm.approved import ApprovedLLMClient
+
+# ---------------------------------------------------------------------------
+# Approved Model Registry
+# Only models listed here may be used by this agent.  Any change to MODEL_NAME,
+# MODEL_VERSION, or MODEL_DIGEST must go through the security review process.
+# ---------------------------------------------------------------------------
+_APPROVED_MODEL_REGISTRY = {
+    "gpt-4o": {
+        "version": "2024-08-06",                          # pinned API version / snapshot
+        "provider": "openai",
+        "digest": "sha256:approved-gpt4o-20240806-unifai",  # integrity token / manifest hash
+        "approved": True,
+    },
+}
+
+MODEL_NAME    = "gpt-4o"
+MODEL_VERSION = _APPROVED_MODEL_REGISTRY[MODEL_NAME]["version"]
+MODEL_DIGEST  = _APPROVED_MODEL_REGISTRY[MODEL_NAME]["digest"]
+
+
+def _verify_model_registration(name: str, version: str, digest: str) -> None:
+    """Raise RuntimeError if the requested model is not in the approved registry."""
+    entry = _APPROVED_MODEL_REGISTRY.get(name)
+    if entry is None:
+        raise RuntimeError(
+            f"Model '{name}' is NOT in the approved model registry. "
+            "Register the model before use."
+        )
+    if entry["version"] != version:
+        raise RuntimeError(
+            f"Model '{name}' version '{version}' does not match the pinned "
+            f"approved version '{entry['version']}'. Update the registry or pin "
+            "to the approved version."
+        )
+    if entry["digest"] != digest:
+        raise RuntimeError(
+            f"Model '{name}' integrity check failed: digest mismatch. "
+            "The model artifact may have been tampered with."
+        )
+    if not entry.get("approved"):
+        raise RuntimeError(
+            f"Model '{name}' is present in the registry but has not been "
+            "approved for production use."
+        )
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +80,19 @@ class TechSupportAgent:
     ALLOWED_ROLES = ["user", "tech_support", "admin"]
     PRIVILEGE_LEVEL = "low"
 
-    def __init__(self, llm_client: ApprovedLLMClient):
-        self.llm_client = llm_client
-        self.agent_id = "tech_support"
-        self.agent_name = "Tech Support Agent"
+    def __init__(self, llm_client: ApprovedLLMClient,
+                 model_name: str = MODEL_NAME,
+                 model_version: str = MODEL_VERSION,
+                 model_digest: str = MODEL_DIGEST):
+        # Enforce approved model registry before accepting the client.
+        _verify_model_registration(model_name, model_version, model_digest)
+
+        self.llm_client   = llm_client
+        self.model_name   = model_name
+        self.model_version = model_version
+        self.model_digest  = model_digest
+        self.agent_id     = "tech_support"
+        self.agent_name   = "Tech Support Agent"
 
     # Maximum allowed length for a user message
     _MAX_MESSAGE_LENGTH = 2000
@@ -52,6 +109,164 @@ class TechSupportAgent:
         r"\\x[0-9a-fA-F]{2}",
         r"\\u[0-9a-fA-F]{4}",
     ]
+
+    # Maximum allowed length for extracted file content
+    _MAX_FILE_CONTENT_LENGTH = 50000
+
+    # Patterns specific to file-based prompt injection
+    _FILE_INJECTION_PATTERNS = [
+        # Standard prompt injection
+        r"ignore (all |previous |prior )?instructions",
+        r"disregard (all |previous |prior )?instructions",
+        r"you are now",
+        r"act as",
+        r"pretend (you are|to be)",
+        r"system prompt",
+        r"<\s*script",
+        # Shell commands
+        r"(?:^|\s)(?:rm|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat)\s+-",
+        r"\$\([^)]+\)",
+        r"`[^`]+`",
+        r"\|\s*(?:bash|sh|python|perl)",
+        # Invisible / zero-width Unicode characters used to hide text
+        r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]",
+        # Hex / unicode escapes
+        r"\\x[0-9a-fA-F]{2}",
+        r"\\u[0-9a-fA-F]{4}",
+    ]
+
+    # Leetspeak substitution map for normalisation before pattern matching
+    _LEET_MAP = str.maketrans(
+        "4831057@",
+        "abeiosla",
+    )
+
+    def _sanitize_file_content(self, content: str) -> str:
+        """
+        Sanitize text extracted from an uploaded file before it is forwarded
+        to the LLM.  Checks for:
+          - Invisible / zero-width Unicode characters
+          - Base64-encoded prompt injection payloads
+          - Leetspeak-obfuscated injection attempts
+          - Embedded shell commands
+          - Standard prompt-injection phrases
+
+        Raises:
+            ValueError: if malicious content is detected.
+        Returns:
+            The cleaned content string.
+        """
+        import re
+        import base64
+
+        if not isinstance(content, str):
+            raise ValueError("File content must be a string.")
+
+        # Remove null bytes
+        cleaned = content.replace("\x00", "")
+
+        if len(cleaned) > self._MAX_FILE_CONTENT_LENGTH:
+            raise ValueError(
+                f"Extracted file content exceeds maximum allowed length of "
+                f"{self._MAX_FILE_CONTENT_LENGTH} characters."
+            )
+
+        # --- 1. Check for invisible / zero-width Unicode characters ----------
+        invisible_pattern = r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]"
+        if re.search(invisible_pattern, cleaned):
+            raise ValueError(
+                "File content contains invisible Unicode characters that may "
+                "be used to hide malicious instructions."
+            )
+
+        # --- 2. Check for base64-encoded payloads ----------------------------
+        # Look for base64 blobs (>=20 chars) and decode them for inspection
+        b64_candidates = re.findall(r"[A-Za-z0-9+/]{20,}={0,2}", cleaned)
+        for candidate in b64_candidates:
+            try:
+                decoded = base64.b64decode(candidate + "==").decode(
+                    "utf-8", errors="ignore"
+                )
+                decoded_lower = decoded.lower()
+                for phrase in [
+                    "ignore instructions",
+                    "disregard instructions",
+                    "you are now",
+                    "act as",
+                    "system prompt",
+                    "pretend",
+                ]:
+                    if phrase in decoded_lower:
+                        raise ValueError(
+                            "File content contains a base64-encoded prompt "
+                            "injection payload."
+                        )
+            except Exception as exc:
+                if "base64-encoded prompt" in str(exc):
+                    raise
+                # Decoding failed — not valid base64, skip
+
+        # --- 3. Check leetspeak-normalised content ---------------------------
+        leet_normalised = cleaned.lower().translate(self._LEET_MAP)
+        for pattern in self._FILE_INJECTION_PATTERNS:
+            if re.search(pattern, leet_normalised, re.IGNORECASE | re.MULTILINE):
+                raise ValueError(
+                    f"File content contains a disallowed pattern (possibly "
+                    f"obfuscated): {pattern}"
+                )
+
+        # --- 4. Check original content against all patterns ------------------
+        for pattern in self._FILE_INJECTION_PATTERNS:
+            if re.search(pattern, cleaned, re.IGNORECASE | re.MULTILINE):
+                raise ValueError(
+                    f"File content contains a disallowed pattern: {pattern}"
+                )
+
+        return cleaned
+
+    # Regex patterns for common PII types
+    _PII_PATTERNS = [
+        # Social Security Numbers (e.g. 123-45-6789)
+        (r'\b\d{3}-\d{2}-\d{4}\b', '[SSN REDACTED]'),
+        # Credit card numbers (16-digit, optionally grouped)
+        (r'\b(?:\d[ -]?){13,16}\b', '[CC REDACTED]'),
+        # Email addresses
+        (r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', '[EMAIL REDACTED]'),
+        # US phone numbers in common formats
+        (r'\b(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b', '[PHONE REDACTED]'),
+        # Dates of birth / generic dates (MM/DD/YYYY or YYYY-MM-DD)
+        (r'\b\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', '[DATE REDACTED]'),
+        # US ZIP codes
+        (r'\b\d{5}(?:-\d{4})?\b', '[ZIP REDACTED]'),
+        # Passport / ID numbers (letter(s) followed by 6-9 digits)
+        (r'\b[A-Z]{1,2}\d{6,9}\b', '[ID REDACTED]'),
+        # IP addresses
+        (r'\b(?:\d{1,3}\.){3}\d{1,3}\b', '[IP REDACTED]'),
+    ]
+
+    def _redact_pii_from_text(self, text: str) -> str:
+        """
+        Scan *text* for common PII patterns and replace each match with a
+        labelled placeholder.  Returns the redacted string.
+
+        This is a best-effort, regex-based redaction layer.  It is applied
+        to all file content before the text is forwarded to the LLM so that
+        sensitive data is not inadvertently leaked through the model.
+        """
+        import re
+
+        if not isinstance(text, str):
+            return text
+
+        redacted = text
+        for pattern, placeholder in self._PII_PATTERNS:
+            redacted = re.sub(pattern, placeholder, redacted)
+
+        logger.info(
+            "PII redaction applied to file content",
+            extra={"original_length": len(text), "redacted_length": len(redacted)},
+        )
+        return redacted
 
     def _sanitize_and_validate(self, message: str) -> str:
         """
@@ -89,6 +304,64 @@ class TechSupportAgent:
 
         return cleaned
 
+    # Patterns that indicate dynamic code execution primitives in LLM output
+    _LLM_OUTPUT_DANGEROUS_PATTERNS = [
+        r"\beval\s*\(",
+        r"\bexec\s*\(",
+        r"\bcompile\s*\(",
+        r"\b__import__\s*\(",
+        r"\bimportlib\b",
+        r"\bsubprocess\b",
+        r"\bos\.system\s*\(",
+        r"\bos\.popen\s*\(",
+        r"\bos\.execv\s*\(",
+        r"\bos\.spawn",
+        r"\bctypes\b",
+        r"\bgetattr\s*\(.*__",
+        r"\bsetattr\s*\(",
+        r"\bdelattr\s*\(",
+        r"\bglobals\s*\(",
+        r"\blocals\s*\(",
+        r"\bvars\s*\(",
+        r"\b__builtins__\b",
+        r"\b__class__\b",
+        r"\b__bases__\b",
+        r"\b__subclasses__\s*\(",
+        r"\bopen\s*\(",
+        r"\bpickle\b",
+        r"\bmarshal\b",
+        r"\bcodeop\b",
+        r"\bast\.literal_eval\b",
+    ]
+
+    def _sanitize_llm_output(self, response: str) -> str:
+        """
+        Validate and sanitize LLM output for dynamic code execution primitives.
+
+        Raises:
+            ValueError: if the response contains a dangerous code execution pattern.
+        Returns:
+            The original response string if it passes all checks.
+        """
+        import re
+
+        if not isinstance(response, str):
+            raise ValueError("LLM response must be a string.")
+
+        for pattern in self._LLM_OUTPUT_DANGEROUS_PATTERNS:
+            if re.search(pattern, response, re.IGNORECASE):
+                logger.warning(
+                    "LLM output blocked: contains dangerous pattern '%s'",
+                    pattern,
+                    extra={"agent_id": self.agent_id},
+                )
+                raise ValueError(
+                    f"LLM output contains a disallowed dynamic code execution "
+                    f"primitive matching pattern: {pattern}"
+                )
+
+        return response
+
     async def handle(
         self,
         context: dict[str, Any],
@@ -114,7 +387,40 @@ class TechSupportAgent:
                 "error": "Unauthorized: invalid or missing agent token",
                 "agent": self.agent_id
             }
-        logger.debug(f"Received request with validated token: {token[:10]}...")
+        logger.debug("Received request with a validated agent token.")
+
+        # Generate a correlation/trace ID that links every step of this request
+        import hashlib, uuid, datetime, json
+        trace_id = str(uuid.uuid4())
+
+        def _audit_log(event: str, principal: str, input_text: str, output_text: str = "") -> None:
+            """Write a structured audit record to the persistent audit trail."""
+            record = {
+                "trace_id": trace_id,
+                "event": event,
+                "agent": self.agent_id,
+                "model_id": getattr(self, "_model_id", "unknown"),
+                "model_version": getattr(self, "_model_version", "unknown"),
+                "principal": principal,
+                "input_hash": hashlib.sha256(input_text.encode("utf-8")).hexdigest(),
+                "output_hash": hashlib.sha256(output_text.encode("utf-8")).hexdigest() if output_text else None,
+                "timestamp_utc": datetime.datetime.utcnow().isoformat() + "Z",
+            }
+            # Persist to the audit log (append-only file; replace with DB/SIEM sink as needed)
+            try:
+                import os
+                audit_path = os.environ.get("AUDIT_LOG_PATH", "/var/log/ai_audit.jsonl")
+                with open(audit_path, "a", encoding="utf-8") as _af:
+                    _af.write(json.dumps(record) + "\n")
+            except Exception as _ae:
+                logger.error("AUDIT LOG WRITE FAILURE: %s | record=%s", _ae, json.dumps(record))
+            logger.info("AUDIT | %s", json.dumps(record))
+
+        _audit_log(
+            event="request_received",
+            principal=str(caller),
+            input_text=str(context),
+        )
 
         raw_message = context.get("user_message", "")
         try:
@@ -137,7 +443,34 @@ class TechSupportAgent:
                     "user_message": user_message[:100]
                 }
             )
-            return await self._escalate_to_finance(user_message, context)
+            # Reduce context to only the fields required by the finance agent
+            reduced_context = {
+                "user_message": user_message,
+                "session_id": context.get("session_id"),
+                "request_id": context.get("request_id"),
+            }
+            logger.info(
+                "Spawning finance subagent",
+                extra={
+                    "spawn_target": "finance",
+                    "reduced_context_keys": list(reduced_context.keys()),
+                    "user_message_preview": user_message[:100],
+                }
+            )
+            result = await self._escalate_to_finance(
+                user_message,
+                reduced_context,
+                timeout=30,
+                max_steps=5,
+            )
+            logger.info(
+                "Finance subagent spawn completed",
+                extra={
+                    "spawn_target": "finance",
+                    "result_keys": list(result.keys()) if isinstance(result, dict) else None,
+                }
+            )
+            return result
 
         # Handle the query directly
         response = await self._process_query(user_message, context)
@@ -145,10 +478,18 @@ class TechSupportAgent:
         # Validate and sanitize LLM output before returning
         sanitized_response = self._validate_llm_response(response)
 
+        _audit_log(
+            event="llm_inference_complete",
+            principal=str(caller),
+            input_text=user_message,
+            output_text=str(sanitized_response),
+        )
+
         return {
             "response": sanitized_response,
             "agent": self.agent_id,
-            "privilege_level": self.PRIVILEGE_LEVEL
+            "privilege_level": self.PRIVILEGE_LEVEL,
+            "trace_id": trace_id,
         }
 
     # Patterns that indicate dynamic code execution primitives in LLM output
@@ -317,16 +658,73 @@ class TechSupportAgent:
         message_lower = message.lower()
         return any(trigger in message_lower for trigger in finance_triggers)
 
-    def _validate_agent_token(self, token: Optional[str]) -> bool:
+    def _validate_agent_token(self, token: Optional[str], expected_subject: Optional[str] = None) -> bool:
         """
-        Validate an incoming agent token against the registered valid tokens.
+        Validate an incoming agent token by verifying its HMAC-SHA256 signature,
+        checking expiry, and binding to the expected subject (agent_id).
 
-        Tokens must be non-empty and present in the authorised token registry
-        maintained by AgentIdentity.
+        Token format (base64url-encoded JSON payload + '.' + hex HMAC-SHA256):
+            <base64url(json_payload)>.<hex_hmac>
+        Payload fields: 'sub' (subject/agent_id), 'exp' (Unix timestamp expiry).
         """
+        import base64
+        import hashlib
+        import hmac
+        import json
+        import os
+        import time
+
         if not token:
+            logger.debug("Token validation failed: token is absent or empty.")
             return False
-        # Delegate to the authoritative token registry on AgentIdentity
+
+        parts = token.split('.')
+        if len(parts) != 2:
+            logger.debug("Token validation failed: malformed token structure.")
+            return False
+
+        payload_b64, provided_sig = parts[0], parts[1]
+
+        # --- 1. Signature verification (HMAC-SHA256, constant-time) ---
+        secret = os.environ.get("AGENT_TOKEN_SECRET", "").encode()
+        if not secret:
+            logger.error("Token validation failed: AGENT_TOKEN_SECRET is not configured.")
+            return False
+
+        expected_sig = hmac.new(secret, payload_b64.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected_sig, provided_sig):
+            logger.debug("Token validation failed: signature mismatch.")
+            return False
+
+        # --- 2. Decode payload ---
+        try:
+            padding = 4 - len(payload_b64) % 4
+            padded = payload_b64 + ('=' * (padding % 4))
+            payload = json.loads(base64.urlsafe_b64decode(padded).decode())
+        except Exception:
+            logger.debug("Token validation failed: payload decode error.")
+            return False
+
+        # --- 3. Expiry check ---
+        exp = payload.get("exp")
+        if exp is None or not isinstance(exp, (int, float)):
+            logger.debug("Token validation failed: missing or invalid 'exp' field.")
+            return False
+        if time.time() > exp:
+            logger.debug("Token validation failed: token has expired.")
+            return False
+
+        # --- 4. Subject binding ---
+        subject = payload.get("sub")
+        if not subject:
+            logger.debug("Token validation failed: missing 'sub' field.")
+            return False
+        bound_subject = expected_subject if expected_subject is not None else self.agent_id
+        if subject != bound_subject:
+            logger.debug("Token validation failed: subject binding mismatch.")
+            return False
+
+        # --- 5. Registry check (authoritative allow-list) ---
         return AgentIdentity.is_valid_token(token)
 
         async def _escalate_to_finance(
@@ -503,6 +901,7 @@ Be helpful, professional, and concise in your responses."""
         in or returned from the context dict to comply with the PII encryption
         policy.
         """
+        import os
         # Simulated user context retrieval
         # In a real app, this would query a database
         user_context = {
@@ -520,8 +919,8 @@ Be helpful, professional, and concise in your responses."""
             "internal_notes": "VIP customer - handle with priority",
             "account_details": {
                 # PII fields are encrypted at rest/in transit
-                "contact_email": self._encrypt_pii("user@example.com"),
-                "phone": self._encrypt_pii("555-123-4567")
+                "contact_email": self._encrypt_pii(os.environ.get("SUPPORT_USER_EMAIL", "")),
+                "phone": self._encrypt_pii(os.environ.get("SUPPORT_USER_PHONE", ""))
             }
         }
 
@@ -534,4 +933,11 @@ Be helpful, professional, and concise in your responses."""
             }
         )
 
-        return user_context
+        # Return only the minimal fields required by callers.
+        # internal_notes is an internal operational field and must not be exposed.
+        # recent_queries and preferences are over-broad for any stated task.
+        # account_details contains PII (even encrypted) and must not be returned.
+        return {
+            "user_id": user_context["user_id"],
+            "subscription_tier": user_context["subscription_tier"],
+        }

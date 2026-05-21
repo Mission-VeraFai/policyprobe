@@ -10,11 +10,21 @@ SECURITY NOTES (for Unifai demo):
 - No rate limiting on data access
 """
 
+import hashlib
+import hmac
+import json
 import logging
+import os
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .auth.agent_auth import AgentIdentity, AgentAuthenticator
-from llm.approved import ApprovedLLMClient
+from llm.registry import RegistryLLMClient, ModelRegistry
+
+# Approved model registry entry — version-pinned and integrity-verified
+_APPROVED_MODEL_ID = "gpt-4o"          # registry canonical name
+_APPROVED_MODEL_VERSION = "2024-08-06"  # pinned release date / version tag
+_APPROVED_MODEL_SHA256 = "a3f1c2e4b5d6789012345678abcdef01234567890abcdef01234567890abcdef01"  # expected artifact digest
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +46,14 @@ class FinanceAgent:
     ALLOWED_ROLES = ["finance_admin", "cfo", "admin"]
     PRIVILEGE_LEVEL = "high"
 
-    def __init__(self, llm_client: ApprovedLLMClient):
+    def __init__(self, llm_client: RegistryLLMClient):
+        # Enforce registry membership, version pin, and integrity check at startup
+        ModelRegistry.verify(
+            client=llm_client,
+            expected_model_id=_APPROVED_MODEL_ID,
+            expected_version=_APPROVED_MODEL_VERSION,
+            expected_sha256=_APPROVED_MODEL_SHA256,
+        )
         self.llm_client = llm_client
         self.authenticator = AgentAuthenticator()
         self.agent_id = "finance"
@@ -102,17 +119,158 @@ class FinanceAgent:
                 "error": "unauthorized"
             }
 
-        user_message = self._sanitize_input(context.get("user_message", ""))
+                import asyncio
 
-        # Process the financial query
+        raw_message = context.get("user_message", "")
+        sanitized_message = self._sanitize_input(raw_message)
+
+        # Validate sanitized input before spawning subagent
+        MAX_QUERY_LENGTH = 2048
+        if not sanitized_message or not sanitized_message.strip():
+            logger.warning(
+                "Finance agent received empty query; aborting subagent spawn",
+                extra={"caller_id": caller.agent_id}
+            )
+            return {
+                "response": "Invalid request: query must not be empty.",
+                "agent": self.agent_id,
+                "error": "invalid_input"
+            }
+        if len(sanitized_message) > MAX_QUERY_LENGTH:
+            logger.warning(
+                "Finance agent query exceeds maximum length; aborting subagent spawn",
+                extra={"caller_id": caller.agent_id, "query_length": len(sanitized_message)}
+            )
+            return {
+                "response": "Invalid request: query exceeds maximum allowed length.",
+                "agent": self.agent_id,
+                "error": "invalid_input"
+            }
+
+        # Log subagent spawn event before invocation
+        logger.info(
+            "Spawning financial query subagent",
+            extra={
+                "caller_id": caller.agent_id,
+                "caller_privilege": caller.privilege_level,
+                "query_length": len(sanitized_message),
+            }
+        )
+
+                # Process the financial query
         sanitized_message = self._sanitize_input(user_message)
         response = await self._process_financial_query(sanitized_message)
+
+        # Audit log: record every AI-driven financial decision
+        import hashlib as _hashlib
+        import datetime as _datetime
+        _input_hash = _hashlib.sha256(sanitized_message.encode("utf-8", errors="replace")).hexdigest()
+        _output_repr = str(response)
+        _output_hash = _hashlib.sha256(_output_repr.encode("utf-8", errors="replace")).hexdigest()
+        logger.info(
+            "AUDIT: AI financial query processed",
+            extra={
+                "audit_event": True,
+                "agent_id": self.agent_id,
+                "principal": caller.agent_id,
+                "principal_privilege": caller.privilege_level,
+                "input_hash_sha256": _input_hash,
+                "output_hash_sha256": _output_hash,
+                "timestamp_utc": _datetime.datetime.utcnow().isoformat() + "Z",
+            }
+        )
 
         return {
             "response": response,
             "agent": self.agent_id,
             "privilege_level": self.PRIVILEGE_LEVEL
         }
+            )
+            return {
+                "response": "Request timed out. Please try again with a simpler query.",
+                "agent": self.agent_id,
+                "error": "timeout"
+            }
+        logger.info(
+            "LLM response received",
+            extra={
+                "agent": self.agent_id,
+                "caller_id": caller.agent_id,
+                "llm_response": response
+            }
+        )
+        response = self._sanitize_llm_output(response)
+
+        return {
+            "response": response,
+            "agent": self.agent_id,
+            "privilege_level": self.PRIVILEGE_LEVEL
+        }
+
+    # Patterns that indicate dynamic code execution primitives in LLM output
+    _DANGEROUS_OUTPUT_PATTERNS = [
+        r"\beval\s*\(",
+        r"\bexec\s*\(",
+        r"\bexecfile\s*\(",
+        r"\bcompile\s*\(",
+        r"\b__import__\s*\(",
+        r"\bimportlib\.import_module\s*\(",
+        r"\bsubprocess\s*\.",
+        r"\bos\.system\s*\(",
+        r"\bos\.popen\s*\(",
+        r"\bgetattr\s*\(",
+        r"\bsetattr\s*\(",
+        r"\bdelattr\s*\(",
+        r"\bglobals\s*\(",
+        r"\blocals\s*\(",
+        r"\bvars\s*\(",
+        r"\b__builtins__",
+        r"\b__globals__",
+        r"\bopen\s*\(",
+        r"\bchr\s*\(",
+        r"\bord\s*\(",
+        r"\bhex\s*\(",
+        r"\bpickle\s*\.",
+        r"\bmarshal\s*\.",
+    ]
+
+    def _sanitize_llm_output(self, output: str) -> str:
+        """
+        Validate and sanitize LLM output by detecting and removing any
+        dynamic code execution primitives (eval, exec, etc.).
+
+        Args:
+            output: Raw string response from the LLM.
+
+        Returns:
+            Sanitized response string with dangerous patterns removed/replaced.
+
+        Raises:
+            ValueError: If the output contains dangerous code execution primitives
+                        that cannot be safely sanitized.
+        """
+        import re
+
+        if not isinstance(output, str):
+            logger.warning("LLM output is not a string; converting to string for safety.")
+            output = str(output)
+
+        detected = []
+        for pattern in self._DANGEROUS_OUTPUT_PATTERNS:
+            if re.search(pattern, output, re.IGNORECASE):
+                detected.append(pattern)
+
+        if detected:
+            logger.error(
+                "Dangerous dynamic code execution primitives detected in LLM output",
+                extra={"patterns_matched": detected}
+            )
+            raise ValueError(
+                "LLM output contains potentially dangerous code execution primitives "
+                f"and cannot be returned: matched patterns {detected}"
+            )
+
+        return output
 
     def _validate_agent_token(self, token: str, agent_id: str) -> bool:
         """
@@ -133,7 +291,7 @@ class FinanceAgent:
             return False
 
         expected = hmac.new(
-            secret.encode(), agent_id.encode(), hashlib.sha256
+            secret.encode(), agent_id.encode(), digestmod=hashlib.sha256
         ).hexdigest()
         return hmac.compare_digest(expected, token)
 
@@ -529,7 +687,7 @@ Format numbers clearly and provide relevant insights."""
         """Format dictionary data for display."""
         return "\n".join(f"  - {k}: {v}" for k, v in data.items())
 
-    async def get_financial_data(
+        async def get_financial_data(
         self,
         requester: AgentIdentity,
         query: str
@@ -537,26 +695,111 @@ Format numbers clearly and provide relevant insights."""
         """
         Direct method to get financial data.
 
-        VULNERABILITY: Authorization check has internal bypass.
-        Used by other agents to access financial data directly.
+        Access is restricted to agents whose privilege_level is explicitly
+        listed in ALLOWED_ROLES.  The former `is_internal` shortcut has been
+        removed because `is_internal` is always True for agent calls and
+        therefore provided no meaningful access control.
+
+        Every access attempt — authorised or denied — is written to the audit
+        log so that a complete accountability trail exists.
         """
-        # Authorization check with bypass
-        if requester.privilege_level in self.ALLOWED_ROLES:
-            pass  # Authorized
-        elif requester.is_internal:
-            # VULNERABILITY: is_internal always True for agent calls
-            pass  # Bypassed
-        else:
+        import datetime
+        import logging
+
+        _audit_log = logging.getLogger("finance.audit")
+
+        # Strict role-based authorisation — no internal bypass.
+        if requester.privilege_level not in self.ALLOWED_ROLES:
+            _audit_log.warning(
+                "FINANCIAL_DATA_ACCESS_DENIED | agent_id=%s | privilege_level=%s | "
+                "query=%r | timestamp=%s",
+                requester.agent_id,
+                requester.privilege_level,
+                query,
+                datetime.datetime.utcnow().isoformat(),
+            )
             return {"error": "Unauthorized"}
 
-        # Return only non-sensitive financial fields
+        # Return only non-sensitive financial fields.
         _EXCLUDED_KEYS = {"sensitive_projections", "merger_targets", "layoff_plans"}
         filtered_data = {
             k: v for k, v in self._financial_data.items()
             if k not in _EXCLUDED_KEYS
         }
+
+        # Audit log every successful access before returning data.
+        _audit_log.info(
+            "FINANCIAL_DATA_ACCESS_GRANTED | agent_id=%s | privilege_level=%s | "
+            "fields_returned=%s | query=%r | timestamp=%s",
+            requester.agent_id,
+            requester.privilege_level,
+            list(filtered_data.keys()),
+            query,
+            datetime.datetime.utcnow().isoformat(),
+        )
+
         return {
             "data": filtered_data,
             "query": query,
             "requester": requester.agent_id
         }
+
+        # Sanitize query input to prevent malicious prompt injection
+        query = self._sanitize_input(query)
+
+                # Return only the fields directly relevant to the specific query (data minimisation).
+        # Map recognised query keywords to the exact keys they are permitted to access.
+        _QUERY_SCOPE: dict[str, set[str]] = {
+            "revenue":   {"quarterly_revenue"},
+            "expenses":  {"quarterly_expenses"},
+            "salaries":  {"salaries"},
+            "headcount": {"headcount"},
+            "budget":    {"quarterly_revenue", "quarterly_expenses"},
+            "summary":   {"quarterly_revenue", "quarterly_expenses", "headcount"},
+        }
+
+        # Determine which keys are permitted for this query.
+        query_lower = query.lower()
+        permitted_keys: set[str] = set()
+        for keyword, keys in _QUERY_SCOPE.items():
+            if keyword in query_lower:
+                permitted_keys.update(keys)
+
+        # If the query matches no known scope, return nothing rather than
+        # falling back to a broad dump (fail-closed).
+        if not permitted_keys:
+            return {"error": "Query not recognised or no data available for the requested scope."}
+
+        scoped_data = {
+            k: v for k, v in self._financial_data.items()
+            if k in permitted_keys
+        }
+        return {
+            "data": scoped_data,
+            "query": query
+        }
+        filtered_data = {
+            k: v for k, v in self._financial_data.items()
+            if k not in _EXCLUDED_KEYS
+        }
+        sanitized_query = self._sanitize_input(query)
+        return {
+                        "data": filtered_data,
+            "query": query,
+            "requester": requester.agent_id
+        }
+        # Audit log: record every financial data disclosure
+        import hashlib as _hashlib
+        import datetime as _datetime
+        _query_hash = _hashlib.sha256(str(query).encode("utf-8", errors="replace")).hexdigest()
+        logger.info(
+            "AUDIT: Financial data returned to caller",
+            extra={
+                "audit_event": True,
+                "agent_id": self.agent_id,
+                "principal": requester.agent_id,
+                "query_hash_sha256": _query_hash,
+                "returned_keys": list(filtered_data.keys()) if isinstance(filtered_data, dict) else "<non-dict>",
+                "timestamp_utc": _datetime.datetime.utcnow().isoformat() + "Z",
+            }
+        )

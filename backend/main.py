@@ -22,31 +22,87 @@ import re
 import os
 import os
 import secrets
+
+
+def _sanitize_llm_input(value: str, max_length: int = 4000) -> str:
+    """Sanitize untrusted input before interpolation into an LLM prompt.
+
+    Defences applied:
+    1. Truncate to a safe maximum length.
+    2. Remove ASCII control characters (except ordinary whitespace).
+    3. Strip common prompt-injection / jailbreak patterns.
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    # 1. Truncate
+    value = value[:max_length]
+    # 2. Remove control characters (keep \t, \n, \r)
+    value = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value)
+    # 3. Strip prompt-injection patterns (case-insensitive)
+    injection_patterns = [
+        r'(?i)ignore\s+(all\s+)?(previous|prior|above)\s+instructions?',
+        r'(?i)disregard\s+(all\s+)?(previous|prior|above)\s+instructions?',
+        r'(?i)you\s+are\s+now\s+(?:a|an|the)\s+',
+        r'(?i)act\s+as\s+(?:a|an|the)\s+',
+        r'(?i)system\s*:\s*',
+        r'(?i)<\s*/?\s*(?:system|user|assistant)\s*>',
+    ]
+    for pattern in injection_patterns:
+        value = re.sub(pattern, '[FILTERED]', value)
+    return value
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
 from fastapi.security import HTTPBasic, HTTPBasicCredentials, Security, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import hashlib
+import hmac
+import json
+import time
+import uuid
+
 import openai
 
 # Approved LLM client using OpenAI (organization-approved registry)
 _openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-APPROVED_MODEL = "gpt-4o"
+APPROVED_MODEL = "gpt-4"
+
+
+def _sanitize_llm_input(text: str, max_length: int = 16000) -> str:
+    """Sanitize and validate text before sending it to the LLM.
+
+    - Rejects None / non-string values.
+    - Strips null bytes and ASCII control characters (except common whitespace).
+    - Truncates to max_length characters to prevent prompt-stuffing / DoS.
+    """
+    if not isinstance(text, str):
+        raise ValueError("LLM input must be a string.")
+    # Remove null bytes and non-printable control characters
+    # (keep \t, \n, \r which are legitimate whitespace)
+    sanitized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    # Truncate to a safe maximum length
+    sanitized = sanitized[:max_length]
+    return sanitized
 
 
 class AgentOrchestrator:
     """Inline orchestrator using only approved LLMs from the organization registry."""
 
     def process(self, message: str, context: str = "") -> str:
-        prompt = message
+        message = _sanitize_llm_input(message)
         if context:
-            prompt = f"Context:\n{context}\n\nUser message:\n{message}"
+            context = _sanitize_llm_input(context)
+        safe_message = _sanitize_llm_input(message)
+        prompt = safe_message
+        if context:
+            safe_context = _sanitize_llm_input(context)
+            prompt = f"Context:\n{safe_context}\n\nUser message:\n{safe_message}"
         response = _openai_client.chat.completions.create(
             model=APPROVED_MODEL,
             messages=[{"role": "user", "content": prompt}],
         )
-        return response.choices[0].message.content
+        return _sanitize_llm_output(response.choices[0].message.content)
 
 
 class FileProcessorAgent:
@@ -55,19 +111,19 @@ class FileProcessorAgent:
     def extract_text(self, file_content: bytes, file_type: str) -> str:
         """Extract and summarize text from file content using an approved LLM."""
         try:
-            text = file_content.decode("utf-8", errors="replace")
+            text = _sanitize_llm_input(file_content.decode("utf-8", errors="replace"))
         except Exception:
-            text = repr(file_content[:500])
+            text = _sanitize_llm_input(repr(file_content[:500]))
         response = _openai_client.chat.completions.create(
             model=APPROVED_MODEL,
             messages=[
                 {
                     "role": "user",
-                    "content": f"Summarize the following file content (type: {file_type}):\n\n{text[:4000]}",
+                    "content": f"Summarize the following file content (type: {_sanitize_llm_input(file_type, max_length=64)}):\n\n{_sanitize_llm_input(text)}",
                 }
             ],
         )
-        return response.choices[0].message.content
+        return _sanitize_llm_output(response.choices[0].message.content)
 
 # Configure logging
 logging.basicConfig(
@@ -109,7 +165,7 @@ file_processor = FileProcessorAgent()
 security = HTTPBasic()
 
 AUTH_USERNAME = os.environ.get("API_USERNAME", "admin")
-AUTH_PASSWORD = os.environ.get("API_PASSWORD", "changeme")
+AUTH_PASSWORD = os.environ.get("API_PASSWORD", "")
 
 
 def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)) -> str:
@@ -122,23 +178,70 @@ def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)) ->
         credentials.password.encode("utf-8"),
         AUTH_PASSWORD.encode("utf-8"),
     )
+    if not AUTH_PASSWORD:
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication is not configured on this server.",
+        )
     if not (correct_username and correct_password):
-                raise HTTPException(
-            status_code=500,
-            detail="An internal error occurred processing your request."
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid credentials.",
+            headers={"WWW-Authenticate": "Basic"},
         )
     return credentials.username
 
 # Authentication
 _bearer_scheme = HTTPBearer()
 _API_KEY = os.environ.get("API_KEY", "")
+_TOKEN_SUBJECT = os.environ.get("API_TOKEN_SUBJECT", "policyprobe-api")
+_TOKEN_TTL_SECONDS = int(os.environ.get("API_TOKEN_TTL", "3600"))
+
+
+def _generate_api_token(subject: str = _TOKEN_SUBJECT, ttl: int = _TOKEN_TTL_SECONDS) -> str:
+    """Generate an HMAC-SHA256 signed token with expiry and subject binding.
+
+    Token format (base64url): <subject>.<expiry_unix_ts>.<hex_hmac_signature>
+    """
+    if not _API_KEY:
+        raise ValueError("API_KEY secret is not configured")
+    expiry = int(time.time()) + ttl
+    payload = f"{subject}.{expiry}"
+    sig = hmac.new(
+        _API_KEY.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    raw = f"{payload}.{sig}"
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("utf-8")
 
 
 def verify_api_key(credentials: HTTPAuthorizationCredentials = Security(_bearer_scheme)) -> None:
-    """Validate the bearer token against the configured API key."""
+    """Validate the bearer token: verify HMAC signature, expiry, and subject binding."""
     if not _API_KEY:
         raise HTTPException(status_code=500, detail="Server API key not configured")
-    if credentials.credentials != _API_KEY:
+    try:
+        raw = base64.urlsafe_b64decode(credentials.credentials.encode("utf-8")).decode("utf-8")
+        parts = raw.split(".")
+        if len(parts) != 3:
+            raise ValueError("Malformed token")
+        subject, expiry_str, provided_sig = parts
+        # Verify subject binding
+        if not secrets.compare_digest(subject, _TOKEN_SUBJECT):
+            raise ValueError("Subject mismatch")
+        # Verify expiry
+        if int(time.time()) > int(expiry_str):
+            raise ValueError("Token expired")
+        # Verify HMAC signature
+        payload = f"{subject}.{expiry_str}"
+        expected_sig = hmac.new(
+            _API_KEY.encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not secrets.compare_digest(provided_sig, expected_sig):
+            raise ValueError("Invalid signature")
+    except (ValueError, Exception):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
@@ -169,6 +272,10 @@ class ChatResponse(BaseModel):
 
 
 import re
+import time
+import hmac as hmac
+import hashlib
+import base64
 
 _PII_PATTERNS = [
     # Email addresses
@@ -721,7 +828,14 @@ async def upload_file(file: UploadFile = File(...), _: None = Depends(verify_api
     )
 
     # Scan for Singapore PII before processing
-    decoded_content = content.decode('utf-8', errors='ignore')
+        # Sanitize redacted text for hidden prompts, shell commands, and encoded payloads
+    sanitize_text_input(safe_content, field_name=f"uploaded_file:{file.filename}")
+
+    processed = await file_processor.process(
+        content=safe_content,
+        filename=file.filename,
+        content_type=file.content_type
+    )
     pii_hits = _detect_sg_pii(decoded_content)
     if pii_hits:
         raise HTTPException(
@@ -739,7 +853,43 @@ async def upload_file(file: UploadFile = File(...), _: None = Depends(verify_api
 
     # Redact PII from file content before processing
     decoded_content = content.decode('utf-8', errors='ignore')
-    safe_content = redact_pii(decoded_content)
+
+    import re as _re
+
+    def _redact_sg_pii(text: str) -> str:
+        """Redact Singapore-specific PII categories in addition to generic PII."""
+        # NRIC / FIN: S/T/F/G followed by 7 digits and a letter (case-insensitive)
+        text = _re.sub(
+            r'\b[STFG]\d{7}[A-Z]\b',
+            '[REDACTED_NRIC_FIN]',
+            text,
+            flags=_re.IGNORECASE,
+        )
+        # SingPass user ID pattern (8-character alphanumeric, often same as NRIC)
+        # Already covered by NRIC pattern above; add explicit label for clarity.
+        # CPF account number: 9-digit numeric string (standalone)
+        text = _re.sub(
+            r'(?<![\d])\d{9}(?![\d])',
+            '[REDACTED_CPF]',
+            text,
+        )
+        # Singapore mobile / phone numbers: +65 or 65 prefix, 8 digits
+        text = _re.sub(
+            r'(?:\+65|\b65)?[\s\-]?[689]\d{7}\b',
+            '[REDACTED_SG_PHONE]',
+            text,
+        )
+        # Singapore postal codes: 6-digit numeric (standalone)
+        text = _re.sub(
+            r'(?<![\d])\d{6}(?![\d])',
+            '[REDACTED_SG_POSTAL]',
+            text,
+        )
+        # Apply generic PII redaction on top
+        text = redact_pii(text)
+        return text
+
+    safe_content = _redact_sg_pii(decoded_content)
 
     # Reject binary executables before any further processing
     if _contains_binary_executable(content):
@@ -761,11 +911,6 @@ async def upload_file(file: UploadFile = File(...), _: None = Depends(verify_api
         content_type=file.content_type
     )
 
-    processed = await file_processor.process(
-        content=content.decode('utf-8', errors='ignore'),
-        filename=file.filename,
-        content_type=file.content_type
-    )
     # Validate file_processor output for dynamic code execution primitives
     processed = _sanitize_llm_output(processed, source="file_processor.process (upload)")
 

@@ -16,13 +16,20 @@ AFTER UNIFAI REMEDIATION:
 - Identify known prompt injection patterns
 """
 
+import hashlib
 import logging
 import re
 import base64
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+audit_logger = logging.getLogger("audit.prompt_injection")
+# audit_logger should be wired to an append-only, persistent handler
+# (e.g. a rotating file with mode='a', a SIEM forwarder, or a write-once
+# object-store sink) with a minimum retention of 90 days.
 
 
 @dataclass
@@ -78,7 +85,7 @@ class PromptInjectionDetector:
     - metadata_injection: Malicious content in file metadata
     """
 
-    # Known prompt injection patterns (defined but NOT USED)
+    # Known prompt injection patterns used by detect_prompt_injection()
     INJECTION_PATTERNS = [
         r"ignore\s+(previous|all|above)\s+instructions?",
         r"disregard\s+(previous|all|above)\s+(instructions?|context)",
@@ -114,15 +121,12 @@ class PromptInjectionDetector:
         """
         Scan content for prompt injection and hidden threats.
 
-        VULNERABILITY: This method is a NO-OP.
-        It returns no threats regardless of content.
-
         Args:
             content: Content to scan for threats
             source: Source of the content (for logging)
 
         Returns:
-            ThreatDetectionResult with has_violations=False always
+            ThreatDetectionResult with detected threats, if any.
         """
         content_length = len(content) if content else 0
 
@@ -166,13 +170,11 @@ class PromptInjectionDetector:
             scanned_content_length=content_length
         )
 
-    async def detect_hidden_text(self, content: str) -> list[ThreatMatch]:
+        async def detect_hidden_text(self, content: str) -> list[ThreatMatch]:
         """
         Detect hidden text patterns in content.
 
-        VULNERABILITY: Not implemented - returns empty list.
-
-        Should detect:
+        Detects:
         - White text on white background (CSS)
         - Zero-size text
         - Off-screen positioned text

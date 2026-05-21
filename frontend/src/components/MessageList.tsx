@@ -2,7 +2,56 @@
 
 import { Message } from './ChatInterface'
 import { ErrorDisplay } from './ErrorDisplay'
-import { User, Bot, Paperclip } from 'lucide-react'
+import { User, Bot, Paperclip, AlertTriangle } from 'lucide-react'
+
+// Patterns for dynamic code execution primitives that must never appear in LLM output
+const DANGEROUS_PATTERNS: RegExp[] = [
+  /\beval\s*\(/gi,
+  /\bexec\s*\(/gi,
+  /\bnew\s+Function\s*\(/gi,
+  /\bsetTimeout\s*\(\s*['"`]/gi,
+  /\bsetInterval\s*\(\s*['"`]/gi,
+  /\bsetImmediate\s*\(\s*['"`]/gi,
+  /\bexecScript\s*\(/gi,
+  /\bdocument\.write\s*\(/gi,
+  /\binnerHTML\s*=/gi,
+  /\bouterHTML\s*=/gi,
+  /\bimportScripts\s*\(/gi,
+  /javascript\s*:/gi,
+  /vbscript\s*:/gi,
+  /data\s*:\s*text\/html/gi,
+]
+
+interface SanitizationResult {
+  sanitized: string
+  flagged: boolean
+  detectedPatterns: string[]
+}
+
+function sanitizeLLMOutput(content: string): SanitizationResult {
+  const detectedPatterns: string[] = []
+
+  for (const pattern of DANGEROUS_PATTERNS) {
+    // Reset lastIndex for global regexes
+    pattern.lastIndex = 0
+    if (pattern.test(content)) {
+      detectedPatterns.push(pattern.source)
+    }
+  }
+
+  if (detectedPatterns.length === 0) {
+    return { sanitized: content, flagged: false, detectedPatterns: [] }
+  }
+
+  // Neutralize all dangerous patterns by inserting a zero-width space to break execution
+  let sanitized = content
+  for (const pattern of DANGEROUS_PATTERNS) {
+    pattern.lastIndex = 0
+    sanitized = sanitized.replace(pattern, (match) => `[BLOCKED:${match.trim()}]`)
+  }
+
+  return { sanitized, flagged: true, detectedPatterns }
+}
 
 interface MessageListProps {
   messages: Message[]
@@ -63,7 +112,7 @@ export function MessageList({ messages }: MessageListProps) {
                     <div
                       className="flex items-center gap-2 mb-1"
                       data-provenance="ai-generated"
-                      data-model="gpt-assistant"
+                      data-model="claude-3-5-sonnet"
                       data-generated-at={message.timestamp.toISOString()}
                       aria-label="AI-generated content"
                     >
@@ -72,16 +121,42 @@ export function MessageList({ messages }: MessageListProps) {
                         AI-Generated
                       </span>
                       <span className="text-xs text-gray-500" title="Model identifier">
-                        model: gpt-assistant
+                        model: claude-3-5-sonnet
                       </span>
                       <span className="text-xs text-gray-600" title="Generation timestamp">
                         &#x2022; {message.timestamp.toISOString()}
                       </span>
                     </div>
                   )}
-                  <div className="message-content text-gray-100">
-                    {message.content}
-                  </div>
+                  {(() => {
+                    const { sanitized, flagged, detectedPatterns } =
+                      sanitizeLLMOutput(message.content)
+                    return (
+                      <>
+                        {flagged && (
+                          <div
+                            className="flex items-center gap-2 mb-2 rounded px-2 py-1 text-xs font-medium bg-red-900 text-red-300 border border-red-700"
+                            role="alert"
+                            aria-label="Potentially unsafe content detected and blocked"
+                          >
+                            <AlertTriangle className="w-3 h-3 flex-shrink-0" />
+                            <span>
+                              Warning: Potentially unsafe content detected and neutralized
+                              {process.env.NODE_ENV === 'development' && (
+                                <> (patterns: {detectedPatterns.join(', ')})</>
+                              )}
+                            </span>
+                          </div>
+                        )}
+                        <div
+                          className="message-content text-gray-100 whitespace-pre-wrap"
+                          aria-label={flagged ? 'Sanitized AI response' : 'AI response'}
+                        >
+                          {sanitized}
+                        </div>
+                      </>
+                    )
+                  })()}
                 </div>
               )}
 

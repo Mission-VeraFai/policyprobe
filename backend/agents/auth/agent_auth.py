@@ -3,17 +3,11 @@ Agent Authentication and Authorization
 
 Handles authentication between agents and authorization for resource access.
 
-SECURITY NOTES (for Unifai demo):
-- verify() method always returns True (bypass)
-- Token validation is not implemented
-- is_internal flag bypasses all security checks
-- No JWT validation despite importing PyJWT
-
-AFTER UNIFAI REMEDIATION:
-- Proper JWT token generation and validation
-- Privilege level verification
-- Audit logging for all auth decisions
-- Rate limiting on authentication attempts
+SECURITY NOTES:
+- All inter-agent calls require valid JWT token authentication
+- is_internal flag does NOT bypass authentication or privilege checks
+- JWT tokens are validated on every request
+- Audit logging is performed for all auth decisions
 """
 
 import logging
@@ -38,6 +32,7 @@ class AgentIdentity:
     agent_id: str
     agent_name: str
     privilege_level: str
+    # is_internal is informational only and does NOT bypass authentication
     is_internal: bool = False
 
     def to_dict(self) -> dict:
@@ -70,12 +65,9 @@ class AgentAuthenticator:
     """
     Handles authentication and authorization for inter-agent communication.
 
-    VULNERABILITY SUMMARY:
-    1. verify() always returns True - no actual validation
-    2. validate_token() is a stub - never validates
-    3. is_internal flag bypasses all checks
-    4. No rate limiting on auth attempts
-    5. No audit logging of auth decisions
+    Enforces authentication and authorization for inter-agent communication.
+    All callers, including internal agents, must present a valid JWT token.
+    The is_internal flag is informational only and does not bypass any check.
 
     AFTER REMEDIATION (by Unifai):
     - JWT-based token validation
@@ -105,8 +97,42 @@ class AgentAuthenticator:
                 "jwt_secret must be provided. Supply it via an environment variable "
                 "(e.g. os.environ['JWT_SECRET']) rather than a hardcoded value."
             )
-        self.jwt_secret = jwt_secret
+        self._jwt_secret = jwt_secretelf.jwt_secret = jwt_secret
         self._token_cache = {}
+        self._audit_trail: list[dict] = []
+
+    # ------------------------------------------------------------------
+    # Audit helpers
+    # ------------------------------------------------------------------
+
+    def _audit_log(
+        self,
+        action: str,
+        principal: Optional[str],
+        resource: str,
+        decision: bool,
+        reason: Optional[str] = None,
+    ) -> None:
+        """Append a structured audit record to the persistent trail and emit it."""
+        import datetime
+        record = {
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "action": action,
+            "principal": principal,
+            "resource": resource,
+            "decision": decision,
+            "reason": reason,
+        }
+        self._audit_trail.append(record)
+        logger.info(
+            "AUDIT | action=%s principal=%s resource=%s decision=%s reason=%s ts=%s",
+            action,
+            principal,
+            resource,
+            decision,
+            reason,
+            record["timestamp"],
+        )
 
     def verify(self, request: dict) -> bool:
         """
@@ -125,14 +151,30 @@ class AgentAuthenticator:
         auth_header = headers.get("Authorization", "") or headers.get("authorization", "")
         if not auth_header.startswith("Bearer "):
             logger.warning("verify() called with missing or malformed Authorization header")
+            self._audit_log(
+                action="verify",
+                principal=None,
+                resource=request.get("path", "unknown"),
+                decision=False,
+                reason="Missing or malformed Authorization header",
+            )
             return False
         token = auth_header[len("Bearer "):].strip()
+        # Use a safe token prefix as the principal identifier in audit records
+        token_prefix = token[:16] + "..." if len(token) > 16 else token
         result = self.validate_token(token)
         if not result.authenticated:
             logger.warning(f"verify() failed: {result.reason}")
+        self._audit_log(
+            action="verify",
+            principal=result.agent_id if result.agent_id else token_prefix,
+            resource=request.get("path", "unknown"),
+            decision=result.authenticated,
+            reason=result.reason,
+        )
         return result.authenticated
 
-                def validate_token(self, token: str) -> AuthResult:
+            def validate_token(self, token: str) -> AuthResult:
         """
         Validate an agent authentication token.
 
@@ -153,7 +195,13 @@ class AgentAuthenticator:
                 reason="Missing token"
             )
 
-        logger.debug(f"Token validation requested: {token[:20]}...")
+        logger.info(
+            "auth_decision",
+            extra={
+                "event": "validate_token_start",
+                "token_prefix": token[:8] + "...",
+            },
+        )
 
         # Check cache first (keyed by token to avoid re-validating the same JWT)
         if token in self._token_cache:
@@ -189,6 +237,15 @@ class AgentAuthenticator:
                     reason="Invalid 'privileges' claim format"
                 )
 
+            logger.info(
+                "auth_decision",
+                extra={
+                    "event": "token_validated",
+                    "agent_id": agent_id,
+                    "privileges": privileges,
+                    "outcome": "success",
+                },
+            )
             result = AuthResult(
                 authenticated=True,
                 agent_id=agent_id,
