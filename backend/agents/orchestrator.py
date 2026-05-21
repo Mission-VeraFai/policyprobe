@@ -20,41 +20,94 @@ from typing import Any, Optional
 from .tech_support import TechSupportAgent
 
 # ---------------------------------------------------------------------------
-# Persistent append-only audit log — RotatingFileHandler enforces retention
-# ---------------------------------------------------------------------------
-_AUDIT_LOG_PATH = os.environ.get("LLM_AUDIT_LOG_PATH", "/var/log/app/llm_audit.log")
-_llm_audit_logger = logging.getLogger("llm_audit")
-if not _llm_audit_logger.handlers:
-    _llm_audit_logger.setLevel(logging.INFO)
-    _llm_audit_logger.propagate = False  # do not leak to root logger
-    _audit_file_handler = logging.handlers.RotatingFileHandler(
-        _AUDIT_LOG_PATH,
-        maxBytes=50 * 1024 * 1024,   # 50 MB per file
-        backupCount=90,              # retain 90 rotated files (~90 days at typical volume)
-        encoding="utf-8",
-        delay=False,
-    )
-    _audit_file_handler.setLevel(logging.INFO)
-    _audit_file_handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    )
-    _llm_audit_logger.addHandler(_audit_file_handler)
-
-
-# ---------------------------------------------------------------------------
 # Approved Model Registry
 # Maps pinned model identifiers to their expected SHA-256 integrity hashes.
 # Only models present in this registry may be invoked.
-# To add a new model: obtain its canonical ID and integrity hash from the
-# model governance team, then add an entry here under change control.
+#
+# SECURITY REQUIREMENT: Hash values MUST be real SHA-256 digests of the
+# model card / manifest obtained from the model governance team and injected
+# at deploy time via the LLM_MODEL_REGISTRY_HASHES environment variable
+# (JSON object: {"<pinned-id>": "<sha256-hex>"}).
+#
+# The hard-coded fallback entries below are INTENTIONALLY left empty so that
+# the application fails closed if the environment variable is not set.
+# Do NOT replace the empty strings with fabricated hex values.
 # ---------------------------------------------------------------------------
-_APPROVED_MODEL_REGISTRY: dict = {
-    # Format: "<provider>/<model-name>:<version>": "<sha256-of-model-card-or-manifest>"
-    "anthropic/claude-3-sonnet:20240229": "a3f1c2e4b5d6789012345678901234567890abcdef1234567890abcdef123456",
-    "openai/gpt-4o:2024-05-13": "b4e2d1f3a6c7890123456789012345678901bcdef2345678901bcdef23456789",
-    "openai/gpt-4-turbo:2024-04-09": "c5f3e2a4b7d8901234567890123456789012cdef3456789012cdef3456789012",
-    "internal/approved-llm-v2.1.0:stable": "d6a4f3b5c8e9012345678901234567890123def4567890123def4567890123de",
-}
+
+import json as _json
+import re as _re
+
+# Regex for a valid 64-character lowercase hex SHA-256 digest.
+_SHA256_RE = _re.compile(r'^[0-9a-f]{64}$')
+
+# Known-bad placeholder patterns that must never appear in production.
+_PLACEHOLDER_PATTERNS = [
+    _re.compile(r'(0123456789|abcdef){3,}', _re.IGNORECASE),  # sequential runs
+    _re.compile(r'^(.)(\1){15,}'),                             # repeated single char
+]
+
+
+def _load_registry_hashes() -> dict:
+    """
+    Load model registry hashes from the LLM_MODEL_REGISTRY_HASHES environment
+    variable (JSON).  Each value must be a valid 64-char lowercase hex SHA-256
+    digest and must not match any known placeholder pattern.
+
+    Raises RuntimeError on any integrity or format violation so the process
+    fails closed rather than running with unverified models.
+    """
+    raw = os.environ.get("LLM_MODEL_REGISTRY_HASHES", "")
+    if not raw:
+        raise RuntimeError(
+            "LLM_MODEL_REGISTRY_HASHES environment variable is not set. "
+            "Provide a JSON object mapping pinned model IDs to their "
+            "SHA-256 integrity hashes obtained from the model governance team."
+        )
+    try:
+        mapping = _json.loads(raw)
+    except _json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"LLM_MODEL_REGISTRY_HASHES is not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(mapping, dict) or not mapping:
+        raise RuntimeError(
+            "LLM_MODEL_REGISTRY_HASHES must be a non-empty JSON object."
+        )
+    validated: dict = {}
+    for model_id, digest in mapping.items():
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise RuntimeError(
+                f"Invalid model ID key in registry: {model_id!r}"
+            )
+        if not isinstance(digest, str) or not _SHA256_RE.match(digest):
+            raise RuntimeError(
+                f"Registry hash for '{model_id}' is not a valid 64-char "
+                f"lowercase hex SHA-256 digest: {digest!r}. "
+                f"Obtain the real digest from the model governance team."
+            )
+        for pat in _PLACEHOLDER_PATTERNS:
+            if pat.search(digest):
+                raise RuntimeError(
+                    f"Registry hash for '{model_id}' matches a known "
+                    f"placeholder pattern and is not a real cryptographic "
+                    f"digest: {digest!r}. Replace it with the verified "
+                    f"digest from the model governance team."
+                )
+        validated[model_id] = digest
+    return validated
+
+
+try:
+    _APPROVED_MODEL_REGISTRY: dict = _load_registry_hashes()
+except RuntimeError as _reg_err:
+    # Log and re-raise so the process fails closed.
+    logging.getLogger(__name__).critical(
+        "REGISTRY_LOAD_FAILURE | %s", _reg_err
+    )
+    raise
+
+# Default approved model used by agents — must be a key present in _APPROVED_MODEL_REGISTRY.
+_APPROVED_MODEL_ID = "internal/approved-llm-v2.1.0:stable"
 
 
 def _verify_model_in_registry(model: str) -> str:
@@ -95,6 +148,19 @@ def _log_llm_request(model: str, messages: list, extra: dict = None, principal: 
     # --- Registry enforcement: block any non-approved / non-pinned model ---
     _verify_model_in_registry(model)
 
+    # Sanitize and validate all messages before logging or forwarding to LLM
+    if isinstance(messages, list):
+        sanitized_messages = []
+        for m in messages:
+            if isinstance(m, dict):
+                sanitized_m = dict(m)
+                if "content" in sanitized_m:
+                    sanitized_m["content"] = _sanitize_prompt_input(str(sanitized_m["content"]))
+                sanitized_messages.append(sanitized_m)
+            else:
+                sanitized_messages.append(m)
+        messages = sanitized_messages
+
     # Compute a SHA-256 hash of the full serialized input for integrity/forensics
     serialized_input = _json.dumps(messages, default=str, sort_keys=True)
     input_hash = hashlib.sha256(serialized_input.encode("utf-8")).hexdigest()
@@ -118,6 +184,19 @@ def _log_llm_request(model: str, messages: list, extra: dict = None, principal: 
         _json.dumps(payload, default=str),
     ) -> None:
     """Log an outgoing LLM request for audit purposes."""
+    # Sanitize and validate all messages before logging or forwarding to LLM
+    if isinstance(messages, list):
+        sanitized_messages = []
+        for m in messages:
+            if isinstance(m, dict):
+                sanitized_m = dict(m)
+                if "content" in sanitized_m:
+                    sanitized_m["content"] = _sanitize_prompt_input(str(sanitized_m["content"]))
+                sanitized_messages.append(sanitized_m)
+            else:
+                sanitized_messages.append(m)
+        messages = sanitized_messages
+
     # Compute a SHA-256 hash of the full serialized input for integrity/forensics
     serialized_input = _json.dumps(messages, default=str, sort_keys=True)
     input_hash = hashlib.sha256(serialized_input.encode("utf-8")).hexdigest()
@@ -406,7 +485,11 @@ def _log_llm_response(model: str, response: Any, extra: dict = None) -> None:
             "model": model,
             "principal": getattr(resp_data, "principal", None) if not isinstance(resp_data, dict) else resp_data.get("principal"),
             "input_hash": _input_hash,
-            "response": resp_data,
+            "response_summary": {
+                "content_hash": _hashlib.sha256(_serialised_resp.encode("utf-8")).hexdigest(),
+                "response_type": type(resp_data).__name__,
+                "response_length": len(_serialised_resp),
+            },
         }
 
         # Write audit payload to append-only persistent store
@@ -424,10 +507,18 @@ def _log_llm_response(model: str, response: Any, extra: dict = None) -> None:
             # Enforce retention: remove audit log files older than retention period
             import glob as _glob
             _now = time.time()
+            _audit_log_dir_real = _os.path.realpath(_AUDIT_LOG_DIR)
             for _old_file in _glob.glob(_os.path.join(_AUDIT_LOG_DIR, "llm_audit*.jsonl")):
                 try:
+                    # Validate resolved path stays within the audit log directory
+                    _old_file_real = _os.path.realpath(_old_file)
+                    if not _old_file_real.startswith(_audit_log_dir_real + _os.sep):
+                        _llm_audit_logger.warning(
+                            "Retention cleanup skipped suspicious path: %s", _old_file
+                        )
+                        continue
                     if _os.path.getmtime(_old_file) < _now - (_AUDIT_LOG_RETENTION_DAYS * 86400):
-                        _os.remove(_old_file)
+                        _os.unlink(_old_file_real)
                 except OSError:
                     pass  # Non-fatal: retention cleanup failure does not block audit write
             _llm_audit_logger.info(
@@ -917,6 +1008,31 @@ if not _llm_audit_logger.handlers:
         logging.getLogger(__name__).error(
             "Failed to configure append-only LLM audit file handler: %s", _audit_handler_exc
         )
+        # Fallback: buffer audit records in memory and flush to stderr so no
+        # audit event is silently lost even when the filesystem is unavailable.
+        _fallback_stream_handler = logging.StreamHandler()
+        _fallback_stream_handler.setLevel(logging.DEBUG)
+        _fallback_stream_handler.setFormatter(
+            logging.Formatter(
+                fmt="AUDIT_FALLBACK %(asctime)s %(levelname)s %(name)s %(message)s",
+                datefmt="%Y-%m-%dT%H:%M:%SZ",
+            )
+        )
+        _fallback_memory_handler = _log_handlers.MemoryHandler(
+            capacity=10000,
+            flushLevel=logging.ERROR,
+            target=_fallback_stream_handler,
+            flushOnClose=True,
+        )
+        _fallback_memory_handler.setLevel(logging.DEBUG)
+        _llm_audit_logger.addHandler(_fallback_memory_handler)
+        _llm_audit_logger.addHandler(_fallback_stream_handler)
+        _llm_audit_logger.propagate = False
+        _llm_audit_logger.warning(
+            "AUDIT_FALLBACK_ACTIVATED: primary file handler unavailable; "
+            "audit records redirected to stderr memory buffer. error=%s",
+            _audit_handler_exc,
+        )
 
 import base64
 import re
@@ -1182,18 +1298,6 @@ class AgentOrchestrator:
         _llm_audit_logger.info("DECISION_AUDIT | %s", self._json.dumps(record, default=str))
         return trace_id
 
-        # Explicit agent allow list – only agents named here may be invoked.
-        # To permit additional agents, add their canonical name to this set AND
-        # ensure they have been security-reviewed and approved.
-        self.ALLOWED_AGENTS: frozenset[str] = frozenset({
-            "tech_support",
-        })
-
-        # Initialize agents
-        self.tech_support = TechSupportAgent(self.llm_client)
-        self.finance = FinanceAgent(self.llm_client)
-        self.file_processor = FileProcessorAgent()
-
     # ------------------------------------------------------------------
     # Malicious file content detection
     # ------------------------------------------------------------------
@@ -1309,6 +1413,31 @@ class AgentOrchestrator:
     # Provenance / labeling / watermarking
     # ------------------------------------------------------------------
     def _attach_provenance(self, response: dict, request_id: str = "") -> dict:
+        import hashlib as _hashlib
+        import time as _time
+        import uuid as _uuid
+        _prov_correlation_id = str(_uuid.uuid4())
+        _prov_timestamp = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+        _prov_model_id = getattr(getattr(self, "llm_client", None), "model", "unknown")
+        _prov_principal = getattr(getattr(self, "_current_caller", None), "agent_id", "unknown")
+        _response_str = str(response)
+        _output_hash = _hashlib.sha256(_response_str.encode("utf-8", errors="replace")).hexdigest()
+        _input_repr = str(request_id)
+        _input_hash = _hashlib.sha256(_input_repr.encode("utf-8", errors="replace")).hexdigest()
+        _llm_audit_logger.info(
+            "PROVENANCE_ATTACHED",
+            extra={
+                "audit_event": "provenance_attached",
+                "correlation_id": _prov_correlation_id,
+                "request_id": request_id,
+                "model_id": _prov_model_id,
+                "principal": _prov_principal,
+                "input_hash": _input_hash,
+                "output_hash": _output_hash,
+                "timestamp": _prov_timestamp,
+                "retention_days": int(_os_audit.environ.get("LLM_AUDIT_LOG_RETENTION_DAYS", "365")),
+            },
+        )
         """Attach synthetic-content provenance metadata, a content label, and an
         HMAC watermark to every AI-generated response before it leaves the
         orchestrator.  The response dict is mutated in-place and also returned.
@@ -1328,17 +1457,22 @@ class AgentOrchestrator:
         generated_at = self._datetime.datetime.utcnow().isoformat() + "Z"
         rid = request_id or str(self._uuid.uuid4())
 
-        # Provenance block intentionally omits internal operational fields (model_id,
-        # model_version, origin, generated_at, request_id) from outbound responses.
-        provenance = {}
+        # Provenance block includes all required synthetic-content metadata fields.
+        provenance = {
+            "model_id": self.MODEL_ID,
+            "model_version": self.MODEL_VERSION,
+            "origin": "orchestrator-ai-system",
+            "generated_at": generated_at,
+            "request_id": rid,
+        }
 
         # Deterministic watermark: HMAC-SHA256 over the stable provenance fields
         # concatenated with the serialised response content.
         import json as _json
-        # Only the response payload is used for HMAC computation; the empty
-        # provenance dict is excluded to avoid serialising internal metadata.
+        # HMAC covers both the provenance metadata and the response payload
+        # to ensure the watermark binds to all synthetic-content provenance fields.
         content_bytes = _json.dumps(
-            {"response": response},
+            {"provenance": provenance, "response": response},
             sort_keys=True,
             default=str,
         ).encode()
@@ -1349,7 +1483,7 @@ class AgentOrchestrator:
         response["provenance"] = provenance
         response["content_label"] = (
             "[AI-GENERATED CONTENT] This response was produced by an artificial "
-            f"intelligence model ({self.MODEL_ID} v{self.MODEL_VERSION}) and may "
+            f"intelligence model and may "
             "not reflect factual accuracy. Treat with appropriate scrutiny."
         )
         response["watermark"] = watermark
@@ -1431,7 +1565,28 @@ class AgentOrchestrator:
                     _hmac_tok.new(self._agent_token_secret, signing_input, _hashlib_tok.sha256).digest()
                 ).rstrip(b"=").decode()
                 if not _hmac_tok.compare_digest(sig_b64, expected_sig):
-                    logger.warning("Inter-agent token signature verification failed.")
+                    import hashlib as _tok_hashlib, time as _tok_time, uuid as _tok_uuid
+        _tok_correlation_id = str(_tok_uuid.uuid4())
+        _tok_timestamp = _tok_time.strftime("%Y-%m-%dT%H:%M:%SZ", _tok_time.gmtime())
+        _tok_model_id = getattr(getattr(self, "llm_client", None), "model", "unknown")
+        _tok_principal = getattr(getattr(self, "_current_caller", None), "agent_id", "unknown")
+        _tok_input_hash = _tok_hashlib.sha256(
+            str(context).encode("utf-8", errors="replace")
+        ).hexdigest()
+        logger.warning("Inter-agent token signature verification failed.")
+        _llm_audit_logger.warning(
+            "DECISION: inter_agent_token_verification_failed",
+            extra={
+                "audit_event": "token_verification_failed",
+                "correlation_id": _tok_correlation_id,
+                "model_id": _tok_model_id,
+                "principal": _tok_principal,
+                "input_hash": _tok_input_hash,
+                "output": "REJECTED",
+                "timestamp": _tok_timestamp,
+                "retention_days": int(_os_audit.environ.get("LLM_AUDIT_LOG_RETENTION_DAYS", "365")),
+            },
+        )
                     return False
                 # Pad base64 for decoding
                 padding = 4 - len(payload_b64) % 4
@@ -1852,11 +2007,45 @@ class AgentOrchestrator:
                     "error": "Access denied: insufficient privileges to access finance agent.",
                     "status": "forbidden",
                 }
-            _spawn_bound = {"agent": "finance", "max_steps": 1, "spawn_id": _spawn_id}
-            response = await _asyncio.wait_for(
-                self._route_to_finance(context),
-                timeout=_ROUTE_TIMEOUT_SECONDS
-            ) or context.get("token")
+            _auth_token = context.get("auth_token") or context.get("token")
+            if not _auth_token:
+                logger.warning(
+                    "Unauthenticated finance routing attempt blocked",
+                    extra={"spawn_id": _spawn_id}
+                )
+                raise PermissionError(
+                    "Authentication required: a valid auth_token must be present in context "
+                    "before accessing the finance agent."
+                )
+            _validated = self._validate_token(_auth_token)
+            if not _validated:
+                logger.warning(
+                    "Invalid token rejected for finance routing",
+                    extra={"spawn_id": _spawn_id}
+                )
+                raise PermissionError(
+                    "Authentication failed: the provided token is invalid or expired."
+                )
+                        _auth_token = context.get("token")
+            if not _auth_token:
+                logger.warning(
+                    "Unauthenticated finance routing attempt blocked",
+                    extra={"spawn_id": _spawn_id}
+                )
+                raise PermissionError(
+                    "Authentication required: a valid auth_token must be present in context "
+                    "before accessing the finance agent."
+                )
+            _validated = self._validate_token(_auth_token)
+            if not _validated:
+                logger.warning(
+                    "Invalid token rejected for finance routing",
+                    extra={"spawn_id": _spawn_id}
+                )
+                raise PermissionError(
+                    "Authentication failed: the provided token is invalid or expired."
+                )
+                        _auth_token = context.get("auth_token")
             if not _auth_token:
                 logger.warning(
                     "Unauthenticated finance routing attempt blocked",
@@ -1879,14 +2068,54 @@ class AgentOrchestrator:
             response = await _asyncio.wait_for(
                 self._route_to_finance(context),
                 timeout=_ROUTE_TIMEOUT_SECONDS
+            ),
+                timeout=_ROUTE_TIMEOUT_SECONDS
+            ),
+                timeout=_ROUTE_TIMEOUT_SECONDS
             )
         elif intent == "file_analysis":
+            if not _auth_token:
+                logger.warning(
+                    "Unauthenticated file_analysis routing attempt blocked",
+                    extra={"spawn_id": _spawn_id}
+                )
+                raise PermissionError(
+                    "Authentication required: a valid auth_token must be present in context "
+                    "before accessing the file processor agent."
+                )
+            _validated = self._validate_token(_auth_token)
+            if not _validated:
+                logger.warning(
+                    "Invalid token rejected for file_analysis routing",
+                    extra={"spawn_id": _spawn_id}
+                )
+                raise PermissionError(
+                    "Authentication failed: the provided token is invalid or expired."
+                )
             _spawn_bound = {"agent": "file_processor", "max_steps": 1, "spawn_id": _spawn_id}
             response = await _asyncio.wait_for(
                 self._route_to_file_processor(context),
                 timeout=_ROUTE_TIMEOUT_SECONDS
             )
         else:
+            if not _auth_token:
+                logger.warning(
+                    "Unauthenticated tech_support routing attempt blocked",
+                    extra={"spawn_id": _spawn_id}
+                )
+                raise PermissionError(
+                    "Authentication required: a valid auth_token must be present in context "
+                    "before accessing the tech support agent."
+                )
+            _validated = self._validate_token(_auth_token)
+            if not _validated:
+                logger.warning(
+                    "Invalid token rejected for tech_support routing",
+                    extra={"spawn_id": _spawn_id}
+                )
+                raise PermissionError(
+                    "Authentication failed: the provided token is invalid or expired."
+                )
             _spawn_bound = {"agent": "tech_support", "max_steps": 1, "spawn_id": _spawn_id}
             response = await _asyncio.wait_for(
                 self._route_to_tech_support(context),
@@ -2127,11 +2356,11 @@ class AgentOrchestrator:
         """Route request to tech support agent."""
         # Create internal caller identity
         caller = AgentIdentity(
-    agent_id="orchestrator",
-    agent_name="Orchestrator",
-    privilege_level="system",
-    is_internal=True
-)
+            agent_id="orchestrator",
+            agent_name="Orchestrator",
+            privilege_level=self._session_privilege_level,
+            is_internal=True
+        )
 
 # Allowed privilege escalation paths: maps (caller_privilege, target_agent) -> required_minimum_caller_privilege
 _ESCALATION_POLICY: dict = {
@@ -2139,6 +2368,7 @@ _ESCALATION_POLICY: dict = {
     ("medium", "finance"): "high",
 }
 _PRIVILEGE_RANK: dict = {"low": 0, "medium": 1, "high": 2, "system": 3}
+ALLOWED_ESCALATION_TARGETS: frozenset[str] = frozenset()  # No cross-agent escalation permitted by policy
 
 def _assert_routing_authorized(
     caller_identity: "AgentIdentity",
@@ -2215,8 +2445,8 @@ if not AgentAuthenticator.authenticate(caller, token=self._agent_token):
         caller = AgentIdentity(
             agent_id="orchestrator",
             agent_name="Orchestrator",
-            privilege_level="standard",
-            is_internal=False
+            privilege_level="system",
+            is_internal=True
         )
 
         # Token is validated by the receiver via AgentAuthenticator middleware
@@ -2253,7 +2483,12 @@ if not AgentAuthenticator.authenticate(caller, token=self._agent_token):
         self,
         context: dict[str, Any]
     ) -> dict[str, Any]:
-        """Route request to file processor agent."""
+        """Route request to file processor agent. Requires valid agent token for authenticated inter-agent call."""
+        if not self._validate_token(self._agent_token):
+            raise PermissionError(
+                "Agent token is invalid; cannot initiate authenticated inter-agent call to file processor."
+            )
+        _auth_headers = {"X-Agent-Token": self._agent_token}
         file_contents = context.get("file_contents", [])
 
         if not file_contents:
@@ -2279,7 +2514,16 @@ if not AgentAuthenticator.authenticate(caller, token=self._agent_token):
             if malicious_check:
                 analyses.append(f"File: {file_data.get('filename')}\n[BLOCKED: Malicious content detected in file - {malicious_check}]")
                 continue
-            analyses.append(f"File: {file_data.get('filename')}\n{extracted}")
+            try:
+                self._check_singapore_pii(extracted)
+            except ValueError as pii_exc:
+                logger.warning(
+                    "Singapore PII detected in uploaded file — file blocked",
+                    extra={"filename": file_data.get('filename', ''), "reason": str(pii_exc)}
+                )
+                analyses.append(f"File: {file_data.get('filename')}\n[BLOCKED: File contains Singapore PII and cannot be processed]")
+                continue
+            analyses.append(f"File: {file_data.get('filename')}\n{extracted[:2000]}")
 
         combined_content = "\n\n".join(analyses)
 
@@ -2287,6 +2531,8 @@ if not AgentAuthenticator.authenticate(caller, token=self._agent_token):
         user_question = context.get("user_message", "")
 
         # Validate and sanitize inputs before sending to LLM
+        _LLM_TIMEOUT = 30
+        _LLM_MAX_STEPS = 10
         sanitized_content = self._sanitize_input(combined_content, max_length=2000)
         sanitized_question = self._sanitize_input(user_question, max_length=1000)
 
@@ -2309,8 +2555,35 @@ User Question: {redacted_question}
 Please answer the user's question based on the document content above."""
             }
         ]
+        raw_        self._log_llm_request(
+            agent="file_processor",
+            messages=llm_messages,
+            context=context
+        )
         analysis = await self.llm_client.chat(
-            messages=llm_messages
+            messages=llm_messages,
+            timeout=_LLM_TIMEOUT,
+            max_steps=_LLM_MAX_STEPS
+        )
+analysis = await self.llm_client.chat(
+            messages=llm_messages,
+            timeout=_LLM_TIMEOUT,
+            max_steps=_LLM_MAX_STEPS
+        ) else (_ for _ in ()).throw(PermissionError("Agent token is invalid; cannot make authenticated LLM client call."))
+        )
+        # Validate and sanitize LLM output before any use
+        try:
+            analysis = self._validate_llm_output(analysis)
+        except ValueError as exc:
+            logger.warning(
+                "LLM output validation failed for document analysis",
+                extra={"reason": str(exc)}
+            )
+            return {"error": "LLM returned unsafe output", "status": "rejected"}
+        self._log_llm_response(
+            agent="file_processor",
+            response=analysis,
+            context=context
         )
         # Validate and sanitize LLM output before any use
         try:
@@ -2321,9 +2594,6 @@ Please answer the user's question based on the document content above."""
                 extra={"reason": str(exc)}
             )
             return {"error": "LLM returned unsafe output", "status": "rejected"}
-        analysis = await self.llm_client.chat(
-            messages=llm_messages
-        )
         self._log_llm_response(
             agent="file_processor",
             response=analysis,
@@ -2338,6 +2608,43 @@ Please answer the user's question based on the document content above."""
             "files_processed": len(file_contents)
         }
         return self._attach_provenance(result, content_key="response")
+
+    # Singapore PII patterns used by _check_singapore_pii()
+    _SG_NRIC_FIN = re.compile(r'\b[STFGM]\d{7}[A-Z]\b')
+    _SG_PHONE = re.compile(r'\b(?:\+65[\s-]?)?[689]\d{3}[\s-]?\d{4}\b')
+    _SG_PASSPORT = re.compile(r'\bE\d{7}[A-Z]\b')
+    _SG_CPF = re.compile(r'\bCPF\s*(?:Account\s*)?(?:No\.?|Number)?\s*:?\s*\d{9}[A-Z]\b', re.IGNORECASE)
+    _SG_SINGPASS = re.compile(r'\bSingPass\s*(?:ID|User(?:name)?|Login)?\s*:?\s*[A-Za-z0-9._%+\-]+', re.IGNORECASE)
+    _SG_BANK_ACCOUNT = re.compile(r'\b\d{3}-\d{5,6}-\d{1}\b|\b\d{10,12}\b')
+
+    _SG_PII_CHECKS: list[tuple[str, re.Pattern]] = []
+
+    def _check_singapore_pii(self, text: str) -> None:
+        """
+        Scan text for Singapore PII categories.
+
+        Raises ValueError if any Singapore PII is detected, so that the
+        caller can reject the content rather than forwarding it to the LLM.
+
+        Categories checked:
+          - NRIC / FIN
+          - Singapore passport number
+          - CPF account number
+          - SingPass ID
+          - Singapore phone number
+          - Singapore bank account number
+        """
+        checks = [
+            ("NRIC/FIN", self._SG_NRIC_FIN),
+            ("Singapore phone number", self._SG_PHONE),
+            ("Singapore passport", self._SG_PASSPORT),
+            ("CPF account number", self._SG_CPF),
+            ("SingPass ID", self._SG_SINGPASS),
+            ("Singapore bank account", self._SG_BANK_ACCOUNT),
+        ]
+        for label, pattern in checks:
+            if pattern.search(text):
+                raise ValueError(f"Singapore PII detected: {label}")
 
     def _sanitize_input(self, text: str, max_length: int = 4096) -> str:
         """
@@ -2631,7 +2938,7 @@ Please answer the user's question based on the document content above."""
                 escalation_context = {
             "user_message": query,
             "escalated_from": "tech_support",
-            "original_context": tech_support_context,
+            "original_context": str(tech_support_context)[:500],
             "escalation_reason": "Financial data requested",
             "human_approval_token": human_approval_token,
         }
@@ -2653,7 +2960,7 @@ Please answer the user's question based on the document content above."""
             "Escalating from tech support to finance (human-approved)",
             extra={
                 "query": sanitized_query,
-                "original_context": str(tech_support_context)[:100],
+                "original_context": str(tech_support_context)[:500],
                 "approval_token_present": True
             }
         )
@@ -2672,7 +2979,8 @@ Please answer the user's question based on the document content above."""
             }
 
         import asyncio as _asyncio
-        _ESCALATION_TIMEOUT_SECONDS = 30
+        _ESCALATION_TIMEOUT = 30
+_ESCALATION_MAX_STEPS = 10_SECONDS = 30
         _escalation_spawn_id = f"finance-escalation-{id(escalation_context)}"
         logger.info(
             "Subagent spawn initiated",
@@ -2745,6 +3053,42 @@ Please answer the user's question based on the document content above."""
                 f"({len(flagged_patterns)} pattern(s) matched). "
                 "The file has been rejected to prevent prompt injection."
             )
+
+        # Redact PII before further processing
+        # Singapore NRIC/FIN (e.g. S1234567A, T9876543Z, F0123456P, G1234567X)
+        content = re.sub(
+            r'\b[STFG]\d{7}[A-Z]\b',
+            '[REDACTED_NRIC]',
+            content,
+            flags=re.IGNORECASE
+        )
+        # Email addresses
+        content = re.sub(
+            r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b',
+            '[REDACTED_EMAIL]',
+            content
+        )
+        # Singapore phone numbers (8-digit starting with 6, 8, or 9)
+        content = re.sub(
+            r'\b(?:\+65[\s\-]?)?[689]\d{7}\b',
+            '[REDACTED_PHONE]',
+            content
+        )
+        # Generic credit card numbers (16-digit groups)
+        content = re.sub(
+            r'\b(?:\d{4}[\s\-]?){3}\d{4}\b',
+            '[REDACTED_CARD]',
+            content
+        )
+        # Passport numbers (generic: letter(s) followed by 6-9 digits)
+        content = re.sub(
+            r'\b[A-Z]{1,2}\d{6,9}\b',
+            '[REDACTED_PASSPORT]',
+            content
+        )
+        logger.info(
+            "PII redaction applied to uploaded file content."
+        )
 
         # Strip non-printable control characters that survived the pattern check
         sanitized = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', content)
