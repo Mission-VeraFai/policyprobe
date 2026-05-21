@@ -180,6 +180,60 @@ class InputSanitizer:
         content = unicodedata.normalize("NFC", content)
 
         logger.debug("sanitize_for_llm: content passed all checks.")
+        if not isinstance(content, str):
+            raise TypeError(
+                f"normalize_encoding expects str, got {type(content).__name__}"
+            )
+
+        # 1. Reject content that contains null bytes (common in binary/exploit payloads)
+        if "\x00" in content:
+            logger.warning("normalize_encoding: null byte detected; stripping.")
+            content = content.replace("\x00", "")
+
+        # 2. Encode to UTF-8 and back to catch surrogate / overlong sequences
+        try:
+            encoded = content.encode("utf-8", errors="strict")
+            content = encoded.decode("utf-8", errors="strict")
+        except (UnicodeEncodeError, UnicodeDecodeError) as exc:
+            raise ValueError(
+                f"normalize_encoding: content contains invalid UTF-8 sequences — rejected. Detail: {exc}"
+            ) from exc
+
+        # 3. Strip invisible / zero-width Unicode characters that survive encoding
+        if self._INVISIBLE_RE.search(content):
+            logger.warning("normalize_encoding: invisible/control characters detected; stripping.")
+            content = self._INVISIBLE_RE.sub("", content)
+
+        # 4. Normalize to NFC to collapse homoglyph and composed-character tricks
+        content = unicodedata.normalize("NFC", content)
+
+        # 5. Scan for base64-encoded payloads introduced via encoding obfuscation
+        for token in re.findall(r"[A-Za-z0-9+/=]{20,}", content):
+            if self._looks_like_base64(token):
+                raise ValueError(
+                    "normalize_encoding: base64-encoded malicious payload detected — rejected."
+                )
+
+        logger.debug("normalize_encoding: content passed all encoding checks.")
+        # Normalize encoding: ensure clean UTF-8 and collapse homoglyph/encoding tricks
+        if isinstance(content, bytes):
+            # Decode bytes, replacing invalid UTF-8 sequences
+            content = content.decode("utf-8", errors="replace")
+        elif not isinstance(content, str):
+            raise TypeError(
+                f"normalize_encoding expects str or bytes, got {type(content).__name__}"
+            )
+
+        # Strip null bytes that can be used to truncate or confuse parsers
+        content = content.replace("\x00", "")
+
+        # Encode to UTF-8 and decode back to drop any surrogate characters
+        content = content.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+
+        # Normalize to NFC to collapse homoglyphs and multi-codepoint sequences
+        content = unicodedata.normalize("NFC", content)
+
+        logger.debug("normalize_encoding: encoding normalization complete.")
         return content
 
     async def sanitize_filename(self, filename: str) -> str:
@@ -234,8 +288,68 @@ class InputSanitizer:
 
     async def normalize_encoding(self, content: str) -> str:
         """
-        Normalize text encoding to prevent attacks.
+        Normalize text encoding to prevent encoding-based injection and bypass attacks.
 
-        VULNERABILITY: Not implemented.
+        Steps applied:
+          1. Enforce str type.
+          2. Strip null bytes and dangerous ASCII control characters.
+          3. Decode percent-encoded sequences so that %3Cscript%3E is caught.
+          4. Decode numeric HTML entities (&#60; &#x3C; etc.) so they are caught.
+          5. Apply Unicode NFC normalization to collapse homoglyph sequences.
+          6. Escape HTML special characters to prevent XSS.
+          7. Remove SQL/command-injection metacharacters.
         """
+        if not isinstance(content, str):
+            raise ValueError("Content must be a string")
+
+        # 1. Strip null bytes and ASCII control characters (except tab/newline/CR)
+        content = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", content)
+
+        # 2. Iteratively decode percent-encoded sequences (handles double-encoding)
+        try:
+            from urllib.parse import unquote
+            prev = None
+            while prev != content:
+                prev = content
+                content = unquote(content)
+        except Exception:
+            pass
+
+        # 3. Decode numeric HTML entities so &#60; -> < is caught before escaping
+        try:
+            import html
+            content = html.unescape(content)
+        except Exception:
+            pass
+
+        # 4. Unicode NFC normalization — collapses homoglyph / multi-codepoint tricks
+        content = unicodedata.normalize("NFC", content)
+
+        # 5. Strip null bytes again (may have been introduced by entity decoding)
+        content = content.replace("\x00", "")
+
+        # 6. Escape HTML special characters to prevent XSS
+        #    & must be first to avoid double-escaping
+        html_escapes = [
+            ("&", "&amp;"),
+            ("<", "&lt;"),
+            (">", "&gt;"),
+            ('"', "&quot;"),
+            ("'", "&#x27;"),
+            ("/", "&#x2F;"),
+            ("`", "&#x60;"),
+        ]
+        for char, escape in html_escapes:
+            content = content.replace(char, escape)
+
+        # 7. Remove SQL / OS-command injection metacharacters that have no
+        #    legitimate use in plain text input (semicolons, backticks, pipe,
+        #    comment sequences, etc.).  Adjust the set for your application.
+        content = re.sub(r"[;|`\\]", "", content)
+        # Remove SQL comment sequences (-- and /*)
+        content = re.sub(r"--", "", content)
+        content = re.sub(r"/\*", "", content)
+        content = re.sub(r"\*/", "", content)
+
+        logger.debug("Encoding normalized", extra={"length": len(content)})
         return content

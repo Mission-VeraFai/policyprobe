@@ -18,12 +18,18 @@ from datetime import datetime, timezone
 from typing import Optional
 
 # ---------------------------------------------------------------------------
-# Approved model registry: only models listed here (with exact pinned version)
-# may be instantiated.  Format: "<model-family>:<version-pin>"
+# Approved model registry: loaded exclusively from the organization's approved
+# registry.  Do NOT define models locally — all entries must come from the
+# org-managed source of truth.
 # ---------------------------------------------------------------------------
-_APPROVED_MODEL_REGISTRY: dict[str, str] = {
-    "llama-3.1-70b-instruct:2024-07-23": "llama-3.1-70b-instruct:2024-07-23",
-}
+try:
+    from org_model_registry import APPROVED_MODEL_REGISTRY as _APPROVED_MODEL_REGISTRY  # type: ignore[import]
+except ImportError as _registry_import_error:  # pragma: no cover
+    raise RuntimeError(
+        "Cannot load the organization's approved model registry "
+        "(org_model_registry).  Ensure the package is installed and "
+        "accessible before using LLMResponseGuard."
+    ) from _registry_import_error
 
 
 def _verify_model_in_registry(model_id: str) -> str:
@@ -53,6 +59,39 @@ def _verify_model_in_registry(model_id: str) -> str:
 APPROVED_MODELS = set(_APPROVED_MODEL_REGISTRY.keys())
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Persistent audit / decision log — append-only, with rotation and retention.
+# Writes one JSON record per line (NDJSON) to a durable file so that every
+# AI-driven validation decision is forensically recoverable.
+# ---------------------------------------------------------------------------
+_AUDIT_LOG_PATH = os.environ.get(
+    "LLM_GUARD_AUDIT_LOG_PATH",
+    "/var/log/llm_response_guard/audit.log",
+)
+_AUDIT_MAX_BYTES = int(os.environ.get("LLM_GUARD_AUDIT_MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MB
+_AUDIT_BACKUP_COUNT = int(os.environ.get("LLM_GUARD_AUDIT_BACKUP_COUNT", "90"))  # 90 rotated files ≈ 900 MB cap
+
+def _build_audit_logger() -> logging.Logger:
+    """Return a dedicated logger that writes NDJSON audit records to a
+    rotating file.  Separated from the module logger so audit records are
+    never mixed with operational log output."""
+    audit_logger = logging.getLogger("llm_response_guard.audit")
+    if not audit_logger.handlers:  # avoid duplicate handlers on re-import
+        os.makedirs(os.path.dirname(_AUDIT_LOG_PATH), exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(
+            _AUDIT_LOG_PATH,
+            maxBytes=_AUDIT_MAX_BYTES,
+            backupCount=_AUDIT_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))  # raw JSON lines
+        audit_logger.addHandler(handler)
+        audit_logger.setLevel(logging.INFO)
+        audit_logger.propagate = False  # do not bubble up to root logger
+    return audit_logger
+
+_audit_logger = _build_audit_logger()
 
 
 @dataclass
@@ -89,7 +128,49 @@ class LLMResponseGuard:
         self.model_id = _verify_model_in_registry(model_id)
         self.validation_count = 0
 
-    async def validate(self, response: str) -> ValidationResult:
+    # Patterns that indicate dynamic code execution primitives.
+    # These must never appear in LLM-generated output returned to callers.
+    _CODE_EXEC_PATTERNS: list[tuple[str, str]] = [
+        (r"\beval\s*\(", "eval() call detected"),
+        (r"\bexec\s*\(", "exec() call detected"),
+        (r"\bcompile\s*\(", "compile() call detected"),
+        (r"\b__import__\s*\(", "__import__() call detected"),
+        (r"\bimportlib\.import_module\s*\(", "importlib.import_module() call detected"),
+        (r"\bos\.system\s*\(", "os.system() call detected"),
+        (r"\bos\.popen\s*\(", "os.popen() call detected"),
+        (r"\bsubprocess\s*\.\w*\s*\([^)]*shell\s*=\s*True", "subprocess with shell=True detected"),
+        (r"\bsubprocess\.call\s*\(", "subprocess.call() call detected"),
+        (r"\bsubprocess\.run\s*\(", "subprocess.run() call detected"),
+        (r"\bsubprocess\.Popen\s*\(", "subprocess.Popen() call detected"),
+        (r"\bpickle\.loads?\s*\(", "pickle.load/loads() call detected"),
+        (r"\bmarshal\.loads?\s*\(", "marshal.load/loads() call detected"),
+        (r"\bctypes\b", "ctypes usage detected"),
+        (r"\b__builtins__\b", "__builtins__ access detected"),
+        (r"\bgetattr\s*\(.*,\s*['\"]__", "getattr dunder access detected"),
+    ]
+
+    def check_code_execution_primitives(self, response: str) -> list[str]:
+        """
+        Scan *response* for dynamic code-execution primitives.
+
+        Returns a (possibly empty) list of human-readable violation strings.
+        Any match means the response MUST be rejected before it reaches the
+        caller — even a single occurrence is sufficient grounds for rejection.
+        """
+        import re
+        violations: list[str] = []
+        for pattern, description in self._CODE_EXEC_PATTERNS:
+            if re.search(pattern, response, re.IGNORECASE | re.DOTALL):
+                violations.append(
+                    f"Code-execution primitive detected in LLM output: {description}"
+                )
+        return violations
+
+    async def validate(
+        self,
+        response: str,
+        trace_id: Optional[str] = None,
+    ) -> ValidationResult:
         """
         Validate LLM response for policy compliance and attach
         provenance metadata, a content label, and a watermark to
@@ -104,6 +185,15 @@ class LLMResponseGuard:
         fingerprint_src = f"{self.model_id}|{generated_at}|{response}"
         fingerprint = hashlib.sha256(fingerprint_src.encode()).hexdigest()
 
+        # Resolve or mint a trace/correlation ID so this step can be joined
+        # to upstream (e.g. request ingestion) and downstream (e.g. delivery)
+        # workflow steps in any distributed tracing or SIEM system.
+        resolved_trace_id = (
+            trace_id
+            or os.environ.get("LLM_GUARD_TRACE_ID")
+            or str(uuid.uuid4())  # mint a new one when none is supplied
+        )
+
         provenance = {
             "model_id": self.model_id,
             "generated_at": generated_at,
@@ -111,8 +201,30 @@ class LLMResponseGuard:
             "watermark_id": watermark_id,
             "fingerprint_sha256": fingerprint,
             "content_label": self._CONTENT_LABEL,
+            "trace_id": resolved_trace_id,
         }
         # -------------------------------------------------------------------
+
+        # ------------------------------------------------------------------
+        # Check for dynamic code-execution primitives in the LLM output.
+        # This MUST run before the response is used or returned in any form.
+        # ------------------------------------------------------------------
+        code_exec_violations = self.check_code_execution_primitives(response)
+        if code_exec_violations:
+            logger.warning(
+                "LLM response rejected: code-execution primitives detected. "
+                "violations=%r watermark_id=%s model_id=%s",
+                code_exec_violations,
+                watermark_id,
+                self.model_id,
+            )
+            return ValidationResult(
+                is_valid=False,
+                violations=code_exec_violations,
+                filtered_response=None,
+                original_response=response,
+                provenance=provenance,
+            )
 
         # Embed the content label and watermark directly in the response text
         # so downstream consumers and end-users can see the provenance.
@@ -132,6 +244,8 @@ class LLMResponseGuard:
 
         audit_record = {
             "event": "llm_response_validated",
+            "trace_id": resolved_trace_id,
+            "provenance": provenance,
             "timestamp_utc": generated_at,
             "principal": principal,
             "model_id": self.model_id,

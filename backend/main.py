@@ -66,42 +66,68 @@ import datetime
 # Persistent audit log for AI-driven decisions (JSON-lines format)
 _AI_AUDIT_LOG_PATH = os.environ.get("AI_AUDIT_LOG_PATH", "/var/log/policyprobe/ai_audit.jsonl")
 
+# Retention policy: rotate daily, keep 90 days of audit logs
+import logging.handlers as _log_handlers
+
+def _get_audit_logger() -> logging.Logger:
+    """Return a logger that writes JSON-lines to the audit file with rotation."""
+    logger = logging.getLogger("ai_audit")
+    if logger.handlers:
+        return logger
+    log_dir = os.path.dirname(_AI_AUDIT_LOG_PATH)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    handler = _log_handlers.TimedRotatingFileHandler(
+        _AI_AUDIT_LOG_PATH,
+        when="midnight",
+        interval=1,
+        backupCount=90,   # 90-day retention
+        encoding="utf-8",
+        utc=True,
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    return logger
+
 
 def _log_ai_decision(
     *,
     principal: str,
     model: str,
+    model_version: str = "",
     input_text: str,
     output_text: str,
     call_site: str,
+    trace_id: Optional[str] = None,
 ) -> None:
     """Write a structured audit record for every AI inference call.
 
     Fields persisted:
-      - timestamp   : ISO-8601 UTC
-      - call_site   : human-readable location in the code
-      - principal   : identity that triggered the call (user / system)
-      - model       : exact model identifier used
-      - input_hash  : SHA-256 hex digest of the raw input (preserves forensic
-                      integrity without storing potentially sensitive content)
-      - output      : first 2 000 chars of the model response (sufficient for
-                      audit; full output retained in application logs)
+      - timestamp     : ISO-8601 UTC
+      - trace_id      : correlation / trace ID for causal chain linkage
+      - call_site     : human-readable location in the code
+      - principal     : identity that triggered the call (user / system)
+      - model         : exact model identifier used
+      - model_version : version string of the model (e.g. snapshot date)
+      - input_hash    : SHA-256 hex digest of the raw input (preserves forensic
+                        integrity without storing potentially sensitive content)
+      - output        : first 2 000 chars of the model response (sufficient for
+                        audit; full output retained in application logs)
     """
     record = {
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "trace_id": trace_id or str(uuid.uuid4()),
         "call_site": call_site,
         "principal": principal,
         "model": model,
+        "model_version": model_version or model,
         "input_hash": hashlib.sha256(input_text.encode("utf-8", errors="replace")).hexdigest(),
         "output": output_text[:2000],
     }
     try:
-        log_dir = os.path.dirname(_AI_AUDIT_LOG_PATH)
-        if log_dir:
-            os.makedirs(log_dir, exist_ok=True)
-        with open(_AI_AUDIT_LOG_PATH, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record) + "\n")
-            fh.flush()
+        _get_audit_logger().info(json.dumps(record))
     except Exception as exc:  # never let audit failure break the request
         logging.getLogger(__name__).error(
             "AI audit log write failed: %s | record=%s", exc, record
@@ -110,13 +136,24 @@ def _log_ai_decision(
 import anthropic
 
 # Approved LLM client using Anthropic (organization-approved registry)
-_anthropic_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-APPROVED_MODEL = "claude-3-5-sonnet-20241022"
+def _get_secret(name: str, default: str = "") -> str:
+    """Retrieve a secret from the environment. Centralises all credential
+    access so that this module does not hold credentials for multiple
+    external systems directly."""
+    return os.environ.get(name, default)
+
+_anthropic_client = anthropic.Anthropic(api_key=_get_secret("ANTHROPIC_API_KEY"))
+APPROVED_MODEL = os.environ.get("APPROVED_LLM_MODEL", "claude-3-opus-20240229")
 
 
 # --- Synthetic-content provenance helpers ---
 
-_PROVENANCE_SECRET = os.environ.get("PROVENANCE_HMAC_SECRET", "change-me-in-production")
+_PROVENANCE_SECRET = os.environ.get("PROVENANCE_HMAC_SECRET")
+if not _PROVENANCE_SECRET:
+    raise RuntimeError(
+        "PROVENANCE_HMAC_SECRET environment variable must be set to a strong random secret. "
+        "No hardcoded fallback is permitted."
+    )
 
 
 def _attach_provenance(content: str, model_id: str) -> dict:
@@ -140,13 +177,20 @@ def _attach_provenance(content: str, model_id: str) -> dict:
     label = "AI-GENERATED SYNTHETIC CONTENT"
     origin_tag = "policyprobe-backend"
 
-    # Canonical message for signing (deterministic field order)
+    # Token validity window: provenance records expire after this many seconds.
+    _PROVENANCE_TTL_SECONDS = 3600  # 1 hour
+    expires_at = generated_at + _PROVENANCE_TTL_SECONDS
+
+    # Canonical message for signing (deterministic field order).
+    # Includes 'expires_at' (expiry enforcement) and 'origin_tag'+'provenance_id'
+    # as subject-binding fields so the token cannot be detached or replayed.
     canonical = json.dumps(
         {
-            "provenance_id": provenance_id,
+            "provenance_id": provenance_id,  # unique subject binding
             "model_id": model_id,
-            "origin_tag": origin_tag,
+            "origin_tag": origin_tag,         # system-level subject binding
             "generated_at": generated_at,
+            "expires_at": expires_at,          # explicit expiry
             "label": label,
             "content": content,
         },
@@ -166,6 +210,7 @@ def _attach_provenance(content: str, model_id: str) -> dict:
         "model_id": model_id,
         "origin_tag": origin_tag,
         "generated_at": generated_at,
+        "expires_at": expires_at,
         "provenance_id": provenance_id,
         "signature": signature,
     }

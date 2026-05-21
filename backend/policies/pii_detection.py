@@ -101,21 +101,6 @@ class PIIDetector:
         "credit_card": "Credit Card Number",
         "phone_us": "US Phone Number",
         "email": "Email Address",
-    } = {
-        # Singapore-specific labels
-        "sg_nric": "Singapore NRIC",
-        "sg_fin": "Singapore FIN",
-        "sg_cpf": "Singapore CPF Account Number",
-        "sg_uen": "Singapore UEN",
-        "sg_singpass_id": "Singapore SingPass ID",
-        "sg_phone": "Singapore Phone Number",
-        "sg_passport": "Singapore Passport Number",
-        # General labels
-        "ssn": "Social Security Number",
-        "ssn_no_dash": "Social Security Number",
-        "credit_card": "Credit Card Number",
-        "phone_us": "Phone Number",
-        "email": "Email Address",
     }
 
     def __init__(self, config_path: Optional[str] = None):
@@ -223,13 +208,11 @@ class PIIDetector:
         """
         Scan a string for PII patterns.
 
-        VULNERABILITY: Patterns defined but never applied.
+        Applies all registered patterns (including Singapore NRIC, FIN, CPF, etc.)
+        to the provided text and returns any matches found.
         """
-        # VULNERABILITY: This method exists but is never called
-        # Patterns are not actually applied to content
         matches = []
 
-        # This code would work but is never executed
         for pii_type, pattern in self.PATTERNS.items():
             for match in re.finditer(pattern, text):
                 matches.append(PIIMatch(

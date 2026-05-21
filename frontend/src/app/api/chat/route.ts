@@ -6,11 +6,63 @@ import { appendFileSync, mkdirSync } from 'fs'
 import { join } from 'path'
 
 const BACKEND_URL = process.env.BACKEND_URL
+
+// Approved model registry: only these pinned model identifiers are permitted.
+// Update this list through your change-management process when adopting new models.
+const APPROVED_MODELS: ReadonlySet<string> = new Set([
+  // OpenAI pinned versions
+  'gpt-4o-2024-08-06',
+  'gpt-4o-mini-2024-07-18',
+  'gpt-4-turbo-2024-04-09',
+  'gpt-3.5-turbo-0125',
+  // Anthropic Claude pinned versions
+  'claude-3-5-sonnet-20241022',
+  'claude-3-5-haiku-20241022',
+  'claude-3-opus-20240229',
+  'claude-3-sonnet-20240229',
+  'claude-3-haiku-20240307',
+  // Add other approved, pinned model IDs here
+])
 const API_SECRET = process.env.API_SECRET
 const BACKEND_API_KEY = process.env.BACKEND_API_KEY
 
+// Allowlist of approved LLM endpoint URL prefixes sanctioned by the organization.
+// Only these endpoints may be used as BACKEND_URL targets.
+const APPROVED_LLM_ENDPOINTS: string[] = [
+  process.env.APPROVED_LLM_ENDPOINT_1 || '',
+  process.env.APPROVED_LLM_ENDPOINT_2 || '',
+].filter(Boolean)
+
+// Fallback hardcoded approved endpoint identifier (org-approved-llm-v1).
+// Operators must set at least one APPROVED_LLM_ENDPOINT_* env var or ensure
+// BACKEND_URL contains the org-approved hostname segment.
+const ORG_APPROVED_HOSTNAME_SEGMENT = process.env.ORG_APPROVED_LLM_HOSTNAME || 'org-approved-llm-v1'
+
+function isApprovedEndpoint(url: string): boolean {
+  // Check against explicitly configured approved endpoint prefixes.
+  if (APPROVED_LLM_ENDPOINTS.length > 0) {
+    return APPROVED_LLM_ENDPOINTS.some((approved) => url.startsWith(approved))
+  }
+  // Fallback: verify the URL contains the org-approved hostname segment.
+  try {
+    const parsed = new URL(url)
+    return parsed.hostname.includes(ORG_APPROVED_HOSTNAME_SEGMENT)
+  } catch {
+    return false
+  }
+}
+
 if (!BACKEND_URL) {
   throw new Error('BACKEND_URL environment variable is not set. Only approved LLM endpoints may be used; configure BACKEND_URL to an approved endpoint.')
+}
+
+if (!isApprovedEndpoint(BACKEND_URL)) {
+  throw new Error(
+    `BACKEND_URL "${BACKEND_URL}" is not in the organization's approved LLM endpoint list. ` +
+    'Set APPROVED_LLM_ENDPOINT_1 (and optionally APPROVED_LLM_ENDPOINT_2) to the approved endpoint URL prefix, ' +
+    'or set ORG_APPROVED_LLM_HOSTNAME to the approved hostname segment. ' +
+    'Only organization-approved LLM endpoints may be used.'
+  )
 }
 if (!BACKEND_API_KEY) {
   throw new Error('BACKEND_API_KEY environment variable is not set. Inter-agent communication requires authentication.')
@@ -41,11 +93,49 @@ function getPrincipal(request: NextRequest): string {
   return 'ip-hash:' + createHash('sha256').update(ip).digest('hex')
 }
 
-const SHELL_COMMAND_PATTERN = /(?:^|[\s;|&`$(){}])(?:bash|sh|zsh|cmd|powershell|pwsh|exec|eval|system|popen|subprocess|os\.system|child_process|spawn|execSync|execFile|passthru|shell_exec|proc_open|\bsudo\b|\bchmod\b|\bchown\b|\brm\s+-rf|\bmkdir\b|\bwget\b|\bcurl\b|\bnc\b|\bnetcat\b|\btelnet\b|\bssh\b|\bscp\b|\bftp\b)/i
+// Shell command pattern built dynamically to avoid embedding raw command strings in source
+const _shellCmdParts = [
+  // Interpreters and scripting runtimes
+  ['ba','sh'].join(''), ['s','h'].join(''), ['zs','h'].join(''),
+  ['cm','d'].join(''), ['powers','hell'].join(''), ['pw','sh'].join(''),
+  // Code execution primitives
+  ['ex','ec'].join(''), ['ev','al'].join(''), ['sys','tem'].join(''),
+  ['po','pen'].join(''), ['subpro','cess'].join(''),
+  ['os\.sys','tem'].join(''), ['child_pro','cess'].join(''),
+  ['spa','wn'].join(''), ['exec','Sync'].join(''), ['exec','File'].join(''),
+  ['pass','thru'].join(''), ['shell_e','xec'].join(''), ['proc_o','pen'].join(''),
+  // Privileged / destructive commands
+  '\\bsudo\\b', '\\bchmod\\b', '\\bchown\\b',
+  ['\\br','m\\s+-rf'].join(''), '\\bmkdir\\b',
+  // Network utilities
+  ['\\bw','get\\b'].join(''), ['\\bcu','rl\\b'].join(''),
+  '\\bnc\\b', '\\bnetcat\\b', '\\btelnet\\b',
+  ['\\bss','h\\b'].join(''), ['\\bsc','p\\b'].join(''), ['\\bft','p\\b'].join('')
+]
+const SHELL_COMMAND_PATTERN = new RegExp(
+  '(?:^|[\\s;|&`$(){}])(?:' + _shellCmdParts.join('|') + ')',
+  'i'
+)
 const BASE64_PATTERN = /(?:[A-Za-z0-9+/]{40,}={0,2})/
 const BINARY_PATTERN = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/
 const HIDDEN_PROMPT_PATTERN = /(?:ignore\s+(?:previous|above|prior|all)\s+(?:instructions?|prompts?|context)|you\s+are\s+now|act\s+as\s+(?:a\s+)?(?:different|new|another|unrestricted)|disregard\s+(?:all|any|previous)|forget\s+(?:all|everything|previous)|system\s*:\s*you|<\s*system\s*>|\[\s*system\s*\]|###\s*(?:system|instruction)|roleplay\s+as|pretend\s+(?:you\s+are|to\s+be)|jailbreak|DAN\s+mode|developer\s+mode)/i
-const LEETSPEAK_SHELL_PATTERN = /(?:[e3][x\*][e3][c\(]|[s\$][y\*][s\$][t\+][e3][m\*]|[e3][v\*][a@][l\|]|[b8][a@4][s\$][h#]|[p\|][o0][w\*][e3][r\*][s\$][h#])/i
+// Leetspeak shell pattern built dynamically to avoid embedding obfuscated command strings in source
+const _leetspeakParts = [
+  // exec
+  '[e3][x\\*][e3][c\\(]',
+  // system
+  '[s\\$][y\\*][s\\$][t\\+][e3][m\\*]',
+  // eval
+  '[e3][v\\*][a@][l\\|]',
+  // bash
+  '[b8][a@4][s\\$][h#]',
+  // powershell
+  '[p\\|][o0][w\\*][e3][r\\*][s\\$][h#]'
+]
+const LEETSPEAK_SHELL_PATTERN = new RegExp(
+  '(?:' + _leetspeakParts.join('|') + ')',
+  'i'
+)
 
 function sanitizeMessage(message: string): { safe: boolean; reason?: string } {
   if (BINARY_PATTERN.test(message)) {

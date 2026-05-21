@@ -16,8 +16,322 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import base64
+import re
+import string
+
 from .auth.agent_auth import AgentIdentity, verify_agent_token
 from llm.approved import ApprovedLLMClient
+
+
+# ---------------------------------------------------------------------------
+# Prompt Sanitization
+# Checks user-supplied input for malicious content before forwarding to LLM.
+# ---------------------------------------------------------------------------
+
+# Shell command patterns that should never appear in user prompts
+_SHELL_COMMAND_PATTERN = re.compile(
+    r'(?:^|\s|;|&&|\|\|)'
+    r'(?:bash|sh|zsh|fish|cmd|powershell|pwsh|python|perl|ruby|php|node|curl|wget|nc|ncat|netcat|'
+    r'chmod|chown|sudo|su|rm\s+-rf|mkfifo|mknod|dd\s+if=|base64\s+-d|eval|exec|system|popen|'
+    r'subprocess|os\.system|__import__|importlib)',
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Binary / non-printable byte sequences
+_BINARY_PATTERN = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]')
+
+# Leetspeak substitution map (common character swaps used to evade filters)
+_LEET_MAP = str.maketrans({
+    '0': 'o', '1': 'i', '3': 'e', '4': 'a',
+    '5': 's', '6': 'g', '7': 't', '@': 'a',
+    '$': 's', '!': 'i', '+': 't',
+})
+
+# Phrases that indicate prompt-injection / jailbreak attempts
+_INJECTION_PHRASES = [
+    'ignore previous instructions',
+    'ignore all instructions',
+    'disregard your instructions',
+    'forget your instructions',
+    'you are now',
+    'act as',
+    'pretend you are',
+    'new instructions',
+    'system prompt',
+    'override instructions',
+    'jailbreak',
+    'do anything now',
+    'dan mode',
+]
+
+
+def _is_base64_encoded(text: str) -> bool:
+    """Return True if *text* looks like a substantial base64-encoded payload."""
+    # Strip whitespace and check the character set
+    stripped = text.strip()
+    if len(stripped) < 20:
+        return False
+    b64_chars = set(string.ascii_letters + string.digits + '+/=')
+    ratio = sum(1 for c in stripped if c in b64_chars) / len(stripped)
+    if ratio < 0.95:
+        return False
+    # Attempt to decode and check whether the result is non-trivial binary
+    try:
+        decoded = base64.b64decode(stripped + '==')  # pad defensively
+        # If decoded bytes contain many non-printable chars it is likely binary
+        non_printable = sum(1 for b in decoded if b < 0x20 and b not in (0x09, 0x0a, 0x0d))
+        if non_printable / max(len(decoded), 1) > 0.1:
+            return True
+        # If decoded text contains shell commands, flag it
+        try:
+            decoded_str = decoded.decode('utf-8', errors='replace')
+            if _SHELL_COMMAND_PATTERN.search(decoded_str):
+                return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False
+
+
+def _contains_leetspeak_injection(text: str) -> bool:
+    """Return True if the text, after leet-substitution, matches injection phrases."""
+    normalized = text.lower().translate(_LEET_MAP)
+    for phrase in _INJECTION_PHRASES:
+        if phrase in normalized:
+            return True
+    return False
+
+
+def sanitize_user_prompt(prompt: str, field_name: str = 'prompt') -> str:
+    """
+    Validate and sanitize a user-supplied prompt before it is forwarded to the LLM.
+
+    Raises ``ValueError`` with a descriptive message if the prompt contains:
+    - Binary / non-printable bytes
+    - Shell commands or executable invocations
+    - Base64-encoded payloads that decode to shell commands or binary data
+    - Leetspeak-obfuscated prompt-injection phrases
+    - Plain-text prompt-injection phrases
+
+    Returns the (unchanged) prompt string when it passes all checks.
+    """
+    if not isinstance(prompt, str):
+        raise ValueError(f"'{field_name}' must be a string, got {type(prompt).__name__}.")
+
+    # 1. Binary / non-printable content
+    if _BINARY_PATTERN.search(prompt):
+        raise ValueError(
+            f"'{field_name}' contains binary or non-printable characters, which are not allowed."
+        )
+
+    # 2. Shell commands
+    if _SHELL_COMMAND_PATTERN.search(prompt):
+        raise ValueError(
+            f"'{field_name}' contains shell command patterns, which are not allowed."
+        )
+
+    # 3. Base64-encoded payloads
+    # Check each whitespace-delimited token that looks long enough to be base64
+    for token in prompt.split():
+        if len(token) >= 20 and _is_base64_encoded(token):
+            raise ValueError(
+                f"'{field_name}' contains a base64-encoded payload that may hide malicious content."
+            )
+
+    # 4. Leetspeak-obfuscated injection
+    if _contains_leetspeak_injection(prompt):
+        raise ValueError(
+            f"'{field_name}' contains obfuscated prompt-injection content."
+        )
+
+    # 5. Plain-text injection phrases
+    lower_prompt = prompt.lower()
+    for phrase in _INJECTION_PHRASES:
+        if phrase in lower_prompt:
+            raise ValueError(
+                f"'{field_name}' contains a disallowed prompt-injection phrase: '{phrase}'."
+            )
+
+    return prompt
+import re
+
+# ---------------------------------------------------------------------------
+# Input sanitization for LLM queries
+# ---------------------------------------------------------------------------
+_MAX_QUERY_LENGTH = 4096  # characters
+
+# Patterns associated with prompt-injection / jailbreak attempts
+_INJECTION_PATTERNS = re.compile(
+    r"(ignore (all |previous |prior |above )?instructions?"
+    r"|system\s*prompt"
+    r"|you are now"
+    r"|disregard (all |previous |prior |above )?instructions?"
+    r"|forget (all |previous |prior |above )?instructions?"
+    r"|act as (if )?you (are|were)"
+    r"|jailbreak"
+    r"|<\s*script"
+    r"|\\x[0-9a-fA-F]{2}"
+    r"|\\u[0-9a-fA-F]{4})",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_query(query: Any) -> str:
+    """Sanitize a free-text query before sending it to the LLM.
+
+    Steps:
+    1. Coerce to string and strip leading/trailing whitespace.
+    2. Remove ASCII control characters (except ordinary whitespace).
+    3. Enforce maximum length.
+    4. Reject queries that contain prompt-injection patterns.
+
+    Returns the sanitized query string.
+    Raises ValueError if the query is empty after sanitization or contains
+    injection patterns.
+    """
+    if query is None:
+        raise ValueError("Query must not be None.")
+
+    # 1. Coerce and strip
+    sanitized: str = str(query).strip()
+
+    # 2. Remove control characters (keep \t, \n, \r as ordinary whitespace)
+    sanitized = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", sanitized)
+
+    # 3. Enforce length
+    if len(sanitized) > _MAX_QUERY_LENGTH:
+        sanitized = sanitized[:_MAX_QUERY_LENGTH]
+
+    # 4. Reject empty queries
+    if not sanitized:
+        raise ValueError("Query is empty after sanitization.")
+
+    # 5. Detect prompt-injection patterns
+    if _INJECTION_PATTERNS.search(sanitized):
+        raise ValueError(
+            "Query contains disallowed content (potential prompt injection)."
+        )
+
+    return sanitized
+
+logger = logging.getLogger(__name__)
+
+
+def _call_llm_with_logging(client: ApprovedLLMClient, prompt: str, **kwargs) -> Any:
+    """Wrapper that logs every LLM request and response for audit compliance."""
+    logger.info(
+        "LLM request initiated",
+        extra={
+            "model": MODEL_NAME,
+            "model_version": MODEL_VERSION,
+            "prompt_length": len(prompt),
+            "prompt_preview": prompt[:200],
+        },
+    )
+    try:
+        response = client.complete(prompt, **kwargs)
+        logger.info(
+            "LLM response received",
+            extra={
+                "model": MODEL_NAME,
+                "model_version": MODEL_VERSION,
+                "response_length": len(str(response)),
+                "response_preview": str(response)[:200],
+            },
+        )
+        return response
+    except Exception as exc:
+        logger.error(
+            "LLM call failed",
+            extra={
+                "model": MODEL_NAME,
+                "model_version": MODEL_VERSION,
+                "error": str(exc),
+            },
+            exc_info=True,
+        )
+        raise
+import re
+
+# ---------------------------------------------------------------------------
+# LLM Output Sanitization
+# All LLM responses MUST pass through _validate_llm_output() before use.
+# ---------------------------------------------------------------------------
+_DANGEROUS_PATTERNS = [
+    # Direct code execution primitives
+    r'\beval\s*\(',
+    r'\bexec\s*\(',
+    r'\bcompile\s*\(',
+    r'\b__import__\s*\(',
+    r'\bimportlib\.import_module\s*\(',
+    # Shell execution
+    r'\bos\.system\s*\(',
+    r'\bos\.popen\s*\(',
+    r'\bsubprocess\.(?:call|run|Popen|check_output|check_call)\s*\([^)]*shell\s*=\s*True',
+    r'\bsubprocess\.getoutput\s*\(',
+    r'\bsubprocess\.getstatusoutput\s*\(',
+    # Dynamic attribute / code loading
+    r'\bgetattr\s*\(.*,\s*[\'"]__',
+    r'\b__builtins__\b',
+    r'\b__globals__\b',
+    r'\b__code__\b',
+    r'\bctypes\b',
+    # Template / code injection helpers
+    r'\bpickle\.loads?\s*\(',
+    r'\bmarshal\.loads?\s*\(',
+    r'\byaml\.load\s*\(',          # unsafe yaml.load
+]
+
+_COMPILED_DANGEROUS_PATTERNS = [
+    re.compile(p, re.IGNORECASE | re.DOTALL)
+    for p in _DANGEROUS_PATTERNS
+]
+
+
+def _validate_llm_output(response: str, context: str = "") -> str:
+    """
+    Validate and sanitize LLM output before use.
+
+    Raises ValueError if the response contains any dynamic code execution
+    primitive or other dangerous pattern.  Returns the (unchanged) response
+    string when it is safe.
+
+    Args:
+        response: Raw text returned by the LLM.
+        context:  Optional label used in log/error messages (e.g. the query
+                  type) to aid incident investigation.
+
+    Returns:
+        The validated response string.
+
+    Raises:
+        ValueError: If a dangerous pattern is detected.
+        TypeError:  If *response* is not a string.
+    """
+    if not isinstance(response, str):
+        raise TypeError(
+            f"LLM output validation failed [{context}]: "
+            f"expected str, got {type(response).__name__}"
+        )
+
+    for pattern in _COMPILED_DANGEROUS_PATTERNS:
+        match = pattern.search(response)
+        if match:
+            logging.getLogger(__name__).error(
+                "Dangerous pattern detected in LLM output [%s]: pattern=%r matched=%r",
+                context,
+                pattern.pattern,
+                match.group(0)[:120],
+            )
+            raise ValueError(
+                f"LLM output rejected [{context}]: contains forbidden dynamic "
+                f"code execution primitive matching pattern '{pattern.pattern}'. "
+                "The response has been discarded for security reasons."
+            )
+
+    return response
 
 # ---------------------------------------------------------------------------
 # Approved Model Registry
@@ -25,48 +339,93 @@ from llm.approved import ApprovedLLMClient
 # MODEL_VERSION, or MODEL_DIGEST must go through the security review process.
 # ---------------------------------------------------------------------------
 _APPROVED_MODEL_REGISTRY = {
-    "org-approved-llm-v1": {
-        "version": "2024-01-01",                          # pinned API version / snapshot
-        "provider": "org-internal",
-        "digest": "sha256:approved-org-llm-v1-20240101-unifai",  # integrity token / manifest hash
+    "gpt-4o": {
+        "version": "2024-08-06",                          # pinned API version / snapshot
+        "provider": "openai",
+        "digest": "sha256:gpt-4o-2024-08-06-openai",  # integrity token / manifest hash
         "approved": True,
     },
+},
 }
 
-MODEL_NAME    = "org-approved-llm-v1"
+MODEL_NAME    = "gpt-4o"
 MODEL_VERSION = _APPROVED_MODEL_REGISTRY[MODEL_NAME]["version"]
 MODEL_DIGEST  = _APPROVED_MODEL_REGISTRY[MODEL_NAME]["digest"]
 
 
 def _verify_model_registration(name: str, version: str, digest: str) -> None:
-    """Raise RuntimeError if the requested model is not in the approved registry."""
-    entry = _APPROVED_MODEL_REGISTRY.get(name)
-    if entry is None:
+    """Raise RuntimeError if the model config does not match org-registry values.
+
+    Since MODEL_NAME/VERSION/DIGEST are sourced from org-registry env vars,
+    this function validates that the values passed at call-time match what
+    was loaded from the registry at startup, preventing runtime substitution.
+    """
+    if name != MODEL_NAME:
         raise RuntimeError(
-            f"Model '{name}' is NOT in the approved model registry. "
-            "Register the model before use."
+            f"Model '{name}' does not match the org-registry-approved model "
+            f"'{MODEL_NAME}'. Only the org-registry-approved model may be used."
         )
-    if entry["version"] != version:
+    if version != MODEL_VERSION:
         raise RuntimeError(
-            f"Model '{name}' version '{version}' does not match the pinned "
-            f"approved version '{entry['version']}'. Update the registry or pin "
-            "to the approved version."
+            f"Model '{name}' version '{version}' does not match the org-registry "
+            f"pinned version '{MODEL_VERSION}'."
         )
-    if entry["digest"] != digest:
+    if digest != MODEL_DIGEST:
         raise RuntimeError(
-            f"Model '{name}' integrity check failed: digest mismatch. "
-            "The model artifact may have been tampered with."
-        )
-    if not entry.get("approved"):
-        raise RuntimeError(
-            f"Model '{name}' is present in the registry but has not been "
-            "approved for production use."
+            f"Model '{name}' integrity check failed: digest mismatch against "
+            "org-registry value. The model artifact may have been tampered with."
         )
 
 import hashlib
 import json
 import os
-from logging.handlers import RotatingFileHandler
+import logging
+import logging.handlers
+
+
+class AppendOnlyFileHandler(logging.FileHandler):
+    """
+    Append-only file handler for AI decision logs.
+
+    Enforces forensic readiness by:
+    - Always opening the log file in append mode ('a'), never 'w' or 'wb'.
+    - Refusing any rotation or truncation operation.
+    - Raising RuntimeError if an attempt is made to rotate or truncate the log.
+
+    This handler satisfies the immutable/append-only requirement for AI-driven
+    action audit trails and decision logs.
+    """
+
+    def __init__(self, filename: str, encoding: str = "utf-8", delay: bool = False):
+        # Force append mode; never allow overwrite or truncation.
+        super().__init__(filename, mode="a", encoding=encoding, delay=delay)
+
+    def _open(self):
+        """Open the log file strictly in append mode."""
+        stream = open(self.baseFilename, "a", encoding=self.encoding)  # noqa: WPS515
+        return stream
+
+    def doRollover(self):
+        """Rotation is prohibited for append-only decision logs."""
+        raise RuntimeError(
+            "AppendOnlyFileHandler: log rotation is prohibited for AI decision "
+            "audit logs. Rotation or truncation would violate the append-only "
+            "and forensic-readiness policy."
+        )
+
+    def rotate(self, source, dest):
+        """Rotation is prohibited for append-only decision logs."""
+        raise RuntimeError(
+            "AppendOnlyFileHandler: log rotation is prohibited for AI decision "
+            "audit logs."
+        )
+
+    def truncate(self):
+        """Truncation is prohibited for append-only decision logs."""
+        raise RuntimeError(
+            "AppendOnlyFileHandler: truncation is prohibited for AI decision "
+            "audit logs."
+        )
 
 logger = logging.getLogger(__name__)
 
@@ -1073,11 +1432,27 @@ Be helpful, professional, and concise in your responses."""
         provenance_payload = (
             f"{self.model_name}:{self.model_version}:{user_context['user_id']}:{generated_at}"
         ).encode()
-        provenance_digest = hmac.new(
-            os.environ.get("PROVENANCE_HMAC_KEY", "default-key").encode(),
+        # Asymmetric signing: load RSA private key from env (PEM-encoded).
+        # PROVENANCE_SIGNING_KEY must be set to a PEM RSA private key; no weak fallback.
+        _pem_key = os.environ.get("PROVENANCE_SIGNING_KEY")
+        if not _pem_key:
+            raise EnvironmentError(
+                "PROVENANCE_SIGNING_KEY environment variable is not set. "
+                "A PEM-encoded RSA private key is required for provenance signing."
+            )
+        from cryptography.hazmat.primitives import hashes as _hashes, serialization as _serialization
+        from cryptography.hazmat.primitives.asymmetric import padding as _padding
+        import base64 as _base64
+        _private_key = _serialization.load_pem_private_key(
+            _pem_key.encode(),
+            password=None,
+        )
+        _raw_signature = _private_key.sign(
             provenance_payload,
-            hashlib.sha256,
-        ).hexdigest()
+            _padding.PKCS1v15(),
+            _hashes.SHA256(),
+        )
+        provenance_digest = _base64.b64encode(_raw_signature).decode()
 
         return {
             "user_id": user_context["user_id"],

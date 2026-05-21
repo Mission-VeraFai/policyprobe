@@ -53,26 +53,58 @@ class AuditLogger:
     - Long-term retention
     """
 
-    # Default AI-decision metadata; callers may override per-instance.
-    DEFAULT_MODEL_ID: str = os.environ.get("AUDIT_MODEL_ID", "unknown-model")
-    DEFAULT_MODEL_VERSION: str = os.environ.get("AUDIT_MODEL_VERSION", "unknown-version")
+    # ---------------------------------------------------------------------------
+    # Approved model registry: only these (model_id, model_version) pairs are
+    # permitted.  Entries are immutable at class definition time.
+    # ---------------------------------------------------------------------------
+    _APPROVED_REGISTRY: dict[str, list[str]] = {
+        "unifai-audit-v1": ["1.0.0", "1.1.0", "1.2.0"],
+        "unifai-audit-v2": ["2.0.0", "2.1.0"],
+    }
+
+    # Pinned defaults — never fall back to env-var strings like 'unknown-model'.
+    DEFAULT_MODEL_ID: str = "unifai-audit-v2"
+    DEFAULT_MODEL_VERSION: str = "2.1.0"
+
+    @classmethod
+    def _validate_model(cls, model_id: str, model_version: str) -> None:
+        """Raise ValueError if (model_id, model_version) is not in the approved registry."""
+        approved_versions = cls._APPROVED_REGISTRY.get(model_id)
+        if approved_versions is None:
+            raise ValueError(
+                f"Model '{model_id}' is not in the approved model registry. "
+                f"Approved models: {list(cls._APPROVED_REGISTRY.keys())}"
+            )
+        if model_version not in approved_versions:
+            raise ValueError(
+                f"Model version '{model_version}' for '{model_id}' is not approved. "
+                f"Approved versions: {approved_versions}"
+            )
 
     def __init__(
         self,
         model_id: Optional[str] = None,
         model_version: Optional[str] = None,
     ):
+        # Resolve to pinned defaults when not explicitly supplied.
+        resolved_model_id: str = model_id if model_id is not None else self.DEFAULT_MODEL_ID
+        resolved_model_version: str = model_version if model_version is not None else self.DEFAULT_MODEL_VERSION
+
+        # Enforce registry membership before any state is set.
+        self._validate_model(resolved_model_id, resolved_model_version)
+
         # Append-only in-memory buffer (tuple-based to prevent mutation).
         self.__events: list[dict] = []
-        self._model_id: str = model_id or self.DEFAULT_MODEL_ID
-        self._model_version: str = model_version or self.DEFAULT_MODEL_VERSION
+        self._model_id: str = resolved_model_id
+        self._model_version: str = resolved_model_version
 
     async def log_event(
         self,
         event_type: str,
         details: dict[str, Any],
         user_id: Optional[str] = None,
-        severity: str = "info"
+        severity: str = "info",
+        correlation_id: Optional[str] = None,
     ) -> None:
         """
         Log a security-relevant event.
@@ -88,8 +120,10 @@ class AuditLogger:
         except Exception:
             input_hash = "hash-error"
 
+        import uuid as _uuid
         event = {
             "timestamp": datetime.utcnow().isoformat(),
+            "correlation_id": correlation_id or str(_uuid.uuid4()),
             "type": event_type,
             "details": details,
             "user_id": user_id,
@@ -109,6 +143,12 @@ class AuditLogger:
             _audit_file_logger.info(json.dumps(event, default=str))
         except Exception as persist_err:
             logger.error("Failed to persist audit event: %s", persist_err)
+            # Re-raise so callers and alerting channels are notified of the
+            # persistence failure — silent failure is not acceptable for audit
+            # trail integrity.
+            raise RuntimeError(
+                f"Audit persistence failure for event '{event_type}': {persist_err}"
+            ) from persist_err
 
         # Also emit to the application logger for real-time observability.
         logger.info(
@@ -123,12 +163,11 @@ class AuditLogger:
     async def log_policy_violation(
         self,
         policy_type: str,
-        violation_details: dict
+        violation_details: dict,
+        correlation_id: Optional[str] = None,
     ) -> None:
         """
         Log a policy violation.
-
-        VULNERABILITY: Violations logged but no alerting.
         """
         await self.log_event(
             event_type="policy_violation",
@@ -136,19 +175,19 @@ class AuditLogger:
                 "policy": policy_type,
                 **violation_details
             },
-            severity="warning"
+            severity="warning",
+            correlation_id=correlation_id,
         )
 
     async def log_data_access(
         self,
         resource: str,
         action: str,
-        user_id: str
+        user_id: str,
+        correlation_id: Optional[str] = None,
     ) -> None:
         """
         Log data access for compliance.
-
-        VULNERABILITY: Minimal implementation.
         """
         await self.log_event(
             event_type="data_access",
@@ -156,7 +195,8 @@ class AuditLogger:
                 "resource": resource,
                 "action": action
             },
-            user_id=user_id
+            user_id=user_id,
+            correlation_id=correlation_id,
         )
 
     def get_recent_events(self, count: int = 100) -> list[dict]:

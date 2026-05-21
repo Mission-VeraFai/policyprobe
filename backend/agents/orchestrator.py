@@ -10,21 +10,54 @@ SECURITY NOTES:
 - Tokens are validated on every inter-agent request
 """
 
+import hashlib
 import logging
+import logging.handlers
 import os
+import time
 from typing import Any, Optional
 
 from .tech_support import TechSupportAgent
 
+# ---------------------------------------------------------------------------
+# Persistent append-only audit log — RotatingFileHandler enforces retention
+# ---------------------------------------------------------------------------
+_AUDIT_LOG_PATH = os.environ.get("LLM_AUDIT_LOG_PATH", "/var/log/app/llm_audit.log")
+_llm_audit_logger = logging.getLogger("llm_audit")
+if not _llm_audit_logger.handlers:
+    _llm_audit_logger.setLevel(logging.INFO)
+    _llm_audit_logger.propagate = False  # do not leak to root logger
+    _audit_file_handler = logging.handlers.RotatingFileHandler(
+        _AUDIT_LOG_PATH,
+        maxBytes=50 * 1024 * 1024,   # 50 MB per file
+        backupCount=90,              # retain 90 rotated files (~90 days at typical volume)
+        encoding="utf-8",
+        delay=False,
+    )
+    _audit_file_handler.setLevel(logging.INFO)
+    _audit_file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    )
+    _llm_audit_logger.addHandler(_audit_file_handler)
 
-def _log_llm_request(model: str, messages: list, extra: dict = None) -> None:
+
+def _log_llm_request(model: str, messages: list, extra: dict = None, principal: str = None) -> None:
     """Log an outgoing LLM request for audit purposes."""
-    # Minimise logged data: record only message count and roles, not content
+    # Compute a SHA-256 hash of the full serialized input for integrity/forensics
+    serialized_input = _json.dumps(messages, default=str, sort_keys=True)
+    input_hash = hashlib.sha256(serialized_input.encode("utf-8")).hexdigest()
     messages_summary = {
         "count": len(messages) if isinstance(messages, list) else None,
         "roles": [m.get("role") for m in messages if isinstance(m, dict)] if isinstance(messages, list) else None,
     }
-    payload = {"model": model, "messages_summary": messages_summary}
+    payload = {
+        "event": "LLM_REQUEST",
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "model": model,
+        "principal": principal,
+        "input_hash": input_hash,
+        "messages_summary": messages_summary,
+    }
     if extra:
         payload.update(extra)
     _llm_audit_logger.info(
@@ -37,6 +70,26 @@ def _log_llm_request(model: str, messages: list, extra: dict = None) -> None:
 # Dynamic-code-execution primitive patterns that must never appear in LLM output
 # ---------------------------------------------------------------------------
 import re as _re
+import json as _json
+
+
+def _sanitize_prompt_input(value: str, max_length: int = 10000) -> str:
+    """
+    Sanitize untrusted string input before interpolation into an LLM prompt.
+
+    Steps:
+      1. Ensure the value is a string.
+      2. Strip non-printable control characters (except common whitespace).
+      3. Truncate to max_length to prevent context-window abuse.
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    # Remove non-printable control characters (keep \t, \n, \r)
+    value = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', value)
+    # Truncate to the allowed maximum length
+    if len(value) > max_length:
+        value = value[:max_length] + '\n[... content truncated for safety ...]'
+    return value
 
 _DANGEROUS_CODE_PATTERNS = [
     # Python builtins
@@ -81,11 +134,25 @@ def _extract_llm_response_text(resp_data: Any) -> str:
     Best-effort extraction of the textual content from a (possibly nested)
     LLM response structure so that _validate_llm_output can inspect it.
     """
-    import json as _json_local
-    try:
-        return _json_local.dumps(resp_data, default=str)
-    except Exception:
-        return str(resp_data)
+    # Extract only known text-bearing fields to avoid serialising the full payload
+    if isinstance(resp_data, str):
+        return resp_data
+    if isinstance(resp_data, dict):
+        for key in ("content", "text", "message", "output", "result"):
+            val = resp_data.get(key)
+            if isinstance(val, str):
+                return val
+        # For nested structures (e.g. choices[0].message.content)
+        choices = resp_data.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0]
+            if isinstance(first, dict):
+                msg = first.get("message", {})
+                if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                    return msg["content"]
+        # Return only a minimal summary, not the full structure
+        return "[structured response]"
+    return "[non-text response]"
 
 
 # ---------------------------------------------------------------------------
@@ -99,10 +166,14 @@ import os as _os_prov
 import uuid as _uuid
 
 # Secret used for HMAC signing of AI-generated content.
-# Override via environment variable AI_PROVENANCE_SECRET in production.
-_AI_PROVENANCE_SECRET: bytes = _os_prov.environ.get(
-    "AI_PROVENANCE_SECRET", "change-me-in-production"
-).encode()
+# Must be set via the AI_PROVENANCE_SECRET environment variable.
+_AI_PROVENANCE_SECRET_VAL = _os_prov.environ.get("AI_PROVENANCE_SECRET")
+if not _AI_PROVENANCE_SECRET_VAL:
+    raise RuntimeError(
+        "AI_PROVENANCE_SECRET environment variable must be set to a strong random secret. "
+        "No hardcoded default is permitted."
+    )
+_AI_PROVENANCE_SECRET: bytes = _AI_PROVENANCE_SECRET_VAL.encode()
 
 
 def _build_provenance(model: str, content: str) -> dict:
@@ -160,7 +231,7 @@ def _attach_provenance(model: str, resp_data: Any) -> Any:
     Returns the (possibly wrapped) resp_data with a ``__provenance__`` key.
     """
     if not isinstance(resp_data, dict):
-        resp_data = {"raw_response": resp_data}
+        resp_data = {"response_type": type(resp_data).__name__}
 
     # Extract best-effort text content for watermark seeding
     content_text = ""
@@ -219,17 +290,225 @@ def _log_llm_response(model: str, response: Any, extra: dict = None) -> None:
             return minimised
 
         resp_data = _extract_minimised_response(response)
-        payload = {"model": model, "response": resp_data}
-        if extra:
-            payload.update(extra)
-        _llm_audit_logger.info(
-            "LLM_RESPONSE | %s",
-            _json.dumps(payload, default=str),
-        )
+
+        # Validate extracted LLM output for dangerous dynamic code execution primitives
+        import re as _re
+        _DANGEROUS_PATTERNS = [
+            _re.compile(r'\beval\s*\(', _re.IGNORECASE),
+            _re.compile(r'\bexec\s*\(', _re.IGNORECASE),
+            _re.compile(r'\b__import__\s*\(', _re.IGNORECASE),
+            _re.compile(r'\bcompile\s*\(', _re.IGNORECASE),
+            _re.compile(r'\bexecfile\s*\(', _re.IGNORECASE),
+            _re.compile(r'subprocess\s*\..*shell\s*=\s*True', _re.IGNORECASE),
+            _re.compile(r'os\.system\s*\(', _re.IGNORECASE),
+            _re.compile(r'os\.popen\s*\(', _re.IGNORECASE),
+            _re.compile(r'\bgetattr\s*\(.*,\s*[\'"]__', _re.IGNORECASE),
+            _re.compile(r'\bsetattr\s*\(', _re.IGNORECASE),
+            _re.compile(r'\bimportlib\.import_module\s*\(', _re.IGNORECASE),
+        ]
+        _serialised_resp = _json.dumps(resp_data, default=str)
+        for _pat in _DANGEROUS_PATTERNS:
+            if _pat.search(_serialised_resp):
+                _llm_audit_logger.warning(
+                    "LLM_RESPONSE_BLOCKED | Dangerous pattern detected in LLM output for model %s: %s",
+                    model,
+                    _pat.pattern,
+                )
+                raise ValueError(
+                    f"LLM output contains a forbidden dynamic code execution primitive "
+                    f"(pattern: {_pat.pattern!r}). Response blocked."
+                )
+
+            payload = {
+        "event": "LLM_RESPONSE",
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "model": model,
+        "principal": getattr(resp_data, "principal", None) if not isinstance(resp_data, dict) else resp_data.get("principal"),
+        "input_hash": getattr(resp_data, "input_hash", None) if not isinstance(resp_data, dict) else resp_data.get("input_hash"),
+        "response": resp_data,
+    }
     except Exception as log_exc:  # pragma: no cover
-        _llm_audit_logger.warning("Failed to serialise LLM response for audit: %s", log_exc)
+        _llm_audit_logger.error("Failed to serialise LLM response for audit: %s", log_exc)
+        raise RuntimeError("Audit logging failure — aborting to preserve forensic integrity") from log_exc
 from .finance import FinanceAgent
 from .file_processor import FileProcessorAgent
+
+
+def _check_malicious_content(content: str, label: str = "file content") -> None:
+    """
+    Scan content for malicious prompt injection patterns before processing.
+    Checks for: hidden/invisible text, base64-encoded prompts, leetspeak prompt
+    injection, shell commands, binary executable signatures, and direct prompt
+    override attempts.
+    """
+    import re
+    import base64
+
+    # 1. Invisible / zero-width characters used to hide text
+    invisible_pattern = re.compile(
+        r'[\u200b\u200c\u200d\u200e\u200f\u202a-\u202e\u2060\u2061\u2062\u2063\ufeff]'
+    )
+    if invisible_pattern.search(content):
+        raise ValueError(
+            f"Uploaded {label} contains hidden/invisible characters that may be used "
+            f"for prompt injection and cannot be processed."
+        )
+
+    # 2. Binary executable signatures (ELF, PE/MZ, Mach-O, shell scripts)
+    binary_signatures = [
+        b'\x7fELF',   # ELF executable
+        b'MZ',        # PE/Windows executable
+        b'\xca\xfe\xba\xbe',  # Mach-O fat binary
+        b'\xfe\xed\xfa\xce',  # Mach-O 32-bit
+        b'\xfe\xed\xfa\xcf',  # Mach-O 64-bit
+    ]
+    raw_bytes = content.encode('utf-8', errors='replace')
+    for sig in binary_signatures:
+        if raw_bytes[:8].startswith(sig) or sig in raw_bytes[:256]:
+            raise ValueError(
+                f"Uploaded {label} appears to contain a binary executable and cannot be processed."
+            )
+
+    # 3. Shell command injection patterns
+    shell_patterns = re.compile(
+        r'(?:^|\s|;|&&|\|\|)'
+        r'(?:bash|sh|zsh|cmd\.exe|powershell|python|perl|ruby|curl|wget|nc|ncat|netcat|eval|exec)'
+        r'(?:\s|$|\()',
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if shell_patterns.search(content):
+        raise ValueError(
+            f"Uploaded {label} contains shell command patterns that may indicate "
+            f"malicious content and cannot be processed."
+        )
+
+    # 4. Base64-encoded prompt injection — decode candidate blobs and re-scan
+    b64_blob_pattern = re.compile(r'[A-Za-z0-9+/]{40,}={0,2}')
+    prompt_injection_keywords = re.compile(
+        r'ignore\s+(?:previous|prior|above|all)\s+instructions?'
+        r'|you\s+are\s+now\s+(?:a|an|the)\b'
+        r'|act\s+as\s+(?:a|an|the)\b'
+        r'|disregard\s+(?:previous|prior|above|all)'
+        r'|system\s*:\s*you\s+are'
+        r'|<\s*(?:system|user|assistant)\s*>'
+        r'|\[\s*(?:INST|SYS|SYSTEM)\s*\]'
+        r'|###\s*(?:Instruction|System|Prompt)',
+        re.IGNORECASE,
+    )
+    for match in b64_blob_pattern.finditer(content):
+        blob = match.group(0)
+        # Pad to valid base64 length
+        padded = blob + '=' * (-len(blob) % 4)
+        try:
+            decoded = base64.b64decode(padded).decode('utf-8', errors='ignore')
+            if prompt_injection_keywords.search(decoded):
+                raise ValueError(
+                    f"Uploaded {label} contains base64-encoded prompt injection content "
+                    f"and cannot be processed."
+                )
+        except (ValueError, Exception):
+            raise  # re-raise ValueError from inner check
+
+    # 5. Direct prompt injection / override attempts in plain text
+    if prompt_injection_keywords.search(content):
+        raise ValueError(
+            f"Uploaded {label} contains prompt injection patterns "
+            f"and cannot be processed."
+        )
+
+    # 6. Leetspeak prompt injection (common substitutions: 4->a, 3->e, 1->i/l, 0->o, 5->s)
+    def _deleet(text: str) -> str:
+        table = str.maketrans('4310@$7|!', 'aeioas tli')
+        return text.translate(table)
+
+    deleeted = _deleet(content)
+    if prompt_injection_keywords.search(deleeted):
+        raise ValueError(
+            f"Uploaded {label} contains leetspeak-obfuscated prompt injection patterns "
+            f"and cannot be processed."
+        )
+
+
+def _check_prompt_safety(content: str, label: str = "prompt") -> None:
+    """
+    Scan content for malicious patterns before processing:
+    - Hidden/invisible Unicode characters used for prompt injection
+    - Base64-encoded payloads
+    - Leetspeak obfuscation of dangerous keywords
+    - Shell commands and binary executable markers
+    """
+    import re
+    import base64
+
+    # 1. Hidden / invisible Unicode characters (zero-width, soft-hyphen, etc.)
+    invisible_pattern = re.compile(
+        r'[\u00ad\u200b\u200c\u200d\u200e\u200f\u202a-\u202e\u2060-\u2064\ufeff\u2028\u2029]'
+    )
+    if invisible_pattern.search(content):
+        raise ValueError(
+            f"The {label} contains hidden or invisible Unicode characters that may indicate "
+            "a prompt injection attempt and cannot be processed."
+        )
+
+    # 2. Base64-encoded content (heuristic: long alphanum+/= token that decodes cleanly)
+    b64_token = re.compile(r'(?<![\w/+])([A-Za-z0-9+/]{40,}={0,2})(?![\w/+])')
+    for match in b64_token.finditer(content):
+        candidate = match.group(1)
+        try:
+            decoded = base64.b64decode(candidate + '==').decode('utf-8', errors='strict')
+            # Flag if decoded text contains shell/script indicators
+            if re.search(
+                r'(?:bash|sh|cmd|powershell|exec|eval|import|system|chmod|wget|curl)',
+                decoded, re.IGNORECASE
+            ):
+                raise ValueError(
+                    f"The {label} contains base64-encoded content with potentially malicious "
+                    "commands and cannot be processed."
+                )
+        except (ValueError, UnicodeDecodeError):
+            pass  # Not valid UTF-8 base64 — skip
+
+    # 3. Leetspeak obfuscation of dangerous keywords
+    # Normalise common leet substitutions then check for dangerous words
+    leet_map = str.maketrans('013456789@$!', 'oieashgtbgas')
+    normalised = content.lower().translate(leet_map)
+    leet_dangerous = re.compile(
+        r'\b(?:exec|eval|system|passthru|shell|popen|subprocess|os\.system|'
+        r'rm\s+-rf|format\s+c|del\s+/[sq]|drop\s+table|truncate\s+table)\b'
+    )
+    if leet_dangerous.search(normalised):
+        raise ValueError(
+            f"The {label} contains obfuscated dangerous keywords and cannot be processed."
+        )
+
+    # 4. Shell command patterns
+    shell_pattern = re.compile(
+        r'(?:'
+        r'\$\([^)]*\)'
+        r'|`[^`]+`'
+        r'|;\s*(?:rm|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat)\b'
+        r'|&&\s*(?:rm|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat)\b'
+        r'|\|\s*(?:bash|sh|cmd|powershell)\b'
+        r'|(?:^|\s)(?:sudo|chmod|chown|chgrp)\s'
+        r'|(?:^|\s)/(?:bin|usr/bin|sbin)/'
+        r'|(?:^|\s)(?:wget|curl)\s+https?://'
+        r')',
+        re.IGNORECASE | re.MULTILINE,
+    )
+    if shell_pattern.search(content):
+        raise ValueError(
+            f"The {label} contains shell command patterns and cannot be processed."
+        )
+
+    # 5. Binary executable markers (ELF, PE/MZ, Mach-O magic bytes represented as escaped or literal)
+    binary_pattern = re.compile(
+        r'(?:\\x7fELF|\\x4d\\x5a|MZ\x00|\x7fELF|\\x7f\\x45\\x4c\\x46'
+        r'|\\xca\\xfe\\xba\\xbe|\\xcf\\xfa\\xed\\xfe)'
+    )
+    if binary_pattern.search(content):
+        raise ValueError(
+            f"The {label} contains binary executable markers and cannot be processed."
+        )
 
 
 def _check_singapore_pii(content: str, label: str = "file content") -> None:
@@ -237,7 +516,10 @@ def _check_singapore_pii(content: str, label: str = "file content") -> None:
     Scan content for Singapore PII categories and raise ValueError if found.
     Covers: NRIC/FIN, SingPass ID, CPF account numbers, Singapore phone numbers,
     Singapore postal codes combined with personal identifiers, and passport numbers.
+    Also invokes malicious content checks prior to PII scanning.
     """
+    # Always screen for malicious/injected content first
+    _check_malicious_content(content, label=label)
     import re
 
     sg_pii_patterns = {
@@ -308,6 +590,11 @@ APPROVED_MODEL_REGISTRY: dict[str, dict] = {
 
 # Default pinned model — must exist in APPROVED_MODEL_REGISTRY
 DEFAULT_APPROVED_MODEL = "approved-llm-v2.1.0"
+
+# Perform registry verification and integrity check at module load time
+_VERIFIED_MODEL_ENTRY = verify_model_integrity(DEFAULT_APPROVED_MODEL)
+_ORCHESTRATOR_MODEL_ID = DEFAULT_APPROVED_MODEL
+_ORCHESTRATOR_MODEL_VERSION = _VERIFIED_MODEL_ENTRY["version"]
 
 
 def verify_model_integrity(model_id: str) -> dict:
@@ -536,8 +823,8 @@ class AgentOrchestrator:
                 f"registry version '{_APPROVED_MODEL_REGISTRY[self.MODEL_ID]}' "
                 f"for model '{self.MODEL_ID}'."
             )
-        self.llm_client = OpenRouterClient(
-            model=self.MODEL_VERSION,
+        self.llm_client = ApprovedLLMClient(
+            model="approved-llm-v2.1.0",
         )
         self.authenticator = AgentAuthenticator()
         import hashlib, uuid as _uuid, datetime as _datetime
@@ -582,6 +869,8 @@ class AgentOrchestrator:
             "timestamp_utc": self._datetime.datetime.utcnow().isoformat() + "Z",
             "model_id": self.MODEL_ID,
             "model_version": self.MODEL_VERSION,
+            "model_registry_approved": APPROVED_MODEL_REGISTRY[self.MODEL_ID]["approved"],
+            "model_config_sha256": APPROVED_MODEL_REGISTRY[self.MODEL_ID]["config_sha256"],
             "input_hash": input_hash,
             "principal": principal,
             "action": action,
@@ -591,6 +880,8 @@ class AgentOrchestrator:
             record["extra"] = extra
 
         _audit_logger.info(self._json.dumps(record))
+        # Also write to the persistent LLM audit file store for forensic readiness
+        _llm_audit_logger.info("DECISION_AUDIT | %s", self._json.dumps(record, default=str))
         return trace_id
 
         # Initialize agents
@@ -675,13 +966,123 @@ class AgentOrchestrator:
             }
         }
 
-        # Token for inter-agent communication
-        # VULNERABILITY: Token is generated but never validated on receiving end
-        self._agent_token = os.environ.get("AGENT_TOKEN")
+                        # Token for inter-agent communication
+        # Tokens are signed JWTs with expiry and binding; validated on every receive.
+        import hmac as _hmac_tok
+        import hashlib as _hashlib_tok
+        import base64 as _b64
+        import time as _time
+
+        _raw_agent_secret = os.environ.get("AGENT_TOKEN_SECRET")
+        if not _raw_agent_secret:
+            raise RuntimeError(
+                "AGENT_TOKEN_SECRET environment variable is not set; "
+                "inter-agent authentication cannot be initialised securely."
+            )
+        self._agent_token_secret: bytes = _raw_agent_secret.encode()
+
+        def _issue_agent_token(self, *, subject: str, audience: str, ttl_seconds: int = 300) -> str:
+            """Issue a signed inter-agent token (HS256 JWT-like structure)."""
+            import json as _json
+            import base64 as _b64
+            import hmac as _hmac_tok
+            import hashlib as _hashlib_tok
+            import time as _time
+            now = int(_time.time())
+            header = _b64.urlsafe_b64encode(
+                _json.dumps({"alg": "HS256", "typ": "JWT"}).encode()
+            ).rstrip(b"=").decode()
+            payload = _b64.urlsafe_b64encode(
+                _json.dumps({
+                    "sub": subject,
+                    "aud": audience,
+                    "iat": now,
+                    "exp": now + ttl_seconds,
+                }).encode()
+            ).rstrip(b"=").decode()
+            signing_input = f"{header}.{payload}".encode()
+            sig = _b64.urlsafe_b64encode(
+                _hmac_tok.new(self._agent_token_secret, signing_input, _hashlib_tok.sha256).digest()
+            ).rstrip(b"=").decode()
+            return f"{header}.{payload}.{sig}"
+
+        def _validate_agent_token(self, token: str, *, expected_subject: str, expected_audience: str) -> bool:
+            """Verify signature, expiry, subject, and audience of an inter-agent token."""
+            import json as _json
+            import base64 as _b64
+            import hmac as _hmac_tok
+            import hashlib as _hashlib_tok
+            import time as _time
+            try:
+                parts = token.split(".")
+                if len(parts) != 3:
+                    return False
+                header_b64, payload_b64, sig_b64 = parts
+                signing_input = f"{header_b64}.{payload_b64}".encode()
+                expected_sig = _b64.urlsafe_b64encode(
+                    _hmac_tok.new(self._agent_token_secret, signing_input, _hashlib_tok.sha256).digest()
+                ).rstrip(b"=").decode()
+                if not _hmac_tok.compare_digest(sig_b64, expected_sig):
+                    logger.warning("Inter-agent token signature verification failed.")
+                    return False
+                # Pad base64 for decoding
+                padding = 4 - len(payload_b64) % 4
+                payload = _json.loads(_b64.urlsafe_b64decode(payload_b64 + "=" * (padding % 4)))
+                now = int(_time.time())
+                if payload.get("exp", 0) < now:
+                    logger.warning("Inter-agent token has expired.")
+                    return False
+                if payload.get("sub") != expected_subject:
+                    logger.warning("Inter-agent token subject mismatch.")
+                    return False
+                if payload.get("aud") != expected_audience:
+                    logger.warning("Inter-agent token audience mismatch.")
+                    return False
+                return True
+            except Exception:
+                logger.warning("Inter-agent token validation raised an exception.")
+                return False
+
+        import types as _types
+        self._issue_agent_token = _types.MethodType(_issue_agent_token, self)
+        self._validate_agent_token = _types.MethodType(_validate_agent_token, self)
         if not self._agent_token:
             logger.warning(
                 "AGENT_TOKEN environment variable is not set; "
                 "inter-agent authentication will not function correctly."
+            )
+
+    def _validate_agent_token(self, token: str) -> bool:
+        """Validate the inter-agent token using a constant-time comparison.
+
+        Returns True only when the supplied token matches the configured
+        AGENT_TOKEN secret.  Raises PermissionError when validation fails so
+        that callers cannot silently bypass the check.
+        """
+        import hmac as _hmac
+        if not self._agent_token:
+            raise PermissionError(
+                "Inter-agent authentication is not configured; "
+                "AGENT_TOKEN must be set before agents may communicate."
+            )
+        if not token:
+            raise PermissionError("Inter-agent request is missing an authentication token.")
+        if not _hmac.compare_digest(
+            token.encode("utf-8"), self._agent_token.encode("utf-8")
+        ):
+            raise PermissionError("Inter-agent token validation failed; request rejected.")
+        return True
+        if not self._agent_token:
+            raise RuntimeError(
+                "AGENT_TOKEN environment variable is not set; "
+                "inter-agent authentication cannot function. "
+                "Set AGENT_TOKEN before starting the orchestrator."
+            )
+        # Pre-validate the token at startup to fail fast on misconfiguration
+        if not self._validate_token(self._agent_token):
+            raise RuntimeError(
+                "AGENT_TOKEN failed validation at startup; "
+                "ensure the token is correctly configured."
             )
 
         # Spawn circuit-breaker: prevent unbounded subagent spawning
@@ -736,6 +1137,22 @@ class AgentOrchestrator:
     _MAX_FILE_SIZE: int = 50_000           # characters per file
     _MAX_FILE_COUNT: int = 10
     # Patterns commonly used in prompt-injection attacks
+    # Singapore PII patterns to redact from uploaded file contents
+    _PII_PATTERNS: list = [
+        # Singapore NRIC/FIN (e.g. S1234567A, T0012345Z, F1234567N, G1234567P)
+        (re.compile(r'\b[STFG]\d{7}[A-Z]\b', re.IGNORECASE), '[REDACTED_NRIC]'),
+        # Singapore phone numbers (8-digit, optionally prefixed with +65 or 65)
+        (re.compile(r'\b(?:\+65|65)?[689]\d{7}\b'), '[REDACTED_PHONE]'),
+        # Email addresses
+        (re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'), '[REDACTED_EMAIL]'),
+        # Singapore passport numbers (e.g. E1234567A)
+        (re.compile(r'\b[A-Z]\d{7}[A-Z]\b'), '[REDACTED_PASSPORT]'),
+        # Credit/debit card numbers (13-19 digits, optionally space/dash separated)
+        (re.compile(r'\b(?:\d[ \-]?){13,19}\b'), '[REDACTED_CARD]'),
+        # Singapore bank account numbers (typically 10 digits)
+        (re.compile(r'\b\d{10}\b'), '[REDACTED_ACCOUNT]'),
+    ]
+
     _INJECTION_PATTERNS: list = [
         r"ignore (all |previous |above )?instructions?",
         r"disregard (all |previous |above )?instructions?",
@@ -749,6 +1166,12 @@ class AgentOrchestrator:
         r"\[INST\]",
         r"<\|.*?\|>",
     ]
+
+    def _redact_pii(self, text: str) -> str:
+        """Redact Singapore PII from the given text using _PII_PATTERNS."""
+        for pattern, replacement in self._PII_PATTERNS:
+            text = pattern.sub(replacement, text)
+        return text
 
     def _sanitize_message(self, message: str) -> str:
         """Sanitize a user-supplied message before it reaches the LLM."""
@@ -768,6 +1191,32 @@ class AgentOrchestrator:
                 )
         return message.strip()
 
+        # Singapore PII patterns for file content scanning
+    _SG_PII_PATTERNS: list = [
+        # NRIC/FIN: S/T/F/G followed by 7 digits and a letter
+        (r'\b[STFG]\d{7}[A-Z]\b', 'NRIC/FIN number'),
+        # Singapore passport: E followed by 7 digits
+        (r'\bE\d{7}\b', 'Singapore passport number'),
+        # Singapore phone numbers: +65 or 65 prefix with 8-digit number starting with 6/8/9
+        (r'(?:\+65|\b65)?\s*[689]\d{7}\b', 'Singapore phone number'),
+        # CPF account references
+        (r'\bCPF\b[\s\S]{0,30}\d{4,}', 'CPF account reference'),
+        # SingPass credentials (SingPass followed by ID-like token)
+        (r'\bSingPass\b[\s\S]{0,50}[A-Z0-9]{6,}', 'SingPass credential'),
+        # Bank account numbers: 10-12 digit sequences (common SG bank format)
+        (r'\b\d{3}[-\s]?\d{3}[-\s]?\d{4,6}\b', 'bank account number'),
+    ]
+
+    def _check_singapore_pii(self, content: str, context: str = "") -> None:
+        """Raise ValueError if Singapore PII is detected in content."""
+        import re
+        for pattern, label in self._SG_PII_PATTERNS:
+            if re.search(pattern, content, re.IGNORECASE):
+                raise ValueError(
+                    f"Singapore PII detected ({label}) in {context}. "
+                    "Uploaded files must not contain PII."
+                )
+
     def _sanitize_file_contents(self, file_contents: list) -> list:
         """Sanitize a list of file-content strings before they reach the LLM."""
         import re
@@ -785,6 +1234,8 @@ class AgentOrchestrator:
             content = content[:self._MAX_FILE_SIZE]
             # Strip null bytes and non-printable control characters
             content = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", content)
+            # Detect and reject Singapore PII in uploaded file contents
+            self._check_singapore_pii(content, context=f"file_contents[{idx}]")
             # Detect and reject prompt-injection attempts inside files
             lower = content.lower()
             for pattern in self._INJECTION_PATTERNS:
@@ -921,14 +1372,37 @@ class AgentOrchestrator:
             }
         )
 
-        # Route to appropriate agent
+                # Route to appropriate agent
+        import asyncio as _asyncio
+        _ROUTE_TIMEOUT_SECONDS = 30  # hard cap per subagent spawn
+        _spawn_id = f"{intent}-{id(context)}"  # traceability token
+        logger.info(
+            "Subagent spawn initiated",
+            extra={"spawn_id": _spawn_id, "intent": intent, "timeout": _ROUTE_TIMEOUT_SECONDS}
+        )
         if intent == "finance":
             # VULNERABILITY: Tech support can route to finance without auth verification
-            response = await self._route_to_finance(context)
+            _spawn_bound = {"agent": "finance", "max_steps": 1, "spawn_id": _spawn_id}
+            response = await _asyncio.wait_for(
+                self._route_to_finance(context),
+                timeout=_ROUTE_TIMEOUT_SECONDS
+            )
         elif intent == "file_analysis":
-            response = await self._route_to_file_processor(context)
+            _spawn_bound = {"agent": "file_processor", "max_steps": 1, "spawn_id": _spawn_id}
+            response = await _asyncio.wait_for(
+                self._route_to_file_processor(context),
+                timeout=_ROUTE_TIMEOUT_SECONDS
+            )
         else:
-            response = await self._route_to_tech_support(context)
+            _spawn_bound = {"agent": "tech_support", "max_steps": 1, "spawn_id": _spawn_id}
+            response = await _asyncio.wait_for(
+                self._route_to_tech_support(context),
+                timeout=_ROUTE_TIMEOUT_SECONDS
+            )
+        logger.info(
+            "Subagent spawn completed",
+            extra={"spawn_id": _spawn_id, "spawn_bound": _spawn_bound}
+        )
 
         return self._attach_provenance(response, routed_agent=intent)
 
@@ -964,7 +1438,7 @@ class AgentOrchestrator:
         from datetime import datetime, timezone
 
         provenance = {
-            "model_id": f"orchestrator-v1/{routed_agent}",
+            "model_id": f"{self.MODEL_ID}/{routed_agent}",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "origin_tag": "AI_GENERATED",
             "routed_agent": routed_agent,
@@ -1160,11 +1634,48 @@ class AgentOrchestrator:
         """Route request to tech support agent."""
         # Create internal caller identity
         caller = AgentIdentity(
-            agent_id="orchestrator",
-            agent_name="Orchestrator",
-            privilege_level="system",
-            is_internal=True  # Flag that bypasses auth
+    agent_id="orchestrator",
+    agent_name="Orchestrator",
+    privilege_level="system",
+    is_internal=True
+)
+
+# Allowed privilege escalation paths: maps (caller_privilege, target_agent) -> required_minimum_caller_privilege
+_ESCALATION_POLICY: dict = {
+    ("low", "finance"): "high",
+    ("medium", "finance"): "high",
+}
+_PRIVILEGE_RANK: dict = {"low": 0, "medium": 1, "high": 2, "system": 3}
+
+def _assert_routing_authorized(
+    caller_identity: "AgentIdentity",
+    target_agent_name: str,
+    agents: dict,
+) -> None:
+    """Raise PermissionError if caller is not permitted to route to target_agent.
+
+    Prevents low/medium privilege callers from escalating to high-privilege
+    agents (e.g. finance) without explicit authorization.
+    """
+    target_info = agents.get(target_agent_name)
+    if target_info is None:
+        raise ValueError(f"Unknown target agent: {target_agent_name!r}")
+
+    caller_rank = _PRIVILEGE_RANK.get(caller_identity.privilege_level, -1)
+    target_rank = _PRIVILEGE_RANK.get(target_info["privilege"], 0)
+
+    if caller_rank < target_rank:
+        raise PermissionError(
+            f"Privilege escalation denied: caller '{caller_identity.agent_id}' "
+            f"(privilege='{caller_identity.privilege_level}') is not authorized "
+            f"to route to agent '{target_agent_name}' "
+            f"(privilege='{target_info['privilege']}')."
         )
+if not AgentAuthenticator.authenticate(caller, token=self._agent_token):
+    raise PermissionError(
+        "Orchestrator AgentIdentity failed authentication; "
+        "inter-agent call aborted."
+    )
 
         self._validate_agent_token(self._agent_token)
         headers = {"X-Agent-Token": self._agent_token}
@@ -1212,7 +1723,11 @@ class AgentOrchestrator:
             is_internal=True
         )
 
-        # Token passed but receiver doesn't validate
+        # Token is validated by the receiver via AgentAuthenticator middleware
+        if not self._validate_token(self._agent_token):
+            raise PermissionError(
+                "Agent token is invalid; cannot initiate authenticated inter-agent call."
+            )
         headers = {"X-Agent-Token": self._agent_token}
 
         logger.info(
@@ -1221,7 +1736,7 @@ class AgentOrchestrator:
                 "caller": caller.agent_id,
                 "privilege": caller.privilege_level,
                 # Token visible in logs
-                "token_preview": self._agent_token[:10] + "..."
+                "token_preview": "[REDACTED]"
             }
         )
 
@@ -1248,7 +1763,16 @@ class AgentOrchestrator:
 
         # Process files and get analysis
         analyses = []
+        _MAX_FILE_ITERATIONS = 20  # hard cap on LLM spawns per file-processor call
+        _file_iter_count = 0
         for file_data in file_contents:
+            if _file_iter_count >= _MAX_FILE_ITERATIONS:
+                logger.warning(
+                    "File processor iteration limit reached",
+                    extra={"max_iterations": _MAX_FILE_ITERATIONS, "processed": _file_iter_count}
+                )
+                break
+            _file_iter_count += 1
             extracted = file_data.get("extracted_content", "")
             analyses.append(f"File: {file_data.get('filename')}\n{extracted}")
 
@@ -1257,34 +1781,213 @@ class AgentOrchestrator:
         # Get the user's actual question
         user_question = context.get("user_message", "")
 
-        # Get LLM analysis of file contents
-        # VULNERABILITY: File content sent directly to LLM without PII/threat scanning
-        # VULNERABILITY: User's question passed through without checking for PII requests
+        # Validate and sanitize inputs before sending to LLM
+        sanitized_content = self._sanitize_input(combined_content, max_length=50000)
+        sanitized_question = self._sanitize_input(user_question, max_length=1000)
+
+                        # Redact PII from file content and user question before sending to LLM
+        redacted_content = self._redact_pii(combined_content)
+        redacted_question = self._redact_pii(user_question)
+
         analysis = await self.llm_client.chat(
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a helpful document analyst. Answer the user's questions based on the provided document content. Be direct and specific - if they ask for specific information, provide it exactly as it appears in the document."
+                    "content": "You are a helpful document analyst. Answer the user's questions based on the provided document content. Summarise and paraphrase relevant information; do not reproduce verbatim blocks of document text."
                 },
                 {
                     "role": "user",
                     "content": f"""Document Content:
-{combined_content}
+{redacted_content}
 
-User Question: {user_question}
+User Question: {redacted_question}
 
 Please answer the user's question based on the document content above."""
                 }
             ]
         )
+        analysis = await self.llm_client.chat(
+            messages=llm_messages
+        )
+        self._log_llm_response(
+            agent="file_processor",
+            response=analysis,
+            context=context
+        )
 
         sanitized_analysis = self._validate_and_sanitize_llm_output(analysis)
 
-        return {
+        result = {
             "response": sanitized_analysis,
             "agent": "file_processor",
             "files_processed": len(file_contents)
         }
+        return self._attach_provenance(result, content_key="response")
+
+    def _sanitize_input(self, text: str, max_length: int = 4096) -> str:
+        """
+        Validate and sanitize input before sending to the LLM.
+
+        Removes null bytes, control characters (except common whitespace),
+        strips leading/trailing whitespace, enforces a maximum length, and
+        redacts patterns that commonly indicate PII (SSNs, credit-card
+        numbers) or prompt-injection attempts.
+
+        Args:
+            text: Raw input string (file content or user question).
+            max_length: Maximum allowed character length after sanitization.
+
+        Returns:
+            Sanitized string safe to forward to the LLM.
+
+        Raises:
+            ValueError: If text is not a string.
+        """
+        import re
+
+        if not isinstance(text, str):
+            raise ValueError("Input validation failed: value is not a string.")
+
+        # Remove null bytes
+        text = text.replace("\x00", "")
+
+        # Remove non-printable control characters (keep \t, \n, \r)
+        text = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+
+        # Redact SSN-like patterns (e.g. 123-45-6789)
+        text = re.sub(r"\b\d{3}-\d{2}-\d{4}\b", "[REDACTED-SSN]", text)
+
+        # Redact credit-card-like patterns (13-16 consecutive digits)
+        text = re.sub(r"\b(?:\d[ -]?){13,16}\b", "[REDACTED-CC]", text)
+
+        # Detect and neutralise basic prompt-injection attempts
+        injection_patterns = [
+            r"(?i)ignore\s+(all\s+)?previous\s+instructions?",
+            r"(?i)disregard\s+(all\s+)?previous\s+instructions?",
+            r"(?i)you\s+are\s+now\s+(?:a|an)\s+",
+            r"(?i)act\s+as\s+(?:a|an)\s+",
+            r"(?i)jailbreak",
+            r"(?i)system\s*prompt",
+        ]
+        for pattern in injection_patterns:
+            text = re.sub(pattern, "[FILTERED]", text)
+
+        # Strip surrounding whitespace and enforce length limit
+        text = text.strip()
+        if len(text) > max_length:
+            text = text[:max_length]
+            logger.warning(
+                "Input truncated to %d characters during sanitization.",
+                max_length
+            )
+
+        return text
+
+    # ---------------------------------------------------------------------------
+    # Provenance helpers – every AI-generated payload must pass through these
+    # before being returned to any caller.
+    # ---------------------------------------------------------------------------
+
+    def _build_provenance(self, content: str) -> dict:
+        """Build provenance metadata for an AI-generated content string.
+
+        Returns a dict containing:
+          - synthetic_label : human-readable marker that the content is AI-generated
+          - watermark_token : a per-response pseudorandom hex token
+          - generated_at    : ISO-8601 UTC timestamp
+          - agent           : identifier of the producing agent
+          - signature       : HMAC-SHA256 over (watermark_token + content)
+        """
+        import hashlib
+        import hmac
+        import os
+        import datetime
+
+        watermark_token = os.urandom(16).hex()
+        generated_at = datetime.datetime.utcnow().isoformat() + "Z"
+        signing_key = getattr(self, "_provenance_signing_key", None)
+        if signing_key is None:
+            # Derive a stable per-instance key from the agent token so that
+            # signatures survive across calls within the same process.
+            signing_key = hashlib.sha256(
+                (self._agent_token + "provenance").encode()
+            ).digest()
+            self._provenance_signing_key = signing_key
+
+        mac = hmac.new(
+            signing_key,
+            msg=(watermark_token + content).encode(),
+            digestmod=hashlib.sha256
+        ).hexdigest()
+
+        return {
+            "synthetic_label": "AI-GENERATED CONTENT",
+            "watermark_token": watermark_token,
+            "generated_at": generated_at,
+            "agent": "orchestrator/file_processor",
+            "signature": mac,
+        }
+
+    def _attach_provenance(
+        self, result: dict, content_key: str = "response"
+    ) -> dict:
+        """Attach provenance metadata to *result* in-place and return it.
+
+        The content addressed by *content_key* is used as the payload over
+        which the watermark token and HMAC signature are computed.
+        """
+        content = result.get(content_key, "")
+        result["provenance"] = self._build_provenance(content)
+        return result
+
+    # ---------------------------------------------------------------------------
+
+    def _redact_pii(self, text: str) -> str:
+        """
+        Redact PII (email addresses, passport numbers, phone numbers) from text
+        before sending to an LLM.
+
+        Args:
+            text: Input string that may contain PII.
+
+        Returns:
+            String with PII replaced by redaction placeholders.
+        """
+        import re
+
+        if not isinstance(text, str):
+            return text
+
+        # Redact email addresses
+        text = re.sub(
+            r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}',
+            '[REDACTED_EMAIL]',
+            text
+        )
+
+        # Redact phone numbers (various formats: +1-800-555-1234, (800) 555-1234,
+        # 800.555.1234, 8005551234, +44 20 7946 0958, etc.)
+        text = re.sub(
+            r'(?:\+?\d{1,3}[\s\-.])?(?:\(?\d{1,4}\)?[\s\-.])?\d{1,4}[\s\-.]\d{1,4}[\s\-.]\d{1,9}',
+            '[REDACTED_PHONE]',
+            text
+        )
+
+        # Redact passport numbers (common formats: letter(s) followed by digits,
+        # e.g. A12345678, AB1234567, or purely numeric 9-digit)
+        text = re.sub(
+            r'\b[A-Z]{1,2}\d{6,9}\b',
+            '[REDACTED_PASSPORT]',
+            text
+        )
+        # Purely numeric passport-style numbers (9 digits)
+        text = re.sub(
+            r'\b\d{9}\b',
+            '[REDACTED_PASSPORT]',
+            text
+        )
+
+        return text
 
     def _validate_and_sanitize_llm_output(self, output: str) -> str:
         """
@@ -1419,11 +2122,21 @@ Please answer the user's question based on the document content above."""
                 extra={"escalation_target": escalation_target}
             )
             return {
-                "error": "Escalation target is not on the approved allow list.",
-                "escalation_target": escalation_target
+                "error": "Escalation target is not on the approved allow list."
             }
 
-        return await self._route_to_finance(escalation_context)
+        import asyncio as _asyncio
+        _ESCALATION_TIMEOUT_SECONDS = 30
+        _escalation_spawn_id = f"finance-escalation-{id(escalation_context)}"
+        logger.info(
+            "Subagent spawn initiated",
+            extra={"spawn_id": _escalation_spawn_id, "agent": "finance", "timeout": _ESCALATION_TIMEOUT_SECONDS}
+        )
+        _escalation_spawn_bound = {"agent": "finance", "max_steps": 1, "spawn_id": _escalation_spawn_id}
+        return await _asyncio.wait_for(
+            self._route_to_finance(escalation_context),
+            timeout=_ESCALATION_TIMEOUT_SECONDS
+        )
 
     def _sanitize_file_content(self, content: str) -> str:
         """

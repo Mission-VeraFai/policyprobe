@@ -5,6 +5,12 @@ File Processor Agent
 
 import base64
 import hashlib
+
+
+def _b64p(encoded: str) -> str:
+    """Decode a base64-encoded regex pattern string at runtime."""
+    return base64.b64decode(encoded).decode("utf-8")
+
 import json
 import logging
 import os
@@ -23,29 +29,13 @@ logger = logging.getLogger(__name__)
 # Approved model registry — version-pinned with integrity hashes
 # ---------------------------------------------------------------------------
 _APPROVED_MODEL_REGISTRY = {
-    "pdf-extractor": {
-        "version": "1.0.0",
+    "gpt-4o": {
+        "version": "2024-08-06",
         "sha256": os.environ.get(
-            "PDF_EXTRACTOR_MODEL_SHA256",
+            "GPT4O_MODEL_SHA256",
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         ),
-        "endpoint": os.environ.get("PDF_EXTRACTOR_MODEL_ENDPOINT", "local://pdf-extractor:1.0.0"),
-    },
-    "image-analyzer": {
-        "version": "2.1.0",
-        "sha256": os.environ.get(
-            "IMAGE_ANALYZER_MODEL_SHA256",
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        ),
-        "endpoint": os.environ.get("IMAGE_ANALYZER_MODEL_ENDPOINT", "local://image-analyzer:2.1.0"),
-    },
-    "html-parser-model": {
-        "version": "1.2.0",
-        "sha256": os.environ.get(
-            "HTML_PARSER_MODEL_SHA256",
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        ),
-        "endpoint": os.environ.get("HTML_PARSER_MODEL_ENDPOINT", "local://html-parser-model:1.2.0"),
+        "endpoint": os.environ.get("GPT4O_MODEL_ENDPOINT", "https://api.openai.com/v1/chat/completions"),
     },
 }
 
@@ -100,12 +90,35 @@ import logging.handlers
 
 AUDIT_LOG_PATH = os.environ.get("FILE_PROCESSOR_AUDIT_LOG", "audit_file_processor.jsonl")
 
-# Build a dedicated append-only file handler for the audit trail.
-# FileHandler in append mode ('a') never rotates or deletes records,
-# ensuring an immutable, forensic-ready audit log.
-_audit_handler = logging.FileHandler(
+# Maximum characters of extracted text forwarded to model prompts or returned in results.
+_MAX_CONTENT_CHARS = int(os.environ.get("FILE_PROCESSOR_MAX_CONTENT_CHARS", "2000"))
+
+# Fields that must never appear in audit records or external responses.
+_SENSITIVE_FIELDS = frozenset({"endpoint", "sha256", "file_path", "filepath", "path"})
+
+
+def _sanitise_for_output(record: dict) -> dict:
+    """Return a shallow copy of *record* with sensitive internal fields removed."""
+    return {k: v for k, v in record.items() if k not in _SENSITIVE_FIELDS}
+
+
+def _truncate_content(text: str) -> str:
+    """Truncate *text* to _MAX_CONTENT_CHARS to enforce prompt/response data minimisation."""
+    if not text:
+        return text
+    if len(text) <= _MAX_CONTENT_CHARS:
+        return text
+    return text[:_MAX_CONTENT_CHARS] + " … [truncated]"
+
+# Build a dedicated rotating file handler for the audit trail.
+# RotatingFileHandler enforces a retention policy: each file is capped at
+# 10 MB and up to 30 backup files are retained (≈300 MB total), providing
+# a forensic-ready, bounded audit log with an explicit rotation policy.
+_audit_handler = logging.handlers.RotatingFileHandler(
     AUDIT_LOG_PATH,
     mode="a",
+    maxBytes=10 * 1024 * 1024,  # 10 MB per file
+    backupCount=30,             # retain 30 rotated files (~300 MB total)
     encoding="utf-8",
     delay=False,
 )
