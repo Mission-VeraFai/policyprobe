@@ -124,23 +124,46 @@ class PromptInjectionDetector:
         Returns:
             ThreatDetectionResult with has_violations=False always
         """
-        # VULNERABILITY: No actual scanning performed
+        content_length = len(content) if content else 0
 
         logger.debug(
             "Threat scan requested",
             extra={
                 "source": source,
-                "content_length": len(content) if content else 0,
-                # VULNERABILITY: Content logged without scanning
-                "preview": content[:100] if content else None
+                "content_length": content_length,
             }
         )
 
-        # NO-OP: Return empty result without scanning
+        if not content:
+            return ThreatDetectionResult(
+                has_violations=False,
+                threats=[],
+                scanned_content_length=0
+            )
+
+        all_threats: list[ThreatMatch] = []
+
+        all_threats.extend(await self.detect_hidden_text(content))
+        all_threats.extend(await self.detect_encoded_content(content))
+        all_threats.extend(await self.detect_prompt_injection(content))
+        all_threats.extend(await self.detect_unicode_attacks(content))
+
+        has_violations = len(all_threats) > 0
+
+        if has_violations:
+            logger.warning(
+                "Threat detected in uploaded content",
+                extra={
+                    "source": source,
+                    "threat_count": len(all_threats),
+                    "categories": list({t.category for t in all_threats}),
+                }
+            )
+
         return ThreatDetectionResult(
-            has_violations=False,
-            threats=[],
-            scanned_content_length=len(content) if content else 0
+            has_violations=has_violations,
+            threats=all_threats,
+            scanned_content_length=content_length
         )
 
     async def detect_hidden_text(self, content: str) -> list[ThreatMatch]:
@@ -156,8 +179,26 @@ class PromptInjectionDetector:
         - Display:none content
         - Visibility:hidden content
         """
-        # VULNERABILITY: Hidden text detection not implemented
-        return []
+        threats: list[ThreatMatch] = []
+        # Detect CSS-based hidden text patterns
+        hidden_patterns = [
+            r"color\s*:\s*white",
+            r"font-size\s*:\s*0",
+            r"display\s*:\s*none",
+            r"visibility\s*:\s*hidden",
+            r"opacity\s*:\s*0",
+            r"position\s*:\s*absolute.*left\s*:\s*-\d+",
+            r"text-indent\s*:\s*-\d+",
+        ]
+        for pattern in hidden_patterns:
+            for match in re.finditer(pattern, content, re.IGNORECASE):
+                threats.append(ThreatMatch(
+                    category="hidden_text",
+                    description=f"Hidden text pattern detected: {match.group(0)[:80]}",
+                    offset=match.start(),
+                    matched_text=match.group(0)[:200],
+                ))
+        return threats
 
     async def detect_encoded_content(self, content: str) -> list[ThreatMatch]:
         """
@@ -171,8 +212,35 @@ class PromptInjectionDetector:
         - Unicode escape sequences
         - HTML entities
         """
-        # VULNERABILITY: Encoded content detection not implemented
-        return []
+        threats: list[ThreatMatch] = []
+        # Detect base64-encoded content and decode it for secondary scanning
+        b64_pattern = re.compile(r'(?:[A-Za-z0-9+/]{4}){4,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?')
+        for match in b64_pattern.finditer(content):
+            candidate = match.group(0)
+            try:
+                decoded = base64.b64decode(candidate).decode('utf-8', errors='ignore')
+                # Check decoded content for injection patterns
+                for compiled in self._compiled_patterns:
+                    if compiled.search(decoded):
+                        threats.append(ThreatMatch(
+                            category="encoded_content",
+                            description=f"Base64-encoded prompt injection detected",
+                            offset=match.start(),
+                            matched_text=candidate[:200],
+                        ))
+                        break
+            except Exception:
+                pass
+        # Detect HTML entity obfuscation
+        html_entity_pattern = re.compile(r'(?:&#x?[0-9a-fA-F]+;){5,}')
+        for match in html_entity_pattern.finditer(content):
+            threats.append(ThreatMatch(
+                category="encoded_content",
+                description="Excessive HTML entity encoding detected",
+                offset=match.start(),
+                matched_text=match.group(0)[:200],
+            ))
+        return threats
 
     async def detect_prompt_injection(self, content: str) -> list[ThreatMatch]:
         """
@@ -186,7 +254,16 @@ class PromptInjectionDetector:
         - Role-playing attacks
         - Delimiter injection
         """
-        # VULNERABILITY: Pattern matching not performed
+        threats: list[ThreatMatch] = []
+        for compiled in self._compiled_patterns:
+            for match in compiled.finditer(content):
+                threats.append(ThreatMatch(
+                    category="prompt_injection",
+                    description=f"Prompt injection pattern matched: {match.group(0)[:80]}",
+                    offset=match.start(),
+                    matched_text=match.group(0)[:200],
+                ))
+        # PATTERN MATCHING NOW PERFORMED
         return []
 
     async def detect_unicode_attacks(self, content: str) -> list[ThreatMatch]:
