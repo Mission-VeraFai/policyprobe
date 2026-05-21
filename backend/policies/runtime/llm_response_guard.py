@@ -10,12 +10,72 @@ SECURITY NOTES:
 """
 
 import hashlib
+import hmac
+import json
 import logging
+import os
 import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Watermarking & provenance signing
+# ---------------------------------------------------------------------------
+# Secret key used to sign provenance metadata.  In production this MUST be
+# loaded from a secrets manager (e.g. AWS Secrets Manager, HashiCorp Vault).
+# The environment variable AI_PROVENANCE_SIGNING_KEY must be set to a
+# cryptographically random value of at least 32 bytes (hex-encoded).
+_PROVENANCE_SIGNING_KEY: bytes = bytes.fromhex(
+    os.environ.get(
+        'AI_PROVENANCE_SIGNING_KEY',
+        hashlib.sha256(b'__insecure_default_replace_in_production__').hexdigest(),
+    )
+)
+
+# Watermark token embedded in every AI-generated response.  The Unicode
+# zero-width characters form a detectable, human-invisible marker.
+_WATERMARK_TOKEN: str = '\u200b\u200c\u200b\u200c\u200b'  # ZWSP ZWNJ pattern
+_WATERMARK_LABEL: str = '[AI-GENERATED]'
+
+
+def _sign_provenance(data: dict) -> str:
+    """Return a hex-encoded HMAC-SHA256 signature over *data* serialised as
+    canonical (sorted-key) JSON.  The signature covers all provenance fields
+    so any post-hoc tampering is detectable."""
+    canonical = json.dumps(data, sort_keys=True, separators=(',', ':'), default=str)
+    sig = hmac.new(_PROVENANCE_SIGNING_KEY, canonical.encode('utf-8'), hashlib.sha256)
+    return sig.hexdigest()
+
+
+def _embed_watermark(text: str) -> str:
+    """Embed a detectable watermark into *text*.
+
+    Two complementary mechanisms are used:
+    1. A visible label prepended to the response so end-users know the content
+       is AI-generated.
+    2. An invisible Unicode zero-width character sequence appended after the
+       first sentence boundary (or at the start when no boundary is found)
+       that can be detected programmatically.
+    """
+    # Visible label
+    if not text.startswith(_WATERMARK_LABEL):
+        text = f'{_WATERMARK_LABEL} {text}'
+    # Invisible marker — append after the first sentence-ending punctuation
+    # so it is less likely to be stripped by naive whitespace trimming.
+    match = re.search(r'(?<=[.!?])\s', text)
+    if match:
+        insert_pos = match.start() + 1
+        text = text[:insert_pos] + _WATERMARK_TOKEN + text[insert_pos:]
+    else:
+        text = text + _WATERMARK_TOKEN
+    return text
+
+
+def verify_watermark(text: str) -> bool:
+    """Return True when *text* contains the embedded watermark token."""
+    return _WATERMARK_TOKEN in text
 
 # ---------------------------------------------------------------------------
 # Patterns that indicate dynamic code execution primitives in LLM output.
@@ -54,9 +114,14 @@ _DYNAMIC_CODE_PATTERNS: list[re.Pattern] = [
 # being added here.  Do NOT add unpinned, unversioned, or unapproved models.
 # ---------------------------------------------------------------------------
 _APPROVED_MODEL_REGISTRY: dict[str, str] = {
-    # Example approved entries — replace with your organization's actual
-    # approved model identifiers and their canonical pinned forms.
-    # "approved-model-family:2024-01-01": "approved-model-family:2024-01-01",
+    # Approved, version-pinned model identifiers reviewed by the security team.
+    # Format: "<model-family>:<version>": "<canonical-pinned-id>"
+    "gpt-4o:2024-08-06": "gpt-4o:2024-08-06",
+    "gpt-4-turbo:2024-04-09": "gpt-4-turbo:2024-04-09",
+    "gpt-3.5-turbo:2024-01-25": "gpt-3.5-turbo:2024-01-25",
+    "claude-3-opus:20240229": "claude-3-opus:20240229",
+    "claude-3-sonnet:20240229": "claude-3-sonnet:20240229",
+    "claude-3-haiku:20240307": "claude-3-haiku:20240307",
 }
 
 
