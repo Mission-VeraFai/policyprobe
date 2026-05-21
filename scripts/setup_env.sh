@@ -15,31 +15,26 @@ cd "$PROJECT_ROOT"
 
 printf 'Setting up Python Environment\n'
 
-# Find suitable Python interpreter (3.10+)
-# Load python helper using dot (POSIX) with strict path validation
-if [ ! -f "$PROJECT_ROOT/scripts/python_helper.sh" ]; then
-    printf 'ERROR: python_helper.sh not found at expected path\n' >&2
-    exit 1
-fi
-# Execute python_helper.sh in a subprocess and capture PYTHON_CMD
-_helper_out="$(mktemp)"
-bash "$PROJECT_ROOT/scripts/python_helper.sh" > "$_helper_out" 2>&1
-# shellcheck source=/dev/null
-PYTHON_CMD="$(grep '^PYTHON_CMD=' "$_helper_out" | tail -1 | cut -d= -f2-)"
-# Remove temp file only if it is a regular file under /tmp
-if [ -f "$_helper_out" ] && [[ "$_helper_out" == /tmp/* ]]; then
-    # HITL approval required before deleting temporary file
-printf 'APPROVAL REQUIRED: About to delete temporary file: %s\n' "$_helper_out"
-printf 'Type "yes" to approve this deletion: '
-read -r _hitl_approval
-if [ "$_hitl_approval" != "yes" ]; then
-    printf 'Deletion not approved. Aborting setup.\n' >&2
-    exit 1
-fi
-rm -f "$_helper_out"
-fi
+# Find suitable Python interpreter (3.10+) — inline discovery, no external script execution
+PYTHON_CMD=""
+for _candidate in "${PYTHON_PATH:-}" python3.12 python3.11 python3.10 python3; do
+    [ -z "$_candidate" ] && continue
+    # Resolve to absolute path and ensure it lives under known safe prefixes
+    _abs="$(command -v "$_candidate" 2>/dev/null || true)"
+    [ -z "$_abs" ] && continue
+    case "$_abs" in
+        /usr/*|/opt/*|/home/*/.pyenv/*|/usr/local/*) ;;
+        *) printf 'WARN: Skipping interpreter at unexpected path: %s\n' "$_abs" >&2; continue ;;
+    esac
+    # Verify version is 3.10+
+    _ver="$("$_abs" -c 'import sys; print("%d%02d" % sys.version_info[:2])' 2>/dev/null || true)"
+    if [ -n "$_ver" ] && [ "$_ver" -ge 31000 ] 2>/dev/null; then
+        PYTHON_CMD="$_abs"
+        break
+    fi
+done
 if [ -z "$PYTHON_CMD" ]; then
-    printf 'ERROR: Could not determine PYTHON_CMD from python_helper.sh\n' >&2
+    printf 'ERROR: No suitable Python 3.10+ interpreter found\n' >&2
     exit 1
 fi
 printf '\n'
@@ -78,7 +73,7 @@ printf '\n'
 # Upgrade pip
 printf 'Upgrading pip...\n'
 # Upgrade pip to a known-safe minimum version rather than unconditionally fetching latest
-"$VENV_PIP" install --upgrade "pip>=23.3,<25"
+"$VENV_PIP" install --upgrade "pip==24.3.1"
 printf '✓ pip upgraded\n'
 printf '\n'
 
