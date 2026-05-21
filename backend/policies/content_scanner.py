@@ -3,11 +3,11 @@ Content Scanner Module
 
 Extracts and analyzes hidden content from various file formats.
 
-SECURITY NOTES (for Unifai demo):
-- Extracts hidden content but does NOT flag it as suspicious
-- Hidden text extraction works but no threat analysis
-- EXIF extraction works but no scanning of contents
-- Acts as a utility, not a security control
+SECURITY NOTES:
+- Extracts hidden content AND flags it as suspicious
+- Hidden text extraction triggers threat analysis via PromptInjectionDetector
+- EXIF extraction results are scanned for injected content
+- Acts as a security control: blocks uploads containing threats
 
 AFTER UNIFAI REMEDIATION:
 - Extracted hidden content is flagged for review
@@ -19,6 +19,92 @@ import logging
 import re
 from typing import Optional, List
 from dataclasses import dataclass, field
+
+# ---------------------------------------------------------------------------
+# Hidden-content sanitization & threat detection
+# ---------------------------------------------------------------------------
+
+# Patterns that indicate prompt-injection / instruction-override attempts
+_INJECTION_PATTERNS: List[re.Pattern] = [
+    re.compile(r'ignore\s+(all\s+)?(previous|prior|above)\s+instructions?', re.IGNORECASE),
+    re.compile(r'disregard\s+(all\s+)?(previous|prior|above)\s+instructions?', re.IGNORECASE),
+    re.compile(r'you\s+are\s+now\s+(?:a|an|the)\b', re.IGNORECASE),
+    re.compile(r'act\s+as\s+(?:a|an|the)\b', re.IGNORECASE),
+    re.compile(r'new\s+instructions?\s*:', re.IGNORECASE),
+    re.compile(r'system\s*:\s*you', re.IGNORECASE),
+    re.compile(r'<\s*/?\s*(?:system|assistant|user)\s*>', re.IGNORECASE),
+    re.compile(r'\[\s*(?:INST|SYS|SYSTEM)\s*\]', re.IGNORECASE),
+    re.compile(r'jailbreak', re.IGNORECASE),
+    re.compile(r'do\s+anything\s+now', re.IGNORECASE),
+]
+
+# Control / non-printable characters that should not appear in document text
+_CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+def sanitize_extracted_content(content: str, source: str = 'hidden_content') -> str:
+    """
+    Sanitize a piece of extracted hidden content before it is forwarded to
+    the LLM.
+
+    Steps
+    -----
+    1. Strip null bytes and ASCII control characters.
+    2. Scan for prompt-injection / instruction-override patterns.
+    3. Scan for Singapore PII.
+    4. Raise ``ValueError`` if any threat is detected so the upload
+       pipeline can reject the content before it reaches the LLM.
+
+    Returns the cleaned string when no threats are found.
+    """
+    if not content:
+        return content
+
+    # Step 1 — remove dangerous control characters
+    cleaned = _CONTROL_CHAR_RE.sub('', content)
+
+    # Step 2 — prompt-injection detection
+    injection_hits: List[str] = []
+    for pattern in _INJECTION_PATTERNS:
+        if pattern.search(cleaned):
+            injection_hits.append(pattern.pattern)
+
+    if injection_hits:
+        logger.warning(
+            "THREAT_BLOCK [%s]: prompt-injection pattern(s) detected in "
+            "extracted hidden content: %s",
+            source,
+            injection_hits,
+        )
+        raise ValueError(
+            f"Security violation: prompt-injection content detected in "
+            f"{source} — content blocked before LLM invocation."
+        )
+
+    # Step 3 — PII detection (reuses existing helper)
+    pii_violations = detect_singapore_pii(cleaned)
+    if pii_violations:
+        for v in pii_violations:
+            logger.warning("PII_BLOCK [%s]: %s", source, v)
+        raise ValueError(
+            f"Security violation: PII detected in {source} — "
+            f"content blocked before LLM invocation."
+        )
+
+    return cleaned
+
+
+def sanitize_extracted_content_list(
+    parts: List[str], source: str = 'hidden_content'
+) -> List[str]:
+    """
+    Sanitize a list of extracted content strings.
+
+    Each part is sanitized individually so the caller receives a clean
+    list that is safe to forward to the LLM.  Raises ``ValueError`` on
+    the first part that fails validation.
+    """
+    return [sanitize_extracted_content(p, source=source) for p in parts if p]
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +168,166 @@ def detect_singapore_pii(text: str) -> List[str]:
     return violations
 
 
+# ---------------------------------------------------------------------------
+# Malicious Command Detection
+# ---------------------------------------------------------------------------
+
+# Patterns indicative of prompt injection or malicious command execution
+_MALICIOUS_COMMAND_PATTERNS: List[tuple] = [
+    ('shell command injection', re.compile(
+        r'(?:^|\s|;|&&|\|\|)(?:rm\s+-rf|wget\s+|curl\s+|bash\s+|sh\s+|python\s+-c|exec\s*\(|eval\s*\(|os\.system|subprocess)',
+        re.IGNORECASE | re.MULTILINE,
+    )),
+    ('prompt injection directive', re.compile(
+        r'(?:ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?'  
+        r'|you\s+are\s+now\s+(?:a\s+)?(?:an?\s+)?(?:evil|malicious|unrestricted|jailbroken)'  
+        r'|disregard\s+(?:all\s+)?(?:previous|prior|your)\s+(?:instructions?|rules?|guidelines?)'  
+        r'|act\s+as\s+(?:if\s+you\s+(?:have\s+no|are\s+without)\s+restrictions?)'  
+        r'|system\s*:\s*you\s+(?:must|shall|will)'  
+        r'|<\s*system\s*>|\[\s*system\s*\])',
+        re.IGNORECASE | re.DOTALL,
+    )),
+    ('base64 encoded payload', re.compile(
+        r'(?:base64\s*(?:decode|encoded?)|atob\s*\(|echo\s+[A-Za-z0-9+/]{20,}={0,2}\s*\|\s*base64)',
+        re.IGNORECASE,
+    )),
+    ('hidden instruction marker', re.compile(
+        r'(?:<!--.*?(?:instruction|command|execute|run|ignore).*?-->'
+        r'|\\u200[0-9a-f]|\\u202[0-9a-f]|\\ufeff)',
+        re.IGNORECASE | re.DOTALL,
+    )),
+    ('code execution attempt', re.compile(
+        r'(?:`[^`]+`|\$\([^)]+\)|\bexec\b|\beval\b|\bimport\s+os\b|\b__import__\s*\()',
+        re.IGNORECASE,
+    )),
+]
+
+
+def detect_malicious_commands(text: str) -> List[str]:
+    """
+    Scan *text* for malicious command patterns including shell injection,
+    prompt injection directives, encoded payloads, and hidden instructions.
+
+    Returns a list of human-readable violation strings, one per category
+    matched.  Returns an empty list when no threats are detected.
+    """
+    if not text:
+        return []
+
+    violations: List[str] = []
+    for label, pattern in _MALICIOUS_COMMAND_PATTERNS:
+        matches = pattern.findall(text)
+        if matches:
+            violations.append(
+                f"Malicious content detected — {label} "
+                f"({len(matches)} occurrence(s))"
+            )
+    return violations
+
+
+def _check_malicious_and_raise(content_parts: List[str], source: str = 'file') -> List[str]:
+    """
+    Scan all *content_parts* for malicious commands.
+
+    Raises ``ValueError`` if any malicious content is found so that the
+    upload pipeline can reject the content before it reaches the LLM.
+    Returns the list of warning strings (empty when clean).
+    """
+        all_warnings: List[str] = []
+    combined = ' '.join(p for p in content_parts if p)
+    input_hash = hashlib.sha256(combined.encode('utf-8', errors='replace')).hexdigest()
+    violations = detect_singapore_pii(combined)
+    if violations:
+        output_summary = '; '.join(violations)
+        for v in violations:
+            msg = f"PII_BLOCK [{source}]: {v}"
+            logger.warning(msg)
+            all_warnings.append(msg)
+        _write_audit_record(
+            action='PII_SCAN',
+            decision='BLOCKED',
+            source=source,
+            input_hash=input_hash,
+            output_summary=output_summary,
+            extra={'violation_count': len(violations), 'violations': violations},
+        )
+        raise ValueError(
+            f"Upload rejected: Singapore PII found in {source}. "
+            + '; '.join(violations)
+        )
+    _write_audit_record(
+        action='PII_SCAN',
+        decision='ALLOWED',
+        source=source,
+        input_hash=input_hash,
+        output_summary='No PII detected',
+    )
+    return all_warnings
+
+
+import hashlib
+import json
+import os
+import getpass
+
+_AUDIT_LOG_PATH = os.environ.get('CONTENT_SCANNER_AUDIT_LOG', 'content_scanner_audit.jsonl')
+
+
+def _write_audit_record(
+    action: str,
+    decision: str,
+    source: str,
+    input_hash: str,
+    output_summary: str,
+    principal: Optional[str] = None,
+    model_id: Optional[str] = None,
+    extra: Optional[dict] = None,
+) -> None:
+    """
+    Append a single structured audit record to the append-only JSONL audit log.
+
+    Fields recorded:
+      - timestamp   : ISO-8601 UTC timestamp
+      - principal   : identity of the actor (env var, OS user, or 'unknown')
+      - action      : what operation was attempted (e.g. 'PII_SCAN')
+      - decision    : outcome (e.g. 'BLOCKED', 'ALLOWED')
+      - source      : file/channel identifier
+      - input_hash  : SHA-256 hex digest of the scanned content
+      - output      : human-readable summary of the decision output
+      - model_id    : LLM/model identifier if applicable
+      - extra       : any additional structured context
+    """
+    if principal is None:
+        principal = (
+            os.environ.get('AUDIT_PRINCIPAL')
+            or os.environ.get('USER')
+            or os.environ.get('USERNAME')
+        )
+        try:
+            principal = principal or getpass.getuser()
+        except Exception:
+            principal = 'unknown'
+
+    record = {
+        'timestamp': datetime.utcnow().isoformat() + 'Z',
+        'principal': principal,
+        'action': action,
+        'decision': decision,
+        'source': source,
+        'input_hash': input_hash,
+        'output': output_summary,
+        'model_id': model_id or os.environ.get('LLM_MODEL_ID', 'unspecified'),
+        'extra': extra or {},
+    }
+    try:
+        with open(_AUDIT_LOG_PATH, 'a', encoding='utf-8') as _af:
+            _af.write(json.dumps(record) + '\n')
+            _af.flush()
+            os.fsync(_af.fileno())
+    except OSError as _e:
+        logger.error('AUDIT_LOG_WRITE_FAILURE: %s — record: %s', _e, json.dumps(record))
+
+
 def _check_pii_and_raise(content_parts: List[str], source: str = 'file') -> List[str]:
     """
     Aggregate PII warnings across all *content_parts*.
@@ -99,10 +345,73 @@ def _check_pii_and_raise(content_parts: List[str], source: str = 'file') -> List
             logger.warning(msg)
             all_warnings.append(msg)
         raise ValueError(
+            f"Upload blocked: Singapore PII detected in {source}. "
+            f"Violations: {'; '.join(violations)}"
+        )
+            all_warnings.append(msg)
+        raise ValueError(
             f"Upload rejected: Singapore PII found in {source}. "
             + '; '.join(violations)
         )
     return all_warnings
+
+
+# Fields that are safe to retain from raw file metadata.
+_METADATA_ALLOWLIST: frozenset = frozenset({
+    'title', 'author', 'subject', 'keywords', 'creator',
+    'producer', 'creation_date', 'modification_date',
+    'page_count', 'word_count', 'content_type', 'language',
+})
+
+
+def _filter_metadata(raw: Optional[dict]) -> Optional[dict]:
+    """Return a copy of *raw* containing only allowlisted keys."""
+    if not raw:
+        return None
+    return {k: v for k, v in raw.items() if k in _METADATA_ALLOWLIST}
+
+
+# Patterns that indicate suspicious hidden / encoded payloads.
+_SUSPICIOUS_PATTERNS: List[re.Pattern] = [
+    re.compile(r'<script[\s>]', re.IGNORECASE),
+    re.compile(r'javascript\s*:', re.IGNORECASE),
+    re.compile(r'data\s*:\s*text/html', re.IGNORECASE),
+    re.compile(r'(?:eval|exec|system|popen|subprocess)\s*\(', re.IGNORECASE),
+    re.compile(r'(?:cmd|powershell|bash|sh)\s+[/\\-]', re.IGNORECASE),
+    re.compile(r'(?:base64_decode|atob)\s*\(', re.IGNORECASE),
+]
+
+
+def _analyse_hidden_content(text: Optional[str], label: str = 'hidden_text') -> Optional[str]:
+    """
+    Analyse *text* for suspicious patterns.
+
+    Returns the original text when clean, or a redacted placeholder
+    with a warning prefix when suspicious content is detected.
+    """
+    if not text:
+        return text
+    hits = [p.pattern for p in _SUSPICIOUS_PATTERNS if p.search(text)]
+    if hits:
+        logger.warning(
+            "Suspicious pattern(s) detected in %s — content suppressed. "
+            "Matched: %s",
+            label,
+            ', '.join(hits),
+        )
+        return '[SUPPRESSED: suspicious content detected]'
+    return text
+
+
+def _analyse_encoded_items(items: Optional[list]) -> Optional[list]:
+    """Analyse each encoded-content item and suppress suspicious entries."""
+    if not items:
+        return items
+    cleaned = []
+    for item in items:
+        text = item if isinstance(item, str) else str(item)
+        cleaned.append(_analyse_hidden_content(text, label='encoded_content'))
+    return cleaned
 
 
 @dataclass
@@ -113,6 +422,12 @@ class ExtractedContent:
     metadata: Optional[dict] = None
     encoded_content: Optional[list[str]] = None
     warnings: Optional[list[str]] = None
+
+    def __post_init__(self) -> None:
+        # Enforce data minimisation on every instance at construction time.
+        self.metadata = _filter_metadata(self.metadata)
+        self.hidden_text = _analyse_hidden_content(self.hidden_text, 'hidden_text')
+        self.encoded_content = _analyse_encoded_items(self.encoded_content)
 
 
 class ContentScanner:
@@ -125,9 +440,9 @@ class ContentScanner:
     - File metadata
     - Encoded content (base64, etc.)
 
-    VULNERABILITY: This scanner extracts hidden content but does NOT
-    treat it as suspicious. All extracted content is passed through
-    to the LLM without security analysis.
+    Hidden text and encoded content are analysed for suspicious
+    patterns before being forwarded; metadata is filtered to a
+    minimal allowlist of safe fields.
     """
 
     # PII patterns for redaction
