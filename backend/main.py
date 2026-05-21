@@ -61,12 +61,114 @@ import hmac
 import json
 import time
 import uuid
+import datetime
 
-import openai
+# Persistent audit log for AI-driven decisions (JSON-lines format)
+_AI_AUDIT_LOG_PATH = os.environ.get("AI_AUDIT_LOG_PATH", "/var/log/policyprobe/ai_audit.jsonl")
 
-# Approved LLM client using OpenAI (organization-approved registry)
-_openai_client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-APPROVED_MODEL = "gpt-4"
+
+def _log_ai_decision(
+    *,
+    principal: str,
+    model: str,
+    input_text: str,
+    output_text: str,
+    call_site: str,
+) -> None:
+    """Write a structured audit record for every AI inference call.
+
+    Fields persisted:
+      - timestamp   : ISO-8601 UTC
+      - call_site   : human-readable location in the code
+      - principal   : identity that triggered the call (user / system)
+      - model       : exact model identifier used
+      - input_hash  : SHA-256 hex digest of the raw input (preserves forensic
+                      integrity without storing potentially sensitive content)
+      - output      : first 2 000 chars of the model response (sufficient for
+                      audit; full output retained in application logs)
+    """
+    record = {
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "call_site": call_site,
+        "principal": principal,
+        "model": model,
+        "input_hash": hashlib.sha256(input_text.encode("utf-8", errors="replace")).hexdigest(),
+        "output": output_text[:2000],
+    }
+    try:
+        log_dir = os.path.dirname(_AI_AUDIT_LOG_PATH)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        with open(_AI_AUDIT_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+            fh.flush()
+    except Exception as exc:  # never let audit failure break the request
+        logging.getLogger(__name__).error(
+            "AI audit log write failed: %s | record=%s", exc, record
+        )
+
+import anthropic
+
+# Approved LLM client using Anthropic (organization-approved registry)
+_anthropic_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+APPROVED_MODEL = "claude-3-5-sonnet-20241022"
+
+
+# --- Synthetic-content provenance helpers ---
+
+_PROVENANCE_SECRET = os.environ.get("PROVENANCE_HMAC_SECRET", "change-me-in-production")
+
+
+def _attach_provenance(content: str, model_id: str) -> dict:
+    """Wrap AI-generated text with provenance metadata and a cryptographic signature.
+
+    Returns a dict that callers can serialise or embed in their response so that
+    downstream consumers can verify the synthetic origin of the content.
+
+    Fields
+    ------
+    content        : the (already sanitised) LLM output
+    label          : human-readable synthetic-origin label
+    model_id       : the approved model that produced the content
+    origin_tag     : constant tag identifying this system as the producer
+    generated_at   : UTC Unix timestamp (float) of generation
+    provenance_id  : unique ID for this particular output
+    signature      : HMAC-SHA256 over a canonical representation of the above fields
+    """
+    provenance_id = str(uuid.uuid4())
+    generated_at = time.time()
+    label = "AI-GENERATED SYNTHETIC CONTENT"
+    origin_tag = "policyprobe-backend"
+
+    # Canonical message for signing (deterministic field order)
+    canonical = json.dumps(
+        {
+            "provenance_id": provenance_id,
+            "model_id": model_id,
+            "origin_tag": origin_tag,
+            "generated_at": generated_at,
+            "label": label,
+            "content": content,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    signature = hmac.new(
+        _PROVENANCE_SECRET.encode("utf-8"),
+        canonical,
+        hashlib.sha256,
+    ).hexdigest()
+
+    return {
+        "content": content,
+        "label": label,
+        "model_id": model_id,
+        "origin_tag": origin_tag,
+        "generated_at": generated_at,
+        "provenance_id": provenance_id,
+        "signature": signature,
+    }
 
 
 def _sanitize_llm_input(text: str, max_length: int = 16000) -> str:
@@ -98,11 +200,12 @@ class AgentOrchestrator:
         if context:
             safe_context = _sanitize_llm_input(context)
             prompt = f"Context:\n{safe_context}\n\nUser message:\n{safe_message}"
-        response = _openai_client.chat.completions.create(
+        response = _anthropic_client.messages.create(
             model=APPROVED_MODEL,
+            max_tokens=1024,
             messages=[{"role": "user", "content": prompt}],
         )
-        return _sanitize_llm_output(response.choices[0].message.content)
+        return _sanitize_llm_output(response.content[0].text)
 
 
 class FileProcessorAgent:
@@ -114,16 +217,47 @@ class FileProcessorAgent:
             text = _sanitize_llm_input(file_content.decode("utf-8", errors="replace"))
         except Exception:
             text = _sanitize_llm_input(repr(file_content[:500]))
-        response = _openai_client.chat.completions.create(
-            model=APPROVED_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"Summarize the following file content (type: {_sanitize_llm_input(file_type, max_length=64)}):\n\n{_sanitize_llm_input(text)}",
-                }
-            ],
+
+        safe_file_type = _sanitize_llm_input(file_type, max_length=64)
+        prompt_content = (
+            f"Summarize the following file content (type: {safe_file_type}):\n\n{_sanitize_llm_input(text)}"
         )
-        return _sanitize_llm_output(response.choices[0].message.content)
+
+        # Explicit termination criterion: attempt the LLM call at most
+        # MAX_AGENT_ITERATIONS times, then raise to guarantee the agent stops.
+        last_error: Exception | None = None
+        for iteration in range(1, MAX_AGENT_ITERATIONS + 1):
+            try:
+                        _request_messages = [{"role": "user", "content": prompt}]
+        logging.getLogger(__name__).info(
+            "LLM request: model=%s messages=%s",
+            APPROVED_MODEL,
+            _request_messages,
+        )
+                response = _openai().chat.completions.create(
+            model=APPROVED_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        _response_content = response.choices[0].message.content
+        logging.getLogger(__name__).info(
+            "LLM response: model=%s response=%s",
+            APPROVED_MODEL,
+            _response_content,
+        )
+        return _sanitize_llm_output(_response_content)
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning(
+                    "FileProcessorAgent.extract_text attempt %d/%d failed: %s",
+                    iteration,
+                    MAX_AGENT_ITERATIONS,
+                    exc,
+                )
+        # Termination criterion reached: max iterations exhausted without success.
+        raise RuntimeError(
+            f"FileProcessorAgent.extract_text exceeded maximum iterations "
+            f"({MAX_AGENT_ITERATIONS}). Last error: {last_error}"
+        ) from last_error
 
 # Configure logging
 logging.basicConfig(
@@ -909,6 +1043,13 @@ async def upload_file(file: UploadFile = File(...), _: None = Depends(verify_api
         content=decoded_content,
         filename=file.filename,
         content_type=file.content_type
+    )
+    _log_ai_decision(
+        principal="system:upload_handler",
+        model=APPROVED_MODEL,
+        input_text=decoded_content,
+        output_text=str(processed)[:2000] if processed is not None else "",
+        call_site="upload_handler:file_processor.process",
     )
 
     # Validate file_processor output for dynamic code execution primitives
