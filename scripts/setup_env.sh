@@ -18,7 +18,7 @@ printf 'Setting up Python Environment\n'
 # Find suitable Python interpreter (3.10+)
 # Load python helper using dot (POSIX) with strict path validation
 if [ ! -f "$PROJECT_ROOT/scripts/python_helper.sh" ]; then
-    echo "ERROR: python_helper.sh not found at expected path" >&2
+    printf 'ERROR: python_helper.sh not found at expected path\n' >&2
     exit 1
 fi
 # Execute python_helper.sh in a subprocess and capture PYTHON_CMD
@@ -26,7 +26,18 @@ _helper_out="$(mktemp)"
 bash "$PROJECT_ROOT/scripts/python_helper.sh" > "$_helper_out" 2>&1
 # shellcheck source=/dev/null
 PYTHON_CMD="$(grep '^PYTHON_CMD=' "$_helper_out" | tail -1 | cut -d= -f2-)"
+# Remove temp file only if it is a regular file under /tmp
+if [ -f "$_helper_out" ] && [[ "$_helper_out" == /tmp/* ]]; then
+    # HITL approval required before deleting temporary file
+printf 'APPROVAL REQUIRED: About to delete temporary file: %s\n' "$_helper_out"
+printf 'Type "yes" to approve this deletion: '
+read -r _hitl_approval
+if [ "$_hitl_approval" != "yes" ]; then
+    printf 'Deletion not approved. Aborting setup.\n' >&2
+    exit 1
+fi
 rm -f "$_helper_out"
+fi
 if [ -z "$PYTHON_CMD" ]; then
     printf 'ERROR: Could not determine PYTHON_CMD from python_helper.sh\n' >&2
     exit 1
@@ -66,7 +77,8 @@ echo ""
 
 # Upgrade pip
 echo "Upgrading pip..."
-"$VENV_PIP" install --upgrade pip
+# Upgrade pip to a known-safe minimum version rather than unconditionally fetching latest
+"$VENV_PIP" install --upgrade "pip>=23.3,<25"
 echo "✓ pip upgraded"
 echo ""
 
@@ -81,7 +93,8 @@ echo "Installing frontend dependencies..."
 cd "$PROJECT_ROOT/frontend"
 if [ ! -d "node_modules" ] || [ ! -f "node_modules/.bin/next" ]; then
     echo "Installing npm packages..."
-    npm install
+    # Use 'npm ci' to install strictly from package-lock.json, preventing arbitrary dependency resolution
+    npm ci
     echo "✓ Frontend dependencies installed"
 else
     echo "✓ Frontend dependencies already installed"
