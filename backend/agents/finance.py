@@ -20,11 +20,21 @@ import uuid
 from typing import Any, Optional
 
 from .auth.agent_auth import AgentIdentity, AgentAuthenticator
-from llm.registry import RegistryLLMClient, ModelRegistry
+from llm.registry import ApprovedLLMClient, ModelRegistry
 
 # Approved model registry entry — version-pinned and integrity-verified
-_APPROVED_MODEL_ID = "claude-3-5-sonnet-20241022"   # registry canonical name (org-approved)
-_APPROVED_MODEL_VERSION = "20241022"             # pinned release date / version tag
+# Model ID must be set to an org-approved model from the registry (do NOT hardcode disallowed models)
+_APPROVED_MODEL_ID = os.environ.get("APPROVED_MODEL_ID", "")  # registry canonical name (org-approved)
+if not _APPROVED_MODEL_ID:
+    raise ValueError(
+        "APPROVED_MODEL_ID must be set to an organization-approved model ID from the registry. "
+        "Hardcoding disallowed model identifiers is prohibited."
+    )
+_APPROVED_MODEL_VERSION = os.environ.get("APPROVED_MODEL_VERSION", "")  # pinned release date / version tag
+if not _APPROVED_MODEL_VERSION:
+    raise ValueError(
+        "APPROVED_MODEL_VERSION must be set to the pinned version of the approved model."
+    )
 _APPROVED_MODEL_SHA256 = os.environ.get("APPROVED_MODEL_SHA256", "")  # must be set to the approved artifact digest from the registry
 if not _APPROVED_MODEL_SHA256:
     raise ValueError(
@@ -54,7 +64,7 @@ class FinanceAgent:
     # All callers must satisfy role and privilege checks via the authenticator.
     # No bypass mechanism exists for any caller origin, including 'internal' callers.
 
-    def __init__(self, llm_client: RegistryLLMClient):
+    def __init__(self, llm_client: ApprovedLLMClient):
         # Enforce registry membership, version pin, and integrity check at startup
         ModelRegistry.verify(
             client=llm_client,
@@ -64,6 +74,56 @@ class FinanceAgent:
         )
         self.llm_client = llm_client
         self._llm_logger = logging.getLogger(__name__ + ".llm_audit")
+
+    def _invoke_llm(self, messages: list, **kwargs) -> Any:
+        """Wrap every LLM call with structured audit logging (request + response)."""
+        interaction_id = str(uuid.uuid4())
+        timestamp_req = datetime.now(timezone.utc).isoformat()
+        self._llm_logger.info(
+            json.dumps({
+                "event": "llm_request",
+                "interaction_id": interaction_id,
+                "agent_id": self.agent_id,
+                "timestamp": timestamp_req,
+                "model_id": _APPROVED_MODEL_ID,
+                "model_version": _APPROVED_MODEL_VERSION,
+                "message_count": len(messages),
+                # Log roles only; omit raw content to avoid leaking PII in logs.
+                "message_roles": [m.get("role") for m in messages if isinstance(m, dict)],
+                "kwargs": {k: v for k, v in kwargs.items() if k not in ("api_key",)},
+            })
+        )
+        try:
+            response = self.llm_client.complete(messages=messages, **kwargs)
+            timestamp_resp = datetime.now(timezone.utc).isoformat()
+            self._llm_logger.info(
+                json.dumps({
+                    "event": "llm_response",
+                    "interaction_id": interaction_id,
+                    "agent_id": self.agent_id,
+                    "timestamp": timestamp_resp,
+                    "model_id": _APPROVED_MODEL_ID,
+                    "model_version": _APPROVED_MODEL_VERSION,
+                    "finish_reason": getattr(response, "finish_reason", None),
+                    "usage": getattr(response, "usage", None),
+                    "response_length": len(str(getattr(response, "content", ""))),
+                })
+            )
+            return response
+        except Exception as exc:
+            timestamp_err = datetime.now(timezone.utc).isoformat()
+            self._llm_logger.error(
+                json.dumps({
+                    "event": "llm_error",
+                    "interaction_id": interaction_id,
+                    "agent_id": self.agent_id,
+                    "timestamp": timestamp_err,
+                    "model_id": _APPROVED_MODEL_ID,
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                })
+            )
+            raise
         self.authenticator = AgentAuthenticator()
         self.agent_id = "finance"
         self.agent_name = "Finance Agent"
@@ -507,8 +567,9 @@ class FinanceAgent:
         response = self._sanitize_llm_output(response)
 
         # Audit log: record every AI-driven financial decision
-        import hashlib as _hashlib
-        import datetime as _datetime
+        import hashlib as _hashlib  # noqa: PLC0415
+        import datetime as _datetime  # noqa: PLC0415
+        import re as _re  # noqa: PLC0415
         _input_hash = _hashlib.sha256(sanitized_message.encode("utf-8", errors="replace")).hexdigest()
         _output_repr = str(response)
         _output_hash = _hashlib.sha256(_output_repr.encode("utf-8", errors="replace")).hexdigest()
@@ -530,29 +591,13 @@ class FinanceAgent:
             "agent": self.agent_id,
             "privilege_level": self.PRIVILEGE_LEVEL
         }
-            )
-            return {
-                "response": "Request timed out. Please try again with a simpler query.",
-                "agent": self.agent_id,
-                "error": "timeout"
-            }
-        logger.info(
-            "LLM response received",
-            extra={
-                "agent": self.agent_id,
-                "caller_id": caller.agent_id,
-                "llm_response": response
-            }
-        )
-        response = self._sanitize_llm_output(response)
-
-        return {
-            "response": response,
-            "agent": self.agent_id,
-            "privilege_level": self.PRIVILEGE_LEVEL
-        }
 
     # Patterns that indicate dynamic code execution primitives in LLM output
+    # re is imported locally in methods that need it; ensure module-level availability
+    try:
+        import re as _re_module  # noqa: PLC0415
+    except ImportError:
+        _re_module = None
     _DANGEROUS_OUTPUT_PATTERNS = [
         r"\beval\s*\(",
         r"\bexec\s*\(",
@@ -1149,7 +1194,15 @@ Format numbers clearly and provide relevant insights."""
         return {
             "data": filtered_data,
             "query": _safe_query,  # sanitized: stripped, control-chars removed, truncated, injection-checked
-            "requester": requester.agent_id
+            "requester": requester.agent_id,
+            "content_label": "AI_GENERATED_FINANCIAL_SUMMARY",
+            "_provenance": {
+                "model_id": _APPROVED_MODEL_ID,
+                "model_version": _APPROVED_MODEL_VERSION,
+                "content_origin": "finance_agent_llm",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "response_id": str(uuid.uuid4()),
+            },
         }
         # Audit log: record every financial data disclosure (must appear before return)
         import hashlib as _hashlib
