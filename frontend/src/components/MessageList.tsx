@@ -58,8 +58,30 @@ export function MessageList({ messages }: MessageListProps) {
               {message.error ? (
                 <ErrorDisplay error={message.error} />
               ) : (
-                <div className="message-content text-gray-100">
-                  {message.content}
+                <div>
+                  {message.role === 'assistant' && (
+                    <div
+                      className="flex items-center gap-2 mb-1"
+                      data-provenance="ai-generated"
+                      data-model="gpt-assistant"
+                      data-generated-at={message.timestamp.toISOString()}
+                      aria-label="AI-generated content"
+                    >
+                      <span className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium bg-teal-900 text-teal-300 border border-teal-700">
+                        <Bot className="w-3 h-3" />
+                        AI-Generated
+                      </span>
+                      <span className="text-xs text-gray-500" title="Model identifier">
+                        model: gpt-assistant
+                      </span>
+                      <span className="text-xs text-gray-600" title="Generation timestamp">
+                        &#x2022; {message.timestamp.toISOString()}
+                      </span>
+                    </div>
+                  )}
+                  <div className="message-content text-gray-100">
+                    {message.content}
+                  </div>
                 </div>
               )}
 
