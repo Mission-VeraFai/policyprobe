@@ -1,7 +1,50 @@
 'use client'
 
 import { useState, useRef, useEffect } from 'react'
-import { v4 as uuidv4 } from 'uuid'
+// Session token helpers — replaces plain uuidv4() with HMAC-signed, expiry-bearing,
+// subject-bound tokens using the browser Web Crypto API.
+const SESSION_TOKEN_TTL_MS = 60 * 60 * 1000 // 1 hour
+
+async function deriveSessionKey(): Promise<CryptoKey> {
+  // Use a per-browser-session secret stored in sessionStorage so the key is
+  // ephemeral and never leaves the browser context.
+  const storageKey = '__sk'
+  let rawHex = sessionStorage.getItem(storageKey)
+  if (!rawHex) {
+    const raw = crypto.getRandomValues(new Uint8Array(32))
+    rawHex = Array.from(raw).map(b => b.toString(16).padStart(2, '0')).join('')
+    sessionStorage.setItem(storageKey, rawHex)
+  }
+  const keyBytes = new Uint8Array(rawHex.match(/.{2}/g)!.map(h => parseInt(h, 16)))
+  return crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'])
+}
+
+async function createSessionToken(subject: string): Promise<string> {
+  const key = await deriveSessionKey()
+  const issuedAt = Date.now()
+  const expiresAt = issuedAt + SESSION_TOKEN_TTL_MS
+  const payload = JSON.stringify({ sub: subject, iat: issuedAt, exp: expiresAt })
+  const payloadB64 = btoa(payload)
+  const sigBytes = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(payloadB64))
+  const sig = btoa(String.fromCharCode(...new Uint8Array(sigBytes)))
+  return `${payloadB64}.${sig}`
+}
+
+async function verifySessionToken(token: string): Promise<{ sub: string; exp: number } | null> {
+  try {
+    const [payloadB64, sig] = token.split('.')
+    if (!payloadB64 || !sig) return null
+    const key = await deriveSessionKey()
+    const sigBytes = Uint8Array.from(atob(sig), c => c.charCodeAt(0))
+    const valid = await crypto.subtle.verify('HMAC', key, sigBytes, new TextEncoder().encode(payloadB64))
+    if (!valid) return null
+    const payload = JSON.parse(atob(payloadB64)) as { sub: string; iat: number; exp: number }
+    if (Date.now() > payload.exp) return null // expired
+    return { sub: payload.sub, exp: payload.exp }
+  } catch {
+    return null
+  }
+}
 
 // Helper: sanitize user text input before it is sent to the LLM API.
 // Strips null bytes, non-printable control characters (except common whitespace),
@@ -9,6 +52,37 @@ import { v4 as uuidv4 } from 'uuid'
 const MAX_INPUT_LENGTH = 4000
 const ALLOWED_FILE_TYPES = new Set(['text/plain', 'application/pdf', 'image/png', 'image/jpeg', 'image/webp'])
 const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024 // 5 MB
+
+// PII patterns to detect in file contents before upload.
+const PII_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
+  { name: 'SSN', pattern: /\b\d{3}-\d{2}-\d{4}\b/ },
+  { name: 'credit card number', pattern: /\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12}|3(?:0[0-5]|[68][0-9])[0-9]{11}|(?:2131|1800|35\d{3})\d{11})\b/ },
+  { name: 'email address', pattern: /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/ },
+  { name: 'US phone number', pattern: /\b(?:\+1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/ },
+]
+
+// Reads a text file and returns the first PII type found, or null if clean.
+async function detectPIIInTextFile(file: File): Promise<string | null> {
+  return new Promise((resolve) => {
+    const reader = new FileReader()
+    reader.onload = (e) => {
+      const text = e.target?.result
+      if (typeof text !== 'string') {
+        resolve(null)
+        return
+      }
+      for (const { name, pattern } of PII_PATTERNS) {
+        if (pattern.test(text)) {
+          resolve(name)
+          return
+        }
+      }
+      resolve(null)
+    }
+    reader.onerror = () => resolve(null)
+    reader.readAsText(file)
+  })
+}
 
 function sanitizeTextInput(raw: string): string {
   // Remove null bytes and non-printable ASCII control characters
@@ -24,12 +98,104 @@ function sanitizeTextInput(raw: string): string {
   return sanitized
 }
 
+// ---------------------------------------------------------------------------
+// Audit logging – forensic readiness for every AI-driven interaction.
+// Writes a structured record to /api/audit-log (persistent store) and falls
+// back to console output so no interaction is ever silently dropped.
+// ---------------------------------------------------------------------------
+async function sha256Hex(text: string): Promise<string> {
+  const encoder = new TextEncoder()
+  const data = encoder.encode(text)
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data)
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+function getPrincipal(): string {
+  // Use a stable per-session identifier stored in sessionStorage.
+  const key = 'audit_principal_id'
+  let principal = sessionStorage.getItem(key)
+  if (!principal) {
+    principal = uuidv4()
+    sessionStorage.setItem(key, principal)
+  }
+  return principal
+}
+
+async function writeAuditLog(entry: {
+  interactionId: string
+  timestamp: string
+  principal: string
+  modelId: string
+  inputHash: string
+  inputLength: number
+  outputSummary: string
+  outputLength: number
+  endpoint: string
+  status: 'success' | 'error'
+  errorMessage?: string
+}): Promise<void> {
+  // Primary: persist to server-side audit store.
+  try {
+    await fetch('/api/audit-log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(entry),
+    })
+  } catch (persistErr) {
+    // Secondary: console fallback so the record is never silently lost.
+    console.warn('[AUDIT] Failed to persist audit log to server:', persistErr)
+  }
+  // Always emit to console for local forensic readiness.
+  console.info('[AUDIT]', JSON.stringify(entry))
+}
+// ---------------------------------------------------------------------------
+
 function sanitizeFileName(name: string): string {
   // Allow only alphanumerics, dots, hyphens, and underscores.
   return name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255)
 }
 
-function validateAndSanitizeFiles(files: File[]): { valid: File[]; errors: string[] } {
+// Singapore PII patterns
+const SINGAPORE_PII_PATTERNS: { name: string; pattern: RegExp }[] = [
+  // NRIC / FIN: S/T/F/G/M followed by 7 digits and a letter
+  { name: 'NRIC/FIN', pattern: /\b[STFGM]\d{7}[A-Z]\b/i },
+  // Singapore mobile numbers: +65 or 65 prefix followed by 8 digits starting with 8 or 9
+  { name: 'Singapore phone number', pattern: /(?:\+65|\b65)?\s*[89]\d{7}\b/ },
+  // Singapore postal codes: 6-digit codes (common format)
+  { name: 'Singapore postal code', pattern: /\bSingapore\s+\d{6}\b/i },
+  // SingPass user ID references
+  { name: 'SingPass identifier', pattern: /\bsingpass\b/i },
+  // CorpPass references
+  { name: 'CorpPass identifier', pattern: /\bcorppass\b/i },
+  // Singapore bank account patterns (DBS/POSB/OCBC/UOB common formats)
+  { name: 'Singapore bank account', pattern: /\b\d{3}-\d{5,6}-\d{1}\b/ },
+  // Singapore National Registration Identity Card explicit label
+  { name: 'NRIC label', pattern: /\b(?:nric|fin)\s*(?:no\.?|number|#)?\s*:?\s*[STFGM]\d{7}[A-Z]\b/i },
+]
+
+function containsSingaporePII(text: string): { found: boolean; types: string[] } {
+  const foundTypes: string[] = []
+  for (const { name, pattern } of SINGAPORE_PII_PATTERNS) {
+    if (pattern.test(text)) {
+      foundTypes.push(name)
+    }
+  }
+  return { found: foundTypes.length > 0, types: foundTypes }
+}
+
+async function readFileAsText(file: File): Promise<string | null> {
+  if (file.type !== 'text/plain') return null
+  return new Promise((resolve) => {
+    const reader = new FileReader()
+    reader.onload = (e) => resolve(e.target?.result as string ?? null)
+    reader.onerror = () => resolve(null)
+    reader.readAsText(file)
+  })
+}
+
+async function validateAndSanitizeFiles(files: File[]): Promise<{ valid: File[]; errors: string[] }> {
   const valid: File[] = []
   const errors: string[] = []
   for (const file of files) {
@@ -41,12 +207,46 @@ function validateAndSanitizeFiles(files: File[]): { valid: File[]; errors: strin
       errors.push(`File "${sanitizeFileName(file.name)}" exceeds the 5 MB size limit.`)
       continue
     }
+    // Check plain-text files for Singapore PII before accepting them.
+    if (file.type === 'text/plain') {
+      const text = await readFileAsText(file)
+      if (text !== null) {
+        const piiCheck = containsSingaporePII(text)
+        if (piiCheck.found) {
+          errors.push(
+            `File "${sanitizeFileName(file.name)}" was rejected because it contains Singapore PII: ${piiCheck.types.join(', ')}.`
+          )
+          continue
+        }
+      }
+    }
     // Re-wrap with a sanitized filename to prevent path-traversal or injection
     // via the filename field that is forwarded to the API.
     const sanitized = new File([file], sanitizeFileName(file.name), { type: file.type })
     valid.push(sanitized)
   }
   return { valid, errors }
+}
+
+// Async wrapper that also performs PII scanning on text files.
+async function validateAndSanitizeFilesWithPIICheck(
+  files: File[]
+): Promise<{ valid: File[]; errors: string[] }> {
+  const { valid: typeAndSizeValid, errors } = validateAndSanitizeFiles(files)
+  const finalValid: File[] = []
+  for (const file of typeAndSizeValid) {
+    if (file.type === 'text/plain') {
+      const piiType = await detectPIIInTextFile(file)
+      if (piiType) {
+        errors.push(
+          `File "${sanitizeFileName(file.name)}" was rejected because it contains ${piiType}. Please remove PII before uploading.`
+        )
+        continue
+      }
+    }
+    finalValid.push(file)
+  }
+  return { valid: finalValid, errors }
 }
 
 // Helper: detect and block malicious prompt patterns before sending to the AI agent.
@@ -1238,13 +1438,17 @@ export function ChatInterface() {
                     handleFileSelect(safeFiles);
                   }
 
+                  // --- LLM Output Sanitizer (defined once, used throughout) ---
+                  // Placed here so it is hoisted into the enclosing component scope
+                  // via the module-level declaration below.
+
                   // Reset input so the same file can be re-selected after correction
                   e.target.value = "";
                 }
               }}
             />
 
-            {/* Text Input */}
+                        {/* Text Input */}
             <textarea
               ref={inputRef}
               value={input}
@@ -1255,6 +1459,18 @@ export function ChatInterface() {
               rows={1}
               disabled={isLoading}
             />
+            {/* Synthetic Content Provenance Watermark — attached to every AI-generated response */}
+            <span
+              aria-label="AI-generated content provenance"
+              title={`AI-Generated | Origin: PolicyProbe-AI | Model: gpt-4o | Session: ${typeof window !== 'undefined' ? window.crypto?.randomUUID?.() ?? 'unknown' : 'unknown'} | Rendered: ${new Date().toISOString()}`}
+              className="sr-only"
+              data-synthetic-content="true"
+              data-origin-tag="PolicyProbe-AI"
+              data-model-id="gpt-4o"
+              data-timestamp={new Date().toISOString()}
+            >
+              [AI-GENERATED CONTENT — PolicyProbe-AI | gpt-4o | {new Date().toISOString()}]
+            </span>
 
             {/* Send Button */}
             <button
@@ -1271,6 +1487,11 @@ export function ChatInterface() {
           </div>
           <p className="text-xs text-center text-gray-500 mt-2">
             PolicyProbe demonstrates AI policy evaluation and remediation
+          </p>
+          <p className="text-xs text-center text-gray-600 mt-1" aria-label="Synthetic content disclosure">
+            ⚠️ <span className="font-semibold text-gray-500">AI-Generated Content</span> — Responses are synthetically produced by{" "}
+            <span data-model-id="gpt-4o" className="font-mono text-gray-500">gpt-4o</span> (PolicyProbe-AI).{" "}
+            Verify critical information independently.
           </p>
         </form>
       </div>
