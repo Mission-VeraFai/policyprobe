@@ -69,18 +69,26 @@ export function ErrorDisplay({ error }: ErrorDisplayProps) {
           </div>
           <p className="text-gray-300 text-sm">{error.message}</p>
 
-          {error.details && Object.keys(error.details).length > 0 && (
-            <div className="mt-3 text-xs">
-              <details className="cursor-pointer">
-                <summary className="text-gray-400 hover:text-gray-300">
-                  View Details
-                </summary>
-                <pre className="mt-2 bg-black/30 rounded p-2 overflow-x-auto text-gray-400">
-                  {JSON.stringify(error.details, null, 2)}
-                </pre>
-              </details>
-            </div>
-          )}
+          {error.details && Object.keys(error.details).length > 0 && (() => {
+            const ALLOWED_DETAIL_KEYS: string[] = ['type', 'code', 'field', 'reason']
+            const safeDetails = Object.fromEntries(
+              Object.entries(error.details as Record<string, unknown>).filter(
+                ([key]) => ALLOWED_DETAIL_KEYS.includes(key)
+              )
+            )
+            return Object.keys(safeDetails).length > 0 ? (
+              <div className="mt-3 text-xs">
+                <details className="cursor-pointer">
+                  <summary className="text-gray-400 hover:text-gray-300">
+                    View Details
+                  </summary>
+                  <pre className="mt-2 bg-black/30 rounded p-2 overflow-x-auto text-gray-400">
+                    {JSON.stringify(safeDetails, null, 2)}
+                  </pre>
+                </details>
+              </div>
+            ) : null
+          })()}
         </div>
       </div>
     </div>
