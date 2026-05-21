@@ -26,6 +26,13 @@ case "$HELPER_SCRIPT" in
     *) printf 'ERROR: python_helper.sh path escapes project root\n' >&2; exit 1 ;;
 esac
 if [ -f "$HELPER_SCRIPT" ] && [ ! -L "$HELPER_SCRIPT" ]; then
+    # Verify helper script is a regular file owned by current user before sourcing
+    _helper_owner="$(stat -c '%u' "$HELPER_SCRIPT" 2>/dev/null || stat -f '%u' "$HELPER_SCRIPT" 2>/dev/null)"
+    _current_uid="$(id -u)"
+    if [ "$_helper_owner" != "$_current_uid" ]; then
+        printf 'ERROR: python_helper.sh is not owned by the current user\n' >&2
+        exit 1
+    fi
     # shellcheck source=scripts/python_helper.sh
     . "$HELPER_SCRIPT"
 else
@@ -67,6 +74,11 @@ if [ ! -d "$PROJECT_ROOT/backend/.venv" ]; then
     echo "Creating Python virtual environment..."
     "$PYTHON_CMD" -m venv "$PROJECT_ROOT/backend/.venv"
     if [ -f "$VENV_ACTIVATE" ] && [ ! -L "$VENV_ACTIVATE" ]; then
+        _venv_owner="$(stat -c '%u' "$VENV_ACTIVATE" 2>/dev/null || stat -f '%u' "$VENV_ACTIVATE" 2>/dev/null)"
+        if [ "$_venv_owner" != "$(id -u)" ]; then
+            printf 'ERROR: venv activate script is not owned by the current user\n' >&2
+            exit 1
+        fi
         # shellcheck source=/dev/null
         . "$VENV_ACTIVATE"
     else
@@ -74,9 +86,14 @@ if [ ! -d "$PROJECT_ROOT/backend/.venv" ]; then
         exit 1
     fi
     printf 'Installing Python dependencies...\n'
-    pip install -r requirements.txt
+    pip install --require-hashes -r requirements.txt
 else
     if [ -f "$VENV_ACTIVATE" ] && [ ! -L "$VENV_ACTIVATE" ]; then
+        _venv_owner2="$(stat -c '%u' "$VENV_ACTIVATE" 2>/dev/null || stat -f '%u' "$VENV_ACTIVATE" 2>/dev/null)"
+        if [ "$_venv_owner2" != "$(id -u)" ]; then
+            printf 'ERROR: venv activate script is not owned by the current user\n' >&2
+            exit 1
+        fi
         # shellcheck source=/dev/null
         . "$VENV_ACTIVATE"
     else
