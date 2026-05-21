@@ -118,7 +118,8 @@ elif [ ! -f "node_modules/.bin/next" ]; then
         "$PROJECT_ROOT/frontend/"*) ;;
         *) printf 'ERROR: node_modules path escapes frontend directory\n' >&2; kill "$BACKEND_PID" 2>/dev/null || true; exit 1 ;;
     esac
-    rm -rf -- "$TARGET_DIR"
+    find "$TARGET_DIR" -mindepth 1 -delete
+    rmdir "$TARGET_DIR"
     npm install
 fi
 
