@@ -91,6 +91,148 @@ class PDFParser:
     def __init__(self):
         pass
 
+    # --- Prompt-injection / hidden-content detection patterns ---
+    # Base64 blobs (≥40 contiguous base64 chars)
+    _B64_RE = re.compile(r'(?:[A-Za-z0-9+/]{40,}={0,2})')
+    # Common shell / system commands
+    _SHELL_RE = re.compile(
+        r'(?i)\b(?:bash|sh|cmd|powershell|exec|eval|system|popen|subprocess'
+        r'|wget|curl|nc|ncat|netcat|chmod|chown|sudo|su|rm\s+-rf|dd\s+if)\b'
+    )
+    # Prompt-injection trigger phrases
+    _PROMPT_INJECT_RE = re.compile(
+        r'(?i)(?:ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions'
+        r'|disregard\s+(?:all\s+)?(?:previous|prior|above)'
+        r'|you\s+are\s+now\s+(?:a|an|in)'
+        r'|act\s+as\s+(?:a|an|if)'
+        r'|new\s+instructions?\s*:'
+        r'|system\s*:\s*you'
+        r'|<\s*/?\s*(?:system|user|assistant|prompt|instruction)\s*>'
+        r'|\[\s*(?:INST|SYS|SYSTEM|PROMPT)\s*\])'
+    )
+    # Leetspeak heuristic: 3+ digit-substituted alpha words (e.g. 1gnor3, 3x3cut3)
+    _LEET_RE = re.compile(r'\b(?=[a-z0-9]*[0-9][a-z0-9]*[a-z][a-z0-9]*)(?=[a-z0-9]*[a-z][a-z0-9]*[0-9])[a-z0-9]{4,}\b', re.IGNORECASE)
+    # Non-printable / binary bytes (control chars except common whitespace)
+    _BINARY_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]')
+
+    def _sanitize_extracted_text(self, text: str, page_num: int) -> str:
+        """
+        Detect and strip content that could carry hidden prompt injections,
+        encoded payloads, shell commands, or binary executables.
+
+        Each category is handled independently so that legitimate text is
+        preserved as much as possible while malicious fragments are removed.
+        """
+        original_length = len(text)
+        flags: list[str] = []
+
+        # 1. Remove non-printable / binary characters
+        cleaned = self._BINARY_RE.sub('', text)
+        if len(cleaned) != len(text):
+            flags.append('binary/non-printable characters')
+        text = cleaned
+
+        # 2. Strip base64-encoded blobs
+        def _strip_b64(m: re.Match) -> str:
+            flags.append('base64-encoded content')
+            return '[REMOVED-B64]'
+        text = self._B64_RE.sub(_strip_b64, text)
+
+        # 3. Remove shell / system command tokens
+        def _strip_shell(m: re.Match) -> str:
+            flags.append('shell command')
+            return '[REMOVED-CMD]'
+        text = self._SHELL_RE.sub(_strip_shell, text)
+
+        # 4. Remove prompt-injection trigger phrases
+        def _strip_inject(m: re.Match) -> str:
+            flags.append('prompt injection phrase')
+            return '[REMOVED-INJECTION]'
+        text = self._PROMPT_INJECT_RE.sub(_strip_inject, text)
+
+        # 5. Remove leetspeak tokens (heuristic — only flag, keep surrounding text)
+        def _strip_leet(m: re.Match) -> str:
+            flags.append('leetspeak token')
+            return '[REMOVED-LEET]'
+        text = self._LEET_RE.sub(_strip_leet, text)
+
+        if flags:
+            unique_flags = list(dict.fromkeys(flags))  # deduplicate, preserve order
+            logger.warning(
+                "Suspicious content detected and removed from PDF page",
+                extra={
+                    "page": page_num + 1,
+                    "flags": unique_flags,
+                    "original_length": original_length,
+                    "sanitized_length": len(text),
+                }
+            )
+
+        return text
+
+    # Patterns that indicate potential prompt injection or malicious content
+    _SUSPICIOUS_PATTERNS = [
+        # Prompt injection / role-switching attempts
+        re.compile(
+            r'(?i)(ignore\s+(all\s+)?(previous|prior|above)\s+instructions'
+            r'|disregard\s+(all\s+)?(previous|prior|above)\s+instructions'
+            r'|you\s+are\s+now\s+(a\s+)?(?:an?\s+)?\w+'
+            r'|act\s+as\s+(a\s+)?(?:an?\s+)?\w+'
+            r'|new\s+instructions?\s*:'
+            r'|system\s*:\s'
+            r'|assistant\s*:\s'
+            r'|user\s*:\s'
+            r'|<\s*/?\s*(?:system|assistant|user|prompt|instruction)\s*>'
+            r'|\[\s*(?:SYSTEM|INST|ASSISTANT|USER)\s*\])'
+        ),
+        # Shell command patterns
+        re.compile(
+            r'(?i)(\$\(|`[^`]*`|\beval\s*\(|\bexec\s*\(|\bos\.system\s*\('
+            r'|\bsubprocess\b|\bpopen\s*\(|\bshell\s*=\s*True'
+            r'|;\s*(?:rm|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat)\s'
+            r'|&&\s*(?:rm|wget|curl|bash|sh|python|perl|ruby|nc|ncat|netcat)\s'
+            r'|\|\s*(?:bash|sh|python|perl|ruby)\b)'
+        ),
+        # Base64-encoded blobs (long runs of base64 chars, likely encoded payloads)
+        re.compile(r'(?:[A-Za-z0-9+/]{40,}={0,2})'),
+    ]
+
+    def _sanitize_extracted_text(self, text: str, page_num: int = 0) -> str:
+        """
+        Sanitize extracted PDF text to prevent prompt injection and
+        execution of malicious content passed to AI agents.
+
+        Removes / neutralises:
+        - Non-printable / binary characters
+        - Base64-encoded blobs that may hide payloads
+        - Shell command patterns
+        - Prompt injection phrases and role-switching attempts
+        """
+        if not text:
+            return text
+
+        # 1. Strip binary / non-printable characters (keep newlines and tabs)
+        cleaned = ''.join(
+            ch if (ch.isprintable() or ch in ('\n', '\t', '\r')) else ' '
+            for ch in text
+        )
+
+        # 2. Check for and remove suspicious patterns, logging warnings
+        for pattern in self._SUSPICIOUS_PATTERNS:
+            matches = pattern.findall(cleaned)
+            if matches:
+                logger.warning(
+                    "Suspicious content detected and removed from PDF page",
+                    extra={
+                        "page": page_num + 1,
+                        "pattern": pattern.pattern[:80],
+                        "match_count": len(matches),
+                    }
+                )
+                cleaned = pattern.sub('[REMOVED-SUSPICIOUS-CONTENT]', cleaned)
+
+        return cleaned
+
     def _redact_pii(self, text: str) -> str:
         """Redact PII from text using regex patterns."""
         redacted = text
@@ -113,9 +255,11 @@ class PDFParser:
 
             text_parts = []
             for page_num, page in enumerate(reader.pages):
-                # VULNERABILITY: Extract all text without filtering
+                # Sanitize extracted text to remove hidden/malicious content
+                # before any further processing.
                 page_text = page.extract_text()
                 if page_text:
+                    page_text = self._sanitize_extracted_text(page_text, page_num)
                     page_text = self._redact_pii(page_text)
                     text_parts.append(page_text)
 
