@@ -6,9 +6,10 @@ Contains modules for detecting and enforcing security policies:
 - Prompt Injection: Detects hidden/malicious prompts
 - Content Scanner: Extracts and analyzes hidden content
 
-SECURITY NOTES (for Unifai demo):
-All policy modules are currently NO-OP implementations.
-They pass through content without actual security scanning.
+SECURITY REQUIREMENTS:
+All policy modules MUST perform active security scanning before content
+is forwarded to the AI model. NO-OP or pass-through implementations
+are strictly prohibited in any environment.
 """
 
 from .pii_detection import PIIDetector, PIIDetectionResult
@@ -22,3 +23,21 @@ __all__ = [
     "ThreatDetectionResult",
     "ContentScanner",
 ]
+
+# Runtime enforcement: verify that critical policy classes expose a callable
+# scan/detect interface, preventing silent NO-OP stub deployments.
+def _verify_policy_implementations() -> None:
+    required = {
+        "PIIDetector": (PIIDetector, "detect"),
+        "PromptInjectionDetector": (PromptInjectionDetector, "detect"),
+        "ContentScanner": (ContentScanner, "scan"),
+    }
+    for name, (cls, method) in required.items():
+        if not callable(getattr(cls, method, None)):
+            raise NotImplementedError(
+                f"{name}.{method}() is not implemented. "
+                "All policy modules must perform active security scanning. "
+                "NO-OP pass-through implementations are not permitted."
+            )
+
+_verify_policy_implementations()

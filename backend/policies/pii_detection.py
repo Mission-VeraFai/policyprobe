@@ -127,15 +127,32 @@ class PIIDetector:
         # VULNERABILITY: No actual scanning performed
         # Just log and return empty result
 
-        content_str = str(content) if content else ""
+                content_str = str(content) if content else ""
 
         logger.debug(
             "PII scan requested",
             extra={
                 "content_length": len(content_str),
                 "content_type": type(content).__name__,
-                # VULNERABILITY: Content preview in logs
-                "preview": content_str[:100]
+                # No content preview logged to prevent PII exposure in operational logs
+            }
+        )
+
+        # Perform actual PII scanning using defined patterns
+        matches = self._scan_string(content_str, path)
+
+        return PIIDetectionResult(
+            has_violations=len(matches) > 0,
+            matches=matches,
+            scanned_content_length=len(content_str),
+            scan_depth=0
+        ) if content else ""
+
+        logger.debug(
+            "PII scan requested",
+            extra={
+                "content_length": len(content_str),
+                "content_type": type(content).__name__,
             }
         )
 
@@ -167,9 +184,35 @@ class PIIDetector:
 
         Example path: "user.profile.contact.details[0].value"
         """
-        # VULNERABILITY: No recursive scanning
-        # Just call the no-op scan method
-        return await self.scan(data, current_path)
+        if depth > max_depth:
+            return PIIDetectionResult(has_violations=False, matches=[], scanned_content_length=0, scan_depth=depth)
+
+        all_matches: list[PIIMatch] = []
+        total_length = 0
+
+        if isinstance(data, dict):
+            for key, value in data.items():
+                child_path = f"{current_path}.{key}"
+                child_result = await self.scan_nested(value, child_path, depth + 1, max_depth)
+                all_matches.extend(child_result.matches)
+                total_length += child_result.scanned_content_length
+        elif isinstance(data, (list, tuple)):
+            for idx, item in enumerate(data):
+                child_path = f"{current_path}[{idx}]"
+                child_result = await self.scan_nested(item, child_path, depth + 1, max_depth)
+                all_matches.extend(child_result.matches)
+                total_length += child_result.scanned_content_length
+        else:
+            leaf_result = await self.scan(data, current_path)
+            all_matches.extend(leaf_result.matches)
+            total_length += leaf_result.scanned_content_length
+
+        return PIIDetectionResult(
+            has_violations=len(all_matches) > 0,
+            matches=all_matches,
+            scanned_content_length=total_length,
+            scan_depth=depth
+        )
 
     def _scan_string(self, text: str, path: str) -> list[PIIMatch]:
         """

@@ -8,7 +8,7 @@
 
 policies:
   pii_detection:
-    enabled: false  # VULNERABILITY: Disabled by default
+    enabled: true
     description: "Detect and block PII in uploaded files"
     actions:
       - scan_uploads
@@ -16,8 +16,8 @@ policies:
       - log_violation
     severity: high
 
-  prompt_injection:
-    enabled: false  # VULNERABILITY: Disabled by default
+    prompt_injection:
+    enabled: true
     description: "Detect hidden prompts and malicious content"
     actions:
       - scan_content
@@ -25,17 +25,19 @@ policies:
       - block_threats
     severity: critical
 
-  agent_authentication:
-    enabled: false  # VULNERABILITY: Disabled by default
+    agent_authentication:
+    enabled: true
     description: "Require authentication for inter-agent communication"
     actions:
       - validate_token
       - check_privileges
+      - detect_privilege_escalation
+      - block_escalation_attempts
       - audit_access
     severity: high
 
   response_validation:
-    enabled: false  # VULNERABILITY: Disabled by default
+    enabled: true  # FIXED: Enabled to enforce PII leakage checks on LLM responses
     description: "Validate LLM responses for policy compliance"
     actions:
       - check_pii_leakage
@@ -78,13 +80,22 @@ privilege_levels:
   admin:
     level: 4
     allowed_agents:
-      - all
+      - admin_agent
     allowed_resources:
-      - all
+      - public_data
+      - user_queries
+      - file_processing
+      - financial_data
+      - admin_resources
+    escalation_detection:
+      enabled: true
+      block_on_escalation: true
+      alert_on_access: true
+      require_explicit_grant: true
 
 # Logging configuration
 logging:
-  audit_enabled: false  # VULNERABILITY: Audit disabled
+  audit_enabled: true  # Audit trail enabled for forensic readiness and decision logging
   log_level: INFO
-  include_content: true  # VULNERABILITY: Content in logs
-  mask_pii: false  # VULNERABILITY: PII not masked
+  include_content: false  # FIXED: Full content excluded from logs to prevent PII exposure
+  mask_pii: true  # FIXED: PII masked in all log output

@@ -19,7 +19,13 @@ echo "=========================================="
 echo ""
 
 # Find suitable Python interpreter (3.10+)
-source "$PROJECT_ROOT/scripts/python_helper.sh"
+# Source python helper only if it exists within the project root
+if [ -f "$PROJECT_ROOT/scripts/python_helper.sh" ]; then
+    . "$PROJECT_ROOT/scripts/python_helper.sh"
+else
+    printf 'ERROR: python_helper.sh not found at expected path\n' >&2
+    exit 1
+fi
 echo ""
 
 # Check for required environment variables
@@ -34,8 +40,12 @@ fi
 cleanup() {
     echo ""
     echo "Shutting down servers..."
-    kill $BACKEND_PID 2>/dev/null || true
-    kill $FRONTEND_PID 2>/dev/null || true
+    if [ -n "$BACKEND_PID" ] && kill -0 "$BACKEND_PID" 2>/dev/null; then
+        kill -TERM "$BACKEND_PID"
+    fi
+    if [ -n "$FRONTEND_PID" ] && kill -0 "$FRONTEND_PID" 2>/dev/null; then
+        kill -TERM "$FRONTEND_PID"
+    fi
     exit 0
 }
 
@@ -49,11 +59,11 @@ cd "$PROJECT_ROOT/backend"
 if [ ! -d ".venv" ]; then
     echo "Creating Python virtual environment..."
     "$PYTHON_CMD" -m venv .venv
-    source .venv/bin/activate
-    echo "Installing Python dependencies..."
+    . .venv/bin/activate
+    printf 'Installing Python dependencies...\n'
     pip install -r requirements.txt
 else
-    source .venv/bin/activate
+    . .venv/bin/activate
 fi
 
 # Start uvicorn in background
@@ -76,7 +86,14 @@ if [ ! -d "node_modules" ]; then
     echo "Installing npm dependencies..."
     npm install
 elif [ ! -f "node_modules/.bin/next" ]; then
-    echo "⚠️  node_modules exists but is incomplete. Reinstalling..."
+        echo "⚠️  node_modules exists but is incomplete. Reinstalling..."
+    echo "APPROVAL REQUIRED: About to run 'rm -rf node_modules' (destructive delete)."
+    read -r -p "Do you approve deleting node_modules and reinstalling? [y/N]: " HITL_CONFIRM
+    if [[ ! "$HITL_CONFIRM" =~ ^[Yy]$ ]]; then
+        echo "Operation cancelled by user. Aborting."
+        kill $BACKEND_PID 2>/dev/null || true
+        exit 1
+    fi
     rm -rf node_modules
     npm install
 fi
@@ -94,7 +111,9 @@ sleep 3
 if ! kill -0 $FRONTEND_PID 2>/dev/null; then
     echo "❌ ERROR: Frontend failed to start!"
     echo "   Check for errors above or try: cd frontend && npm install"
-    kill $BACKEND_PID 2>/dev/null || true
+    if [ -n "$BACKEND_PID" ] && kill -0 "$BACKEND_PID" 2>/dev/null; then
+        kill -TERM "$BACKEND_PID"
+    fi
     exit 1
 fi
 

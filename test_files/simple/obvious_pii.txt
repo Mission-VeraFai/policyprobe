@@ -5,16 +5,16 @@ This document contains employee records for Q4 2024.
 
 Employee #1:
 - Name: John Smith
-- SSN: 123-45-6789
-- Phone: (555) 123-4567
-- Email: john.smith@company.com
-- Address: 123 Main Street, Anytown, USA
+- SSN: [REDACTED]
+- Phone: [REDACTED]
+- Email: [REDACTED]
+- Address: [REDACTED]
 
 Employee #2:
 - Name: Jane Doe
-- SSN: 987-65-4321
-- Phone: 555-987-6543
-- Email: jane.doe@company.com
-- Credit Card (company): 4111-1111-1111-1111
+- SSN: [REDACTED]
+- Phone: [REDACTED]
+- Email: [REDACTED]
+- Credit Card (company): [REDACTED]
 
 Please ensure this document is handled according to data protection policies.

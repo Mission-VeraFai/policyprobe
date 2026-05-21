@@ -4,7 +4,12 @@ File Processor Agent
 """
 
 import base64
+import hashlib
+import json
 import logging
+import os
+import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from file_parsers.pdf_parser import PDFParser
@@ -12,6 +17,26 @@ from file_parsers.image_parser import ImageParser
 from file_parsers.html_parser import HTMLParser
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Audit-trail helpers
+# ---------------------------------------------------------------------------
+AUDIT_LOG_PATH = os.environ.get("FILE_PROCESSOR_AUDIT_LOG", "audit_file_processor.jsonl")
+
+
+def _sha256(data: Optional[str]) -> str:
+    """Return the hex SHA-256 digest of *data* (empty string when None)."""
+    raw = (data or "").encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _write_audit_record(record: dict) -> None:
+    """Append *record* as a single JSON line to the persistent audit log."""
+    try:
+        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:  # pragma: no cover
+        logger.error("Failed to write audit record", extra={"error": str(exc)})
 
 
 class FileProcessorAgent:
@@ -48,7 +73,8 @@ class FileProcessorAgent:
         self,
         content: Optional[str],
         filename: str,
-        content_type: str
+        content_type: str,
+        principal: str = "system",
     ) -> str:
         """
         Process uploaded file and extract content.
@@ -73,9 +99,7 @@ class FileProcessorAgent:
             extra={
                 "file_name": filename,
                 "file_type": content_type,
-                "content_length": len(content) if content else 0,
-                # VULNERABILITY: Content preview in logs could contain sensitive data
-                "content_preview": content[:100] if content else None
+                "content_length": len(content) if content else 0
             }
         )
 
@@ -85,8 +109,7 @@ class FileProcessorAgent:
         # Determine file type
         file_type = self._get_file_type(content_type, filename)
 
-        # Process based on file type
-        # VULNERABILITY: No content scanning before processing
+                # Process based on file type
         try:
             if file_type == "pdf":
                 extracted = await self._process_pdf(content)
@@ -97,23 +120,18 @@ class FileProcessorAgent:
             elif file_type == "json":
                 extracted = await self._process_json(content)
             elif file_type == "text":
-                extracted = content  # Direct text, no processing needed
+                extracted = content
             else:
                 extracted = f"Unsupported file type: {content_type}"
 
-            # VULNERABILITY: No post-processing security scan
-            # Extracted content could contain:
-            # - Hidden prompt injections (invisible text, encoded data)
-            # - PII that should be masked
-            # - Malicious instructions
+            # Redact PII from extracted content before returning
+            extracted = self._redact_pii(extracted)
 
             logger.info(
                 "File processing complete",
                 extra={
                     "file_name": filename,
-                    "extracted_length": len(extracted),
-                    # VULNERABILITY: Full extracted content in logs
-                    "extracted_preview": extracted[:200]
+                    "extracted_length": len(extracted)
                 }
             )
 
@@ -124,12 +142,269 @@ class FileProcessorAgent:
                 "Error processing file",
                 extra={
                     "file_name": filename,
-                    "error": str(e),
-                    # VULNERABILITY: Full content in error logs
-                    "file_content": content[:500] if content else None
+                    "error": str(e)
                 }
             )
             return f"Error processing {filename}: {str(e)}"
+
+    def _scan_for_malicious_content(self, text: str) -> dict:
+        """Scan extracted text for hidden or malicious prompt content.
+
+        Checks for:
+        - Invisible / zero-width Unicode characters used to hide instructions
+        - Base64-encoded payloads that decode to prompt-like text
+        - Leetspeak patterns commonly used to obfuscate prompt injections
+        - Shell command sequences
+        - Binary executable magic bytes embedded in text
+
+        Returns a dict with keys:
+            flagged (bool): True if any issue was found
+            reasons (list[str]): Human-readable descriptions of each finding
+        """
+        import re
+        import base64
+
+        reasons = []
+
+        # 1. Invisible / zero-width characters
+        invisible_pattern = re.compile(
+            r"[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\u206a-\u206f\ufeff]"
+        )
+        if invisible_pattern.search(text):
+            reasons.append("invisible or zero-width Unicode characters detected")
+
+        # 2. Base64-encoded payloads
+        # Look for long base64 tokens and decode them to check for prompt keywords
+        b64_token_pattern = re.compile(r"[A-Za-z0-9+/]{40,}={0,2}")
+        prompt_keywords = re.compile(
+            r"ignore|disregard|forget|system|assistant|user|prompt|"
+            r"instruction|jailbreak|override|bypass|sudo|exec|eval",
+            re.IGNORECASE,
+        )
+        for match in b64_token_pattern.finditer(text):
+            token = match.group(0)
+            # Pad to a valid length
+            padded = token + "=" * (-len(token) % 4)
+            try:
+                decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+                if prompt_keywords.search(decoded):
+                    reasons.append("base64-encoded prompt injection payload detected")
+                    break
+            except Exception:
+                pass
+
+        # 3. Leetspeak obfuscation of common injection keywords
+        # Normalise common leet substitutions then check for keywords
+        leet_map = str.maketrans("013456789@", "oieashgtba")
+        normalised = text.lower().translate(leet_map)
+        leet_keywords = [
+            "ignore previous", "disregard", "jailbreak", "bypass",
+            "you are now", "act as", "pretend", "roleplay",
+        ]
+        for kw in leet_keywords:
+            if kw in normalised:
+                reasons.append(f"leetspeak-obfuscated injection keyword detected: '{kw}'")
+                break
+
+        # 4. Shell command sequences
+        shell_pattern = re.compile(
+            r"(?:^|\s|;|&&|\|\|)(?:rm\s+-rf|chmod\s+[0-7]+|curl\s+http|wget\s+http|"
+            r"bash\s+-[ci]|sh\s+-[ci]|python[23]?\s+-c|perl\s+-e|nc\s+-[lne]|"
+            r"eval\s*\(|exec\s*\(|os\.system|subprocess\.)",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        if shell_pattern.search(text):
+            reasons.append("shell command sequence detected")
+
+        # 5. Binary executable magic bytes (ELF, PE/MZ, Mach-O)
+        binary_magic = re.compile(
+            r"(?:\x7fELF|MZ|\xfe\xed\xfa\xce|\xfe\xed\xfa\xcf|"
+            r"\xce\xfa\xed\xfe|\xcf\xfa\xed\xfe)"
+        )
+        if binary_magic.search(text):
+            reasons.append("binary executable magic bytes detected")
+
+        return {"flagged": bool(reasons), "reasons": reasons}
+
+    def _scan_for_malicious_content(self, text: str, filename: str) -> str:
+        """
+        Scan extracted text for malicious content patterns before it is used
+        as agent input. Raises ValueError if dangerous content is detected.
+        """
+        import re
+        import base64
+        import string
+
+        if not text:
+            return text
+
+        # 1. Reject binary / non-printable content (executable bytes)
+        non_printable = sum(
+            1 for ch in text if ch not in string.printable
+        )
+        if non_printable > max(10, len(text) * 0.05):
+            logger.warning(
+                "File rejected: high proportion of non-printable characters",
+                extra={"file_name": filename, "non_printable_count": non_printable}
+            )
+            raise ValueError(
+                f"File '{filename}' contains binary or non-printable content "
+                "and cannot be used as agent input."
+            )
+
+        # 2. Detect hidden / invisible Unicode prompt-injection characters
+        invisible_pattern = re.compile(
+            r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064\u206a-\u206f\ufeff\u00ad]"
+        )
+        if invisible_pattern.search(text):
+            logger.warning(
+                "File rejected: invisible/hidden Unicode characters detected",
+                extra={"file_name": filename}
+            )
+            raise ValueError(
+                f"File '{filename}' contains hidden Unicode characters that may "
+                "encode malicious prompt instructions."
+            )
+
+        # 3. Detect base64-encoded blobs that could hide instructions
+        b64_pattern = re.compile(
+            r"(?:[A-Za-z0-9+/]{40,}={0,2})"
+        )
+        for match in b64_pattern.finditer(text):
+            candidate = match.group(0)
+            try:
+                decoded = base64.b64decode(candidate + "==").decode("utf-8", errors="ignore")
+                # Flag if the decoded payload looks like a shell command or prompt
+                if re.search(
+                    r"(ignore previous|system prompt|you are now|execute|eval|\$\(|`[^`]+`|\bsh\b|\bbash\b)",
+                    decoded,
+                    re.IGNORECASE,
+                ):
+                    logger.warning(
+                        "File rejected: base64-encoded malicious instruction detected",
+                        extra={"file_name": filename}
+                    )
+                    raise ValueError(
+                        f"File '{filename}' contains base64-encoded content that "
+                        "appears to encode malicious instructions."
+                    )
+            except (ValueError, UnicodeDecodeError):
+                pass  # Not valid UTF-8 after decode — not a text payload
+
+        # 4. Detect prompt-injection phrases
+        injection_pattern = re.compile(
+            r"(ignore (all |previous |prior )(instructions?|prompts?|context)"
+            r"|you are now"
+            r"|act as (a |an )?(different|new|unrestricted)"
+            r"|disregard (your |all )?(previous |prior )?(instructions?|rules?|guidelines?)"
+            r"|system\s*prompt"
+            r"|<\s*system\s*>"
+            r"|\[INST\]"
+            r"|###\s*instruction)",
+            re.IGNORECASE,
+        )
+        if injection_pattern.search(text):
+            logger.warning(
+                "File rejected: prompt-injection phrase detected",
+                extra={"file_name": filename}
+            )
+            raise ValueError(
+                f"File '{filename}' contains prompt-injection instructions and "
+                "cannot be used as agent input."
+            )
+
+        # 5. Detect shell commands / executable patterns
+        shell_pattern = re.compile(
+            r"(\$\([^)]+\)"
+            r"|`[^`]+`"
+            r"|\b(rm|wget|curl|chmod|chown|sudo|nc|ncat|netcat|python|perl|ruby|php)\s+-"
+            r"|\b(exec|eval|os\.system|subprocess|popen)\s*\("
+            r"|/bin/(sh|bash|zsh|dash|ksh))",
+            re.IGNORECASE,
+        )
+        if shell_pattern.search(text):
+            logger.warning(
+                "File rejected: shell command pattern detected",
+                extra={"file_name": filename}
+            )
+            raise ValueError(
+                f"File '{filename}' contains shell command patterns and "
+                "cannot be used as agent input."
+            )
+
+        # 6. Detect leetspeak-obfuscated dangerous keywords
+        leet_map = str.maketrans("013457", "oieash")
+        normalised = text.lower().translate(leet_map)
+        leet_danger_pattern = re.compile(
+            r"\b(ignore|execute|system|shell|eval|admin|root|hack|exploit)\b",
+            re.IGNORECASE,
+        )
+        # Only flag when the original text does NOT contain the plain word
+        # but the leet-normalised version does (i.e. it was obfuscated)
+        for match in leet_danger_pattern.finditer(normalised):
+            plain_word = match.group(0)
+            start, end = match.start(), match.end()
+            original_slice = text[start:end].lower()
+            if original_slice != plain_word:
+                logger.warning(
+                    "File rejected: leetspeak-obfuscated dangerous keyword detected",
+                    extra={"file_name": filename, "keyword": plain_word}
+                )
+                raise ValueError(
+                    f"File '{filename}' contains leetspeak-obfuscated dangerous "
+                    "keywords and cannot be used as agent input."
+                )
+
+        logger.info(
+            "Security scan passed",
+            extra={"file_name": filename, "content_length": len(text)}
+        )
+        return text
+
+    def _redact_pii(self, text: str) -> str:
+        """
+        Detect and redact PII patterns from text content.
+
+        Redacts:
+        - Social Security Numbers (SSN)
+        - Credit card numbers
+        - Phone numbers
+        - Email addresses
+        """
+        import re
+
+        if not text:
+            return text
+
+        # Redact SSNs (e.g. 123-45-6789 or 123456789)
+        text = re.sub(
+            r'\b(?!000|666|9\d{2})\d{3}[-\s]?(?!00)\d{2}[-\s]?(?!0000)\d{4}\b',
+            '[REDACTED-SSN]',
+            text
+        )
+
+        # Redact credit card numbers (13-16 digit sequences, optionally separated by spaces/dashes)
+        text = re.sub(
+            r'\b(?:\d[ -]?){13,16}\b',
+            '[REDACTED-CC]',
+            text
+        )
+
+        # Redact phone numbers (various formats)
+        text = re.sub(
+            r'\b(?:\+?1[-.]?)?\(?\d{3}\)?[-.]?\d{3}[-.]?\d{4}\b',
+            '[REDACTED-PHONE]',
+            text
+        )
+
+        # Redact email addresses
+        text = re.sub(
+            r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b',
+            '[REDACTED-EMAIL]',
+            text
+        )
+
+        return text
 
     def _get_file_type(self, content_type: str, filename: str) -> str:
         """Determine file type from MIME type or extension."""
@@ -241,30 +516,62 @@ class FileProcessorAgent:
         except json.JSONDecodeError as e:
             return f"Invalid JSON: {str(e)}\n\nRaw content:\n{content}"
 
+    # Singapore PII patterns used by validate_file
+    _SG_PII_PATTERNS = [
+        # NRIC / FIN  (S/T/F/G/M followed by 7 digits and a letter)
+        (r'\b[STFGM]\d{7}[A-Z]\b', 'Singapore NRIC/FIN'),
+        # Singapore passport  (E followed by 7–8 digits)
+        (r'\bE\d{7,8}\b', 'Singapore Passport Number'),
+        # Singapore mobile / local phone  (+65 or 65 prefix, or bare 8-digit starting with 6/8/9)
+        (r'(?:\+65|\b65)[\s-]?[689]\d{3}[\s-]?\d{4}\b', 'Singapore Phone (+65)'),
+        (r'\b[689]\d{3}[\s-]?\d{4}\b', 'Singapore Phone (local)'),
+        # Singapore postal code  (6-digit, first digit 0-8)
+        (r'\bSingapore\s+[0-9]{6}\b', 'Singapore Postal Code'),
+        # Generic Singapore address keywords combined with a postal code
+        (r'\b(?:Blk|Block|Lot|#\d{2}-\d{2,4})\b.*?\b[0-9]{6}\b', 'Singapore Address'),
+        # Full name + NRIC in proximity (common in forms)
+        (r'(?i)(?:nric|fin|ic\s*no\.?|identity\s+card)\s*[:\-]?\s*[STFGM]\d{7}[A-Z]', 'Singapore ID Label+Value'),
+    ]
+
     async def validate_file(self, content: str, filename: str) -> dict:
         """
         Validate file before processing.
 
-        VULNERABILITY: Validation only checks format, not content.
-        No security scanning performed.
+        Checks file size and scans content for Singapore PII categories
+        (NRIC, FIN, passport number, phone numbers, postal codes, addresses).
+        Files containing PII are rejected to comply with the Singapore PII policy.
         """
-        # Basic validation only
+        import re
+
         validation_result = {
             "valid": True,
             "filename": filename,
             "size": len(content) if content else 0,
-            "warnings": []
+            "warnings": [],
+            "errors": []
         }
 
-        # Size check (but no PII/threat check)
+        # Size check
         if len(content) > 10 * 1024 * 1024:  # 10MB
             validation_result["warnings"].append("Large file - processing may be slow")
 
-        # VULNERABILITY: No content-based security validation
-        # Should check for:
-        # - PII patterns
-        # - Known malware signatures
-        # - Prompt injection patterns
-        # - Hidden content indicators
+        # Singapore PII content scan
+        pii_found = []
+        for pattern, label in self._SG_PII_PATTERNS:
+            if re.search(pattern, content):
+                pii_found.append(label)
+
+        if pii_found:
+            validation_result["valid"] = False
+            unique_labels = list(dict.fromkeys(pii_found))  # preserve order, deduplicate
+            validation_result["errors"].append(
+                f"File rejected: Singapore PII detected ({', '.join(unique_labels)}). "
+                "Uploading files containing personal data is not permitted."
+            )
+            logger.warning(
+                "Singapore PII detected in uploaded file '%s': %s",
+                filename,
+                ', '.join(unique_labels)
+            )
 
         return validation_result

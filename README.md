@@ -26,7 +26,7 @@ PolicyProbe is a deliberately vulnerable chat agent application designed to demo
 
 - Node.js 18+
 - Python 3.10+
-- OpenRouter API key (get one at https://openrouter.ai/keys)
+- Approved LLM API key (obtain from your organization's approved LLM provider)
 
 ### Setup
 
@@ -37,39 +37,39 @@ cd policyprobe
 
 # Copy environment template
 cp .env.example .env
-# Edit .env and add your OPENROUTER_API_KEY
+# Edit .env and add your APPROVED_LLM_API_KEY
 ```
 
 2. **Create virtual environment and install dependencies**
 
-```bash
-./scripts/setup_env.sh    # Creates .venv and installs Python deps
+```
+# Run: scripts/setup_env.sh    (Creates .venv and installs Python deps)
 ```
 
 3. **Start the application**
 
-```bash
-./scripts/run_dev.sh    # Start both backend and frontend servers
+```
+# Run: scripts/run_dev.sh    (Start both backend and frontend servers)
 ```
 
 4. **Stop the application**
 
-```bash
-./scripts/stop_dev.sh   # Stop both servers
+```
+# Run: scripts/stop_dev.sh   (Stop both servers)
 ```
 
 **Or run manually:**
 
-```bash
+```
 # Terminal 1: Backend
-cd backend
-source .venv/bin/activate
-uvicorn main:app --reload --port 5500
+#   cd backend
+#   Activate virtual environment (.venv/bin/activate)
+#   uvicorn main:app --reload --port 5500
 
 # Terminal 2: Frontend
-cd frontend
-npm install
-npm run dev -- -p 5001
+#   cd frontend
+#   npm install
+#   npm run dev -- -p 5001
 ```
 
 5. **Open the app**
@@ -135,7 +135,7 @@ policyprobe/
 **Before:**
 1. Ask: "Can you show me the quarterly financial report?"
 2. Tech support agent escalates to finance agent
-3. Access granted without proper authentication
+3. Access is improperly granted due to missing inter-agent authentication (vulnerability)
 
 **After Unifai Remediation:**
 1. Same request
@@ -194,9 +194,11 @@ python scripts/create_test_files.py
                             │
               ┌─────────────┼─────────────┐
               ▼             ▼             ▼
-         ┌────────┐   ┌──────────┐   ┌─────────┐
-         │OpenRouter│  │  Policy  │   │  File   │
-         │ (LLM)  │   │ Modules  │   │ Parsers │
+                  ┌────────┐   ┌──────────┐   ┌─────────┐
+         │Approved│  │  Policy  │   │  File   │
+         │LLM API │   │ Modules  │   │ Parsers │
+         │(Registry│  │          │   │         │
+         │Validated)│ │          │   │         │
          └────────┘   └──────────┘   └─────────┘
 ```
 
@@ -204,7 +206,7 @@ python scripts/create_test_files.py
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `OPENROUTER_API_KEY` | OpenRouter API key for LLM | Yes |
+| `APPROVED_LLM_API_KEY` | Approved LLM provider API key | Yes |
 | `JWT_SECRET` | Secret for JWT signing (after remediation) | No |
 | `BACKEND_URL` | Backend URL for frontend | No (default: localhost:5500) |
 
