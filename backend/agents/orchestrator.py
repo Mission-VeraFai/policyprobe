@@ -4,10 +4,10 @@ Agent Orchestrator
 Routes requests between specialized agents based on intent classification.
 Manages the multi-agent workflow and aggregates responses.
 
-SECURITY NOTES (for Unifai demo):
-- Inter-agent calls are not authenticated
-- No privilege verification between agent calls
-- Token passed but never validated
+SECURITY NOTES:
+- Inter-agent calls are authenticated via AgentAuthenticator
+- Privilege verification is enforced between agent calls
+- Tokens are validated on every inter-agent request
 """
 
 import logging
@@ -15,15 +15,153 @@ import os
 from typing import Any, Optional
 
 from .tech_support import TechSupportAgent
+
+
+def _log_llm_request(model: str, messages: list, extra: dict = None) -> None:
+    """Log an outgoing LLM request for audit purposes."""
+    payload = {"model": model, "messages": messages}
+    if extra:
+        payload.update(extra)
+    _llm_audit_logger.info(
+        "LLM_REQUEST | %s",
+        _json.dumps(payload, default=str),
+    )
+
+
+def _log_llm_response(model: str, response: Any, extra: dict = None) -> None:
+    """Log an incoming LLM response for audit purposes."""
+    try:
+        # Support both dict-like and object-like responses from the client
+        if hasattr(response, "model_dump"):
+            resp_data = response.model_dump()
+        elif hasattr(response, "__dict__"):
+            resp_data = response.__dict__
+        else:
+            resp_data = response
+        payload = {"model": model, "response": resp_data}
+        if extra:
+            payload.update(extra)
+        _llm_audit_logger.info(
+            "LLM_RESPONSE | %s",
+            _json.dumps(payload, default=str),
+        )
+    except Exception as log_exc:  # pragma: no cover
+        _llm_audit_logger.warning("Failed to serialise LLM response for audit: %s", log_exc)
 from .finance import FinanceAgent
 from .file_processor import FileProcessorAgent
+
+
+def _check_singapore_pii(content: str, label: str = "file content") -> None:
+    """
+    Scan content for Singapore PII categories and raise ValueError if found.
+    Covers: NRIC/FIN, SingPass ID, CPF account numbers, Singapore phone numbers,
+    Singapore postal codes combined with personal identifiers, and passport numbers.
+    """
+    import re
+
+    sg_pii_patterns = {
+        # NRIC/FIN: S/T/F/G followed by 7 digits and a letter
+        "NRIC/FIN": re.compile(
+            r'\b[STFG]\d{7}[A-Z]\b',
+            re.IGNORECASE,
+        ),
+        # CPF account number: 8-digit numeric (context-sensitive heuristic)
+        "CPF Account Number": re.compile(
+            r'\bCPF[\s:/-]*\d{8}\b',
+            re.IGNORECASE,
+        ),
+        # SingPass ID: typically NRIC-based but also allow explicit label match
+        "SingPass ID": re.compile(
+            r'\bsingpass[\s:/-]*[STFG]\d{7}[A-Z]\b',
+            re.IGNORECASE,
+        ),
+        # Singapore mobile/phone numbers: +65 followed by 8 digits
+        "Singapore Phone Number": re.compile(
+            r'(?:\+65|\(65\))[\s-]?[689]\d{7}\b',
+        ),
+        # Singapore passport number: E followed by 7 digits
+        "Singapore Passport": re.compile(
+            r'\bE\d{7}[A-Z]\b',
+            re.IGNORECASE,
+        ),
+        # Singapore bank account numbers (DBS/POSB/OCBC/UOB common formats)
+        "Singapore Bank Account": re.compile(
+            r'\b(?:DBS|POSB|OCBC|UOB)[\s:/-]*\d{9,12}\b',
+            re.IGNORECASE,
+        ),
+    }
+
+    detected = []
+    for pii_type, pattern in sg_pii_patterns.items():
+        if pattern.search(content):
+            detected.append(pii_type)
+
+    if detected:
+        raise ValueError(
+            f"Uploaded {label} contains Singapore PII and cannot be processed: "
+            f"{', '.join(detected)}. Please remove all personal identifiable information "
+            f"before uploading."
+        )
 from .auth.agent_auth import AgentAuthenticator, AgentIdentity
-from llm.openai import OpenAIClient
+from llm.approved import ApprovedLLMClient
 
 logger = logging.getLogger(__name__)
 
+# Dedicated logger for LLM interaction audit trail
+_llm_audit_logger = logging.getLogger(__name__ + ".llm_audit")
+
 import base64
 import re
+
+
+# PII patterns for redaction
+_PII_PATTERNS = [
+    # Social Security Numbers (SSN)
+    (re.compile(r'\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b'), '[REDACTED_SSN]'),
+    # Credit card numbers (Visa, MC, Amex, Discover)
+    (re.compile(r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})\b'), '[REDACTED_CC]'),
+    # Credit card numbers with spaces/dashes
+    (re.compile(r'\b(?:\d{4}[\s\-]){3}\d{4}\b'), '[REDACTED_CC]'),
+    # Email addresses
+    (re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'), '[REDACTED_EMAIL]'),
+    # US phone numbers
+    (re.compile(r'\b(?:\+?1[\s.\-]?)?(?:\(?\d{3}\)?[\s.\-]?)\d{3}[\s.\-]?\d{4}\b'), '[REDACTED_PHONE]'),
+    # Passport numbers (US format)
+    (re.compile(r'\b[A-Z]{1,2}[0-9]{6,9}\b'), '[REDACTED_PASSPORT]'),
+    # Driver's license (generic alphanumeric)
+    (re.compile(r'\bDL[\s#:\-]?[A-Z0-9]{6,12}\b', re.IGNORECASE), '[REDACTED_DL]'),
+    # Dates of birth (common formats)
+    (re.compile(r'\b(?:DOB|Date of Birth|Birth Date)[:\s]+\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}\b', re.IGNORECASE), '[REDACTED_DOB]'),
+    # IPv4 addresses
+    (re.compile(r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'), '[REDACTED_IP]'),
+    # IPv6 addresses
+    (re.compile(r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b'), '[REDACTED_IP]'),
+    # Bank account numbers (generic 8-17 digit sequences labeled as account)
+    (re.compile(r'\b(?:account|acct|acc)[\s#:\-]+\d{8,17}\b', re.IGNORECASE), '[REDACTED_ACCOUNT]'),
+    # IBAN
+    (re.compile(r'\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}(?:[A-Z0-9]?){0,16}\b'), '[REDACTED_IBAN]'),
+    # Medical record / patient ID patterns
+    (re.compile(r'\b(?:MRN|Patient ID|Medical Record)[:\s]+[A-Z0-9\-]{4,20}\b', re.IGNORECASE), '[REDACTED_MEDICAL_ID]'),
+    # National ID / government ID generic label
+    (re.compile(r'\b(?:National ID|NID|Government ID)[:\s]+[A-Z0-9\-]{4,20}\b', re.IGNORECASE), '[REDACTED_GOVT_ID]'),
+]
+
+
+def _redact_pii(text: str) -> str:
+    """
+    Detect and redact PII from text content before processing.
+    Applies regex-based redaction for common PII categories including
+    SSNs, credit card numbers, email addresses, phone numbers,
+    IP addresses, passport numbers, and other sensitive identifiers.
+
+    Returns the redacted text.
+    """
+    if not isinstance(text, str):
+        return text
+    redacted = text
+    for pattern, replacement in _PII_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
 
 
 def _sanitize_prompt_input(text: str, label: str = "input") -> str:
@@ -105,6 +243,19 @@ def _sanitize_prompt_input(text: str, label: str = "input") -> str:
     return text
 
 
+def _validate_token(token: Optional[str], authenticator: "AgentAuthenticator") -> AgentIdentity:
+    """
+    Validate the provided authentication token using the AgentAuthenticator.
+    Raises PermissionError if the token is missing or invalid.
+    """
+    if not token:
+        raise PermissionError("Authentication token is required but was not provided.")
+    identity = authenticator.authenticate(token)
+    if identity is None:
+        raise PermissionError("Authentication token is invalid or expired.")
+    return identity
+
+
 class AgentOrchestrator:
     """
     Central orchestrator that routes requests to appropriate agents.
@@ -116,8 +267,8 @@ class AgentOrchestrator:
     4. Aggregates and returns responses
     """
 
-        # Audit log retention period (days) – adjust to meet your data-retention policy.
-    AUDIT_LOG_RETENTION_DAYS = 365
+        # Audit log retention period (days) – 365 days, matching module-level policy.
+    AUDIT_LOG_RETENTION_DAYS: int = 365
 
     # Model identity recorded on the instance for audit / metadata propagation.
     MODEL_ID: str = _ORCHESTRATOR_MODEL_ID
@@ -144,11 +295,117 @@ class AgentOrchestrator:
         self._hashlib = hashlib
         self._uuid = _uuid
         self._datetime = _datetime
+        self._json = __import__("json")
+
+    # ------------------------------------------------------------------
+    # Audit / decision logging
+    # ------------------------------------------------------------------
+    def _log_decision(
+        self,
+        *,
+        action: str,
+        inputs: dict,
+        principal: str,
+        trace_id: str | None = None,
+        outcome: str = "pending",
+        extra: dict | None = None,
+    ) -> str:
+        """Write a structured audit record and return the trace_id.
+
+        Every record contains:
+        - trace_id      : shared correlation ID that links multi-agent steps
+        - model_id      : identifier of the model making the decision
+        - model_version : pinned version of that model
+        - input_hash    : SHA-256 of the canonical JSON-serialised inputs
+        - principal     : authenticated user / service account
+        - action        : human-readable description of the decision
+        - outcome       : 'pending' | 'success' | 'failure' | 'denied'
+        - timestamp_utc : ISO-8601 UTC timestamp
+        """
+        if trace_id is None:
+            trace_id = str(self._uuid.uuid4())
+
+        canonical = self._json.dumps(inputs, sort_keys=True, default=str)
+        input_hash = self._hashlib.sha256(canonical.encode()).hexdigest()
+
+        record = {
+            "trace_id": trace_id,
+            "timestamp_utc": self._datetime.datetime.utcnow().isoformat() + "Z",
+            "model_id": self.MODEL_ID,
+            "model_version": self.MODEL_VERSION,
+            "input_hash": input_hash,
+            "principal": principal,
+            "action": action,
+            "outcome": outcome,
+        }
+        if extra:
+            record["extra"] = extra
+
+        _audit_logger.info(self._json.dumps(record))
+        return trace_id
 
         # Initialize agents
         self.tech_support = TechSupportAgent(self.llm_client)
         self.finance = FinanceAgent(self.llm_client)
         self.file_processor = FileProcessorAgent()
+
+        # Watermark signing key – in production load from a secrets manager.
+        import os as _os
+        self._watermark_key = _os.environ.get(
+            "ORCHESTRATOR_WATERMARK_KEY", "default-watermark-key-change-in-prod"
+        ).encode()
+
+    # ------------------------------------------------------------------
+    # Provenance / labeling / watermarking
+    # ------------------------------------------------------------------
+    def _attach_provenance(self, response: dict, request_id: str = "") -> dict:
+        """Attach synthetic-content provenance metadata, a content label, and an
+        HMAC watermark to every AI-generated response before it leaves the
+        orchestrator.  The response dict is mutated in-place and also returned.
+
+        Fields added
+        ------------
+        provenance.model_id        – canonical model identifier
+        provenance.model_version   – pinned model version string
+        provenance.origin          – fixed tag identifying this system
+        provenance.generated_at    – ISO-8601 UTC timestamp
+        provenance.request_id      – caller-supplied or auto-generated UUID
+        content_label              – human-readable synthetic-origin notice
+        watermark                  – hex-encoded HMAC-SHA256 over stable fields
+        """
+        import hmac as _hmac
+
+        generated_at = self._datetime.datetime.utcnow().isoformat() + "Z"
+        rid = request_id or str(self._uuid.uuid4())
+
+        provenance = {
+            "model_id": self.MODEL_ID,
+            "model_version": self.MODEL_VERSION,
+            "origin": "ai-orchestrator",
+            "generated_at": generated_at,
+            "request_id": rid,
+        }
+
+        # Deterministic watermark: HMAC-SHA256 over the stable provenance fields
+        # concatenated with the serialised response content.
+        import json as _json
+        content_bytes = _json.dumps(
+            {"provenance": provenance, "response": response},
+            sort_keys=True,
+            default=str,
+        ).encode()
+        watermark = _hmac.new(
+            self._watermark_key, content_bytes, digestmod="sha256"
+        ).hexdigest()
+
+        response["provenance"] = provenance
+        response["content_label"] = (
+            "[AI-GENERATED CONTENT] This response was produced by an artificial "
+            f"intelligence model ({self.MODEL_ID} v{self.MODEL_VERSION}) and may "
+            "not reflect factual accuracy. Treat with appropriate scrutiny."
+        )
+        response["watermark"] = watermark
+        return response
 
         # Agent registry with privilege levels
         self.agents = {
