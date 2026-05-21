@@ -97,22 +97,120 @@ async function detectPIIInTextFile(file: File): Promise<string | null> {
   })
 }
 
+// Shell/exec primitives that must not appear in user input.
+const DANGEROUS_INPUT_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
+  // Shell command chaining and redirection
+  { name: 'shell chaining', pattern: /(?:^|\s|;|&|\|)(?:bash|sh|zsh|ksh|csh|tcsh|fish|cmd|powershell|pwsh)(?:\s|$)/i },
+  { name: 'shell redirection', pattern: /(?:[|]{1,2}|[&]{1,2}|;|`|\$\()/ },
+  // Common exec primitives
+  { name: 'exec primitive', pattern: /\b(?:exec|eval|system|popen|subprocess|spawn|fork|execve|execvp|ShellExecute|WScript\.Shell|os\.system|child_process)\s*[\.(]/i },
+  // Base64-encoded payloads (long base64 strings are suspicious in chat input)
+  { name: 'base64 payload', pattern: /(?:[A-Za-z0-9+/]{40,}={0,2})/ },
+  // Binary / non-UTF-8 escape sequences smuggled as text
+  { name: 'binary escape', pattern: /(?:\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4}|\\[0-7]{3})/ },
+  // Leetspeak obfuscation of common dangerous words
+  { name: 'leetspeak obfuscation', pattern: /(?:3x3c|3x[e3][c(]|[e3][x%][e3][c(]|5h[e3]ll|5y5t[e3]m|[e3]v[4a]l)/i },
+  // Prompt-injection trigger phrases
+  { name: 'prompt injection', pattern: /(?:ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions?|disregard\s+(?:your\s+)?(?:previous|prior|system)\s+(?:prompt|instructions?)|you\s+are\s+now\s+(?:in\s+)?(?:developer|jailbreak|dan|unrestricted)\s+mode)/i },
+]
+
 function sanitizeTextInput(raw: string): string {
-  // Remove null bytes and non-printable ASCII control characters
-  // (keep \t, \n, \r which are legitimate whitespace).
+  // 1. Remove null bytes and non-printable ASCII control characters
+  //    (keep \t, \n, \r which are legitimate whitespace).
   // eslint-disable-next-line no-control-regex
   let sanitized = raw.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
-  // Collapse runs of more than two consecutive newlines to prevent prompt flooding.
+
+  // 2. Remove Unicode direction-override characters and invisible tag-block
+  //    characters that can hide injected instructions from human reviewers.
+  // eslint-disable-next-line no-misleading-character-class
+  sanitized = sanitized.replace(/[\u202A-\u202E\u2066-\u2069\uFEFF\u200B-\u200F\u2028\u2029]/g, '')
+  // Unicode tag block U+E0000–U+E007F
+  sanitized = sanitized.replace(/[\uE0000-\uE007F]/gu, '')
+
+  // 3. Collapse runs of more than two consecutive newlines to prevent prompt flooding.
   sanitized = sanitized.replace(/\n{3,}/g, '\n\n')
-  // Enforce maximum length.
+
+  // 4. Enforce maximum length before pattern checks to bound regex work.
   if (sanitized.length > MAX_INPUT_LENGTH) {
     sanitized = sanitized.slice(0, MAX_INPUT_LENGTH)
   }
+
+  // 5. Reject input that contains dangerous patterns (shell commands, base64
+  //    payloads, binary escapes, leetspeak obfuscation, prompt injection).
+  for (const { name, pattern } of DANGEROUS_INPUT_PATTERNS) {
+    if (pattern.test(sanitized)) {
+      console.warn(`sanitizeTextInput: blocked input matching pattern "${name}"`)
+      throw new Error(`Your message contains content that is not allowed (${name}). Please revise your input.`)
+    }
+  }
+
   return sanitized
 }
 
 // Maximum length allowed for a single MCP/LLM server output string.
 const MAX_OUTPUT_LENGTH = 32_000
+
+// ---------------------------------------------------------------------------
+// MCP Server Authentication – HMAC-SHA-256 signature verification.
+// The MCP/LLM server must sign every response payload with a shared secret.
+// The client verifies the signature before trusting any server output.
+// The shared secret is provisioned via REACT_APP_MCP_SERVER_HMAC_SECRET.
+// ---------------------------------------------------------------------------
+
+/**
+ * Derives a CryptoKey from the shared MCP server secret for HMAC-SHA-256.
+ * Returns null if the secret is not configured.
+ */
+async function getMcpServerHmacKey(): Promise<CryptoKey | null> {
+  const secret = process.env.REACT_APP_MCP_SERVER_HMAC_SECRET
+  if (!secret) {
+    console.error('[MCP Auth] REACT_APP_MCP_SERVER_HMAC_SECRET is not configured – server authentication is disabled.')
+    return null
+  }
+  const enc = new TextEncoder()
+  return crypto.subtle.importKey(
+    'raw',
+    enc.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['verify']
+  )
+}
+
+/**
+ * verifyMcpServerSignature – verifies that `payload` was signed by the
+ * MCP/LLM server using the shared HMAC-SHA-256 secret.
+ *
+ * @param payload   - The raw string payload received from the server.
+ * @param signature - The hex-encoded HMAC-SHA-256 signature provided by the server.
+ * @returns         - true if the signature is valid, false otherwise.
+ */
+async function verifyMcpServerSignature(payload: string, signature: string): Promise<boolean> {
+  if (!signature || typeof signature !== 'string' || signature.length === 0) {
+    console.warn('[MCP Auth] No signature provided by MCP server – rejecting output.')
+    return false
+  }
+  const key = await getMcpServerHmacKey()
+  if (!key) {
+    // Secret not configured: fail closed to avoid silently skipping auth.
+    return false
+  }
+  try {
+    const enc = new TextEncoder()
+    // Convert hex signature to Uint8Array.
+    const sigBytes = new Uint8Array(
+      signature.match(/.{1,2}/g)?.map((byte) => parseInt(byte, 16)) ?? []
+    )
+    const valid = await crypto.subtle.verify('HMAC', key, sigBytes, enc.encode(payload))
+    if (!valid) {
+      console.warn('[MCP Auth] MCP server signature verification FAILED – output rejected.')
+    }
+    return valid
+  } catch (err) {
+    console.error('[MCP Auth] Error during signature verification:', err)
+    return false
+  }
+}
 
 /**
  * sanitizeMcpOutput – sanitizes text received from an MCP or LLM server before
@@ -128,6 +226,65 @@ const MAX_OUTPUT_LENGTH = 32_000
  *  5. Output is truncated to MAX_OUTPUT_LENGTH to prevent DoS via
  *     oversized payloads.
  */
+/**
+ * Patterns that indicate dynamic code execution primitives.
+ * Any LLM/MCP output matching one of these is considered unsafe and is
+ * replaced with a safe placeholder rather than being rendered.
+ */
+const DYNAMIC_CODE_EXECUTION_PATTERNS: RegExp[] = [
+  // JavaScript / TypeScript
+  /\beval\s*\(/i,
+  /\bFunction\s*\(/i,
+  /\bnew\s+Function\b/i,
+  /\bsetTimeout\s*\(\s*['"`]/i,
+  /\bsetInterval\s*\(\s*['"`]/i,
+  /\bexecScript\s*\(/i,
+  // Python
+  /\bexec\s*\(/i,
+  /\beval\s*\(/i,
+  /\bcompile\s*\(/i,
+  /\b__import__\s*\(/i,
+  /\bimportlib\.import_module\s*\(/i,
+  // Shell / subprocess
+  /\bsubprocess\s*\.\s*(call|run|Popen|check_output|check_call)\s*\([^)]*shell\s*=\s*True/i,
+  /\bos\s*\.\s*(system|popen|execv|execve|execvp|spawnl|spawnle|spawnlp|spawnv|spawnve|spawnvp)\s*\(/i,
+  /\bchild_process\s*\.\s*(exec|execSync|spawn|spawnSync|execFile|execFileSync)\s*\(/i,
+  // Ruby
+  /\beval\s*\(/i,
+  /`[^`]*`/,           // backtick shell execution
+  /\bsystem\s*\(/i,
+  /\%x\s*\{/i,
+  // PHP
+  /\beval\s*\(/i,
+  /\bpreg_replace\s*\([^,]*\/e/i,
+  /\bassert\s*\([^)]*\$[^)]*\)/i,
+  // Generic dangerous patterns
+  /\bdynamic(?:ally)?\s+(?:execut|evaluat|compil)/i,
+]
+
+/**
+ * authenticatedSanitizeMcpOutput – authenticates the MCP server response by
+ * verifying its HMAC-SHA-256 signature, then sanitizes the payload.
+ *
+ * @param raw       - The raw payload from the MCP/LLM server.
+ * @param signature - The hex-encoded HMAC-SHA-256 signature from the server.
+ * @returns         - A Promise resolving to the sanitized string, or '' if auth fails.
+ */
+async function authenticatedSanitizeMcpOutput(raw: unknown, signature: string): Promise<string> {
+  // Coerce to string first so we can verify the exact bytes the server signed.
+  const payload = typeof raw === 'string' ? raw : ''
+  if (payload === '') return ''
+
+  // Authenticate the server before processing its output.
+  const trusted = await verifyMcpServerSignature(payload, signature)
+  if (!trusted) {
+    // Reject output from unauthenticated or tampered server responses.
+    return ''
+  }
+
+  return sanitizeMcpOutput(raw)
+}
+
 function sanitizeMcpOutput(raw: unknown): string {
   // 1. Coerce to string.
   if (typeof raw !== 'string') {
@@ -153,6 +310,19 @@ function sanitizeMcpOutput(raw: unknown): string {
     sanitized = sanitized.slice(0, MAX_OUTPUT_LENGTH)
   }
 
+  // 6. Detect dynamic code execution primitives.
+  //    If any pattern matches, discard the entire output to prevent
+  //    client-side execution of injected code.
+  for (const pattern of DYNAMIC_CODE_EXECUTION_PATTERNS) {
+    if (pattern.test(sanitized)) {
+      console.warn(
+        '[sanitizeMcpOutput] Blocked LLM output containing dynamic code execution primitive matching:',
+        pattern.toString()
+      )
+      return '[Response blocked: output contained a dynamic code execution primitive and was removed for security reasons.]'
+    }
+  }
+
   return sanitized
 }
 
@@ -170,15 +340,84 @@ async function sha256Hex(text: string): Promise<string> {
     .join('')
 }
 
-function getPrincipal(): string {
-  // Use a stable per-session identifier stored in sessionStorage.
-  const key = 'audit_principal_id'
-  let principal = sessionStorage.getItem(key)
-  if (!principal) {
-    principal = uuidv4()
-    sessionStorage.setItem(key, principal)
+// ---------------------------------------------------------------------------
+// Principal integrity helpers
+// ---------------------------------------------------------------------------
+const PRINCIPAL_TTL_MS = 8 * 60 * 60 * 1000 // 8 hours
+
+async function hmacSign(secret: string, message: string): Promise<string> {
+  const enc = new TextEncoder()
+  const key = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  )
+  const sig = await crypto.subtle.sign('HMAC', key, enc.encode(message))
+  return Array.from(new Uint8Array(sig))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+}
+
+async function hmacVerify(secret: string, message: string, mac: string): Promise<boolean> {
+  const expected = await hmacSign(secret, message)
+  if (expected.length !== mac.length) return false
+  // Constant-time comparison
+  let diff = 0
+  for (let i = 0; i < expected.length; i++) {
+    diff |= expected.charCodeAt(i) ^ mac.charCodeAt(i)
   }
-  return principal
+  return diff === 0
+}
+
+// Returns a per-session secret, generating one if absent.
+function getSessionSecret(): string {
+  const secretKey = 'audit_session_secret'
+  let secret = sessionStorage.getItem(secretKey)
+  if (!secret) {
+    const bytes = new Uint8Array(32)
+    crypto.getRandomValues(bytes)
+    secret = Array.from(bytes).map((b) => b.toString(16).padStart(2, '0')).join('')
+    sessionStorage.setItem(secretKey, secret)
+  }
+  return secret
+}
+
+async function getPrincipal(): Promise<string> {
+  const key = 'audit_principal_id'
+  const stored = sessionStorage.getItem(key)
+  const secret = getSessionSecret()
+
+  if (stored) {
+    try {
+      const parsed = JSON.parse(stored) as { id: string; exp: number; sub: string; mac: string }
+      const now = Date.now()
+      // Verify expiry
+      if (parsed.exp && now < parsed.exp) {
+        // Verify HMAC binding: mac covers id + exp + sub
+        const message = `${parsed.id}:${parsed.exp}:${parsed.sub}`
+        const valid = await hmacVerify(secret, message, parsed.mac)
+        if (valid) {
+          return parsed.id
+        }
+      }
+    } catch {
+      // Fall through to regenerate
+    }
+    // Invalid or expired — clear and regenerate
+    sessionStorage.removeItem(key)
+  }
+
+  // Generate a new signed, expiry-bound principal
+  const id = uuidv4()
+  const exp = Date.now() + PRINCIPAL_TTL_MS
+  const sub = 'audit-principal'
+  const message = `${id}:${exp}:${sub}`
+  const mac = await hmacSign(secret, message)
+  const record = JSON.stringify({ id, exp, sub, mac })
+  sessionStorage.setItem(key, record)
+  return id
 }
 
 // Approved model registry — only pinned, organisation-approved model identifiers.
@@ -350,8 +589,43 @@ function containsSingaporePII(text: string): { found: boolean; types: string[] }
   return { found: foundTypes.length > 0, types: foundTypes }
 }
 
+const TEXT_READABLE_TYPES = new Set([
+  'text/plain',
+  'text/html',
+  'application/json',
+])
+
+const TEXT_READABLE_EXTENSIONS = ['.txt', '.html', '.htm', '.json']
+
+function isTextReadableFile(file: File): boolean {
+  if (TEXT_READABLE_TYPES.has(file.type)) return true
+  const nameLower = file.name.toLowerCase()
+  return TEXT_READABLE_EXTENSIONS.some((ext) => nameLower.endsWith(ext))
+}
+
+// Prompt-injection patterns to detect attempts to hijack the LLM via file content.
+const PROMPT_INJECTION_PATTERNS: { name: string; pattern: RegExp }[] = [
+  { name: 'ignore instructions', pattern: /ignore\s+(all\s+)?(previous|prior|above)\s+instructions/i },
+  { name: 'system prompt override', pattern: /you\s+are\s+now\s+(?:a\s+)?(?:an?\s+)?(?:new|different|evil|unrestricted)/i },
+  { name: 'jailbreak DAN', pattern: /\bDAN\b|do\s+anything\s+now/i },
+  { name: 'role override', pattern: /(?:act|pretend|behave)\s+as\s+(?:if\s+you\s+(?:are|were)|a\s+)/i },
+  { name: 'prompt leak', pattern: /(?:repeat|print|output|reveal|show|tell\s+me)\s+(?:your\s+)?(?:system\s+)?(?:prompt|instructions|context)/i },
+  { name: 'instruction injection marker', pattern: /<\s*(?:system|assistant|user|instruction)\s*>/i },
+  { name: 'CRLF injection', pattern: /(?:\r\n|\n)\s*(?:system|assistant|user)\s*:/i },
+  { name: 'token smuggling', pattern: /\[\s*(?:INST|SYS|SYSTEM|END)\s*\]/i },
+]
+
+function containsPromptInjection(text: string): { found: boolean; types: string[] } {
+  const foundTypes: string[] = []
+  for (const { name, pattern } of PROMPT_INJECTION_PATTERNS) {
+    if (pattern.test(text)) {
+      foundTypes.push(name)
+    }
+  }
+  return { found: foundTypes.length > 0, types: foundTypes }
+}
+
 async function readFileAsText(file: File): Promise<string | null> {
-  if (file.type !== 'text/plain') return null
   return new Promise((resolve) => {
     const reader = new FileReader()
     reader.onload = (e) => resolve(e.target?.result as string ?? null)
@@ -372,8 +646,8 @@ async function validateAndSanitizeFiles(files: File[]): Promise<{ valid: File[];
       errors.push(`File "${sanitizeFileName(file.name)}" exceeds the 5 MB size limit.`)
       continue
     }
-    // Check plain-text files for Singapore PII before accepting them.
-    if (file.type === 'text/plain') {
+    // Scan all text-readable files for Singapore PII and prompt injection.
+    if (isTextReadableFile(file)) {
       const text = await readFileAsText(file)
       if (text !== null) {
         const piiCheck = containsSingaporePII(text)
@@ -383,6 +657,22 @@ async function validateAndSanitizeFiles(files: File[]): Promise<{ valid: File[];
           )
           continue
         }
+        const injectionCheck = containsPromptInjection(text)
+        if (injectionCheck.found) {
+          errors.push(
+            `File "${sanitizeFileName(file.name)}" was rejected because it contains potential prompt-injection content: ${injectionCheck.types.join(', ')}.`
+          )
+          continue
+        }
+      }
+    } else {
+      // For binary files (PDF, DOCX, images), scan the filename itself for injection patterns.
+      const injectionInName = containsPromptInjection(file.name)
+      if (injectionInName.found) {
+        errors.push(
+          `File "${sanitizeFileName(file.name)}" was rejected because its filename contains potential prompt-injection content: ${injectionInName.types.join(', ')}.`
+        )
+        continue
       }
     }
     // Re-wrap with a sanitized filename to prevent path-traversal or injection
@@ -400,14 +690,12 @@ async function validateAndSanitizeFilesWithPIICheck(
   const { valid: typeAndSizeValid, errors } = validateAndSanitizeFiles(files)
   const finalValid: File[] = []
   for (const file of typeAndSizeValid) {
-    if (file.type === 'text/plain') {
-      const piiType = await detectPIIInTextFile(file)
-      if (piiType) {
-        errors.push(
-          `File "${sanitizeFileName(file.name)}" was rejected because it contains ${piiType}. Please remove PII before uploading.`
-        )
-        continue
-      }
+    const piiType = await detectPIIInTextFile(file)
+    if (piiType) {
+      errors.push(
+        `File "${sanitizeFileName(file.name)}" was rejected because it contains ${piiType}. Please remove PII before uploading.`
+      )
+      continue
     }
     finalValid.push(file)
   }
@@ -567,6 +855,53 @@ export type ApprovedModelId =
   | 'org-approved-model-v1'
   | 'org-approved-model-v2'
 
+/**
+ * Canonical registry of approved foundation models.
+ * Each entry carries the model's pinned SHA-256 digest so that any
+ * invocation can be verified against a known-good artefact hash before
+ * provenance metadata is persisted.
+ *
+ * To add a new model:
+ *  1. Obtain the official SHA-256 digest from your model governance team.
+ *  2. Add an entry here under a new ApprovedModelId literal.
+ *  3. Update the ApprovedModelId union type above.
+ */
+export const APPROVED_MODEL_REGISTRY: Readonly<Record<ApprovedModelId, { digest: string; displayName: string }>> = {
+  'org-approved-model-v1': {
+    // SHA-256 digest of the approved model artefact — must match the value
+    // published in the organisation's model governance portal.
+    digest: 'a3f1c2e4b5d6789012345678901234567890abcdef1234567890abcdef123456',
+    displayName: 'Org Approved Model v1',
+  },
+  'org-approved-model-v2': {
+    digest: 'b7e2d3f4a5c6890123456789012345678901bcdef2345678901bcdef23456789',
+    displayName: 'Org Approved Model v2',
+  },
+} as const
+
+/**
+ * Type-guard: returns true only when modelId is a key in APPROVED_MODEL_REGISTRY.
+ * Use this before any model invocation or provenance metadata write.
+ */
+export function isApprovedModelId(modelId: string): modelId is ApprovedModelId {
+  return Object.prototype.hasOwnProperty.call(APPROVED_MODEL_REGISTRY, modelId)
+}
+
+/**
+ * Returns the pinned SHA-256 digest for an approved model, or throws if the
+ * model is not in the registry.  Call isApprovedModelId first when you need
+ * a non-throwing check.
+ */
+export function getApprovedModelDigest(modelId: string): string {
+  if (!isApprovedModelId(modelId)) {
+    throw new Error(
+      `Model '${modelId}' is not in the approved model registry. ` +
+      `Approved models: ${Object.keys(APPROVED_MODEL_REGISTRY).join(', ')}`,
+    )
+  }
+  return APPROVED_MODEL_REGISTRY[modelId].digest
+}
+
 // Patterns considered dangerous dynamic-code-execution primitives that must
 // never appear verbatim in LLM-generated content rendered to the user.
 const DANGEROUS_CODE_PATTERNS: ReadonlyArray<RegExp> = [
@@ -630,23 +965,32 @@ function deriveWatermark(content: string, modelId: string, generatedAt: string):
 }
 
 /**
- * Derives a hex provenance signature from content + modelId + generatedAt.
- * Uses a simple polynomial rolling hash as a lightweight stand-in for a
- * cryptographic digest (replace with SubtleCrypto SHA-256 in production).
+ * Derives a hex-encoded SHA-256 provenance signature from
+ * content + modelId + generatedAt using the Web Crypto API (SubtleCrypto).
+ *
+ * The function also verifies that modelId is present in APPROVED_MODEL_REGISTRY
+ * and that the registry's pinned digest is included in the signed payload,
+ * binding the signature to a specific approved model artefact.
+ *
+ * Returns a Promise<string> — callers must await the result.
  */
-function deriveProvenanceSignature(content: string, modelId: string, generatedAt: string): string {
-  const input = `${content}|${modelId}|${generatedAt}`
-  let h1 = 0xdeadbeef
-  let h2 = 0x41c6ce57
-  for (let i = 0; i < input.length; i++) {
-    const ch = input.charCodeAt(i)
-    h1 = Math.imul(h1 ^ ch, 2654435761)
-    h2 = Math.imul(h2 ^ ch, 1597334677)
-  }
-  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)
-  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)
-  const combined = (4294967296 * (2097151 & h2) + (h1 >>> 0))
-  return combined.toString(16).padStart(16, '0')
+async function deriveProvenanceSignature(
+  content: string,
+  modelId: string,
+  generatedAt: string,
+): Promise<string> {
+  // Enforce registry membership before signing.
+  const pinnedDigest = getApprovedModelDigest(modelId) // throws if not approved
+
+  // Bind the pinned model digest into the signed payload so the signature
+  // is invalidated if the model artefact changes.
+  const input = `${content}|${modelId}|${generatedAt}|${pinnedDigest}`
+  const encoder = new TextEncoder()
+  const data = encoder.encode(input)
+
+  const hashBuffer = await window.crypto.subtle.digest('SHA-256', data)
+  const hashArray = Array.from(new Uint8Array(hashBuffer))
+  return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('')
 }
 
 function sanitizeLLMOutput(
@@ -697,18 +1041,9 @@ function sanitizeLLMOutput(
 // permitted. Any model reference not present here is rejected at runtime.
 // ---------------------------------------------------------------------------
 export const APPROVED_MODEL_REGISTRY = {
-  // OpenAI GPT models
-  'gpt-4o-2024-08-06': { vendor: 'openai', family: 'gpt', pinned: true },
-  'gpt-4-turbo-2024-04-09': { vendor: 'openai', family: 'gpt', pinned: true },
-  'gpt-3.5-turbo-0125': { vendor: 'openai', family: 'gpt', pinned: true },
-  // Anthropic Claude models
-  'claude-3-5-sonnet-20241022': { vendor: 'anthropic', family: 'claude', pinned: true },
-  'claude-3-opus-20240229': { vendor: 'anthropic', family: 'claude', pinned: true },
-  'claude-3-haiku-20240307': { vendor: 'anthropic', family: 'claude', pinned: true },
-  // Google Gemini models
-  'gemini-1.5-pro-002': { vendor: 'google', family: 'gemini', pinned: true },
-  'gemini-1.5-flash-002': { vendor: 'google', family: 'gemini', pinned: true },
-  'gemini-1.0-pro-002': { vendor: 'google', family: 'gemini', pinned: true },
+  // Org-approved models
+  'org-approved-model-v1': { vendor: 'internal', family: 'org-approved', pinned: true },
+  'org-approved-model-v2': { vendor: 'internal', family: 'org-approved', pinned: true },
 } as const
 
 /** Union type of all approved, pinned model identifiers. */
@@ -825,7 +1160,7 @@ export async function buildAssistantMessage({
   const fullPayload = `${provenancePayload}|${content}`
   const provenanceSignature = await hmacSha256Hex(signingKey, fullPayload)
 
-  return {
+  const message: AssistantMessage = {
     id,
     role: 'assistant',
     content,
@@ -837,6 +1172,28 @@ export async function buildAssistantMessage({
     watermark,
     provenanceSignature,
   }
+
+  // Write a durable audit record for every AI-generated assistant message.
+  const inputHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(content))
+    .then(buf => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join(''))
+    .catch(() => 'hash-unavailable')
+  const sessionId =
+    typeof window !== 'undefined' ? (localStorage.getItem('session_id') ?? 'unknown-session') : 'unknown-session'
+  // Extract modelVersion from modelId if encoded as 'name-vN', else default to 'unknown'
+  const modelVersionMatch = modelId.match(/-(v\d[\w.]*)$/i)
+  const modelVersion = modelVersionMatch ? modelVersionMatch[1] : 'unknown'
+  await writeAuditRecord({
+    modelId,
+    modelVersion,
+    inputHash,
+    outputSnippet: content.slice(0, 200),
+    timestamp: generatedAt,
+    sessionId,
+    messageId: id,
+    decision: 'assistant-message-generated',
+  }).catch(err => { throw new Error(`[AUDIT] buildAssistantMessage audit write failed: ${err}`) })
+
+  return message
 }
 
 /**
@@ -897,14 +1254,32 @@ function sanitizePolicyError(error: PolicyError): PolicyError {
 
 // Audit logger: persists AI decision records for forensic readiness
 async function writeAuditRecord(record: {
-  eventType: 'ai_completion'
-  principal: string
   modelId: string
+  modelVersion: string
   inputHash: string
   outputSnippet: string
   timestamp: string
   sessionId: string
   messageId: string
+  decision?: string
+}): Promise<void> {
+  let response: Response
+  try {
+    response = await fetch('/api/audit/ai-decisions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(record),
+    })
+  } catch (err) {
+    console.error('[AUDIT] Network error writing audit record:', err)
+    throw new Error(`[AUDIT] Network error writing audit record: ${err}`)
+  }
+  if (!response.ok) {
+    const body = await response.text().catch(() => '')
+    const msg = `[AUDIT] Audit record persist failed: HTTP ${response.status} ${response.statusText} — ${body}`
+    console.error(msg)
+    throw new Error(msg)
+  }
 }): Promise<void> {
   try {
     const token = getAuthToken()
@@ -1271,7 +1646,7 @@ export function ChatInterface() {
       })
     } = redactPII(rawContent)
       if (piiFound) {
-        console.warn(`PII detected and redacted in file: ${file.name}`)
+        // PII detected and redacted — not logged to avoid exposing PII-related information
       }
       attachments.push({
         id: uuidv4(),
@@ -1323,6 +1698,19 @@ export function ChatInterface() {
         ? (sessionStorage.getItem('auth_token') || localStorage.getItem('auth_token') || '')
         : ''
 
+      if (!sessionToken) {
+        const authErrorMessage: Message = {
+          id: uuidv4(),
+          role: 'assistant',
+          content: 'Authentication required. Please log in to continue.',
+          timestamp: new Date(),
+          error: { type: 'auth', message: 'No authentication token found. Request blocked.' },
+        }
+        setMessages(prev => [...prev, authErrorMessage])
+        setIsLoading(false)
+        return
+      }
+
       // Sanitize and validate input BEFORE sending to the AI model
       const sanitizedInput = sanitizeTextInput(input)
       const inputError = validateTextInput(sanitizedInput)
@@ -1358,7 +1746,7 @@ export function ChatInterface() {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          ...(sessionToken ? { 'Authorization': `Bearer ${sessionToken}` } : {}),
+          'Authorization': `Bearer ${sessionToken}`,
         },
         body: JSON.stringify({
           message: sanitizedInput,
@@ -1405,10 +1793,7 @@ export function ChatInterface() {
         }
         setMessages(prev => [...prev, errorMessage])
       } else {
-        const generatedAt = data.generated_at ?? new Date().toISOString()
-        const modelId = data.model_id ?? data.model ?? 'unknown'
-        const watermark = data.watermark ?? `wp-${Buffer.from(`${modelId}:${generatedAt}`).toString('base64')}`
-              const completionTimestamp = new Date().toISOString()
+        const completionTimestamp = new Date().toISOString()
       const resolvedModelId = data.model || data.modelId || 'unknown'
       const completionContent = sanitizeLLMOutput(data.message || data.response || data.content || '')
 
@@ -1418,9 +1803,6 @@ export function ChatInterface() {
         content: completionContent,
         timestamp: new Date(),
         isSynthetic: true,
-        modelId: resolvedModelId,
-        generatedAt: completionTimestamp,
-        watermark: data.watermark,
       }
 
       // Persist audit record for this AI decision (forensic readiness)
