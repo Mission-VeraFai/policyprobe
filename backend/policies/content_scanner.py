@@ -24,6 +24,9 @@ from dataclasses import dataclass, field
 # Hidden-content sanitization & threat detection
 # ---------------------------------------------------------------------------
 
+# Approved LLM model identifier (organization registry)
+APPROVED_MODEL = "approved-llm-v1"  # Replace with the exact approved model name from the org registry
+
 # Patterns that indicate prompt-injection / instruction-override attempts
 _INJECTION_PATTERNS: List[re.Pattern] = [
     re.compile(r'ignore\s+(all\s+)?(previous|prior|above)\s+instructions?', re.IGNORECASE),
@@ -40,6 +43,46 @@ _INJECTION_PATTERNS: List[re.Pattern] = [
 
 # Control / non-printable characters that should not appear in document text
 _CONTROL_CHAR_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]')
+
+
+# ---------------------------------------------------------------------------
+# Audit logging helpers
+# ---------------------------------------------------------------------------
+import hashlib
+import json
+import uuid
+import datetime
+
+_AUDIT_LOGGER = logging.getLogger(__name__ + ".audit")
+_SCANNER_ID = "content_scanner"
+_SCANNER_VERSION = "1.0.0"
+_RETENTION_POLICY = "7-years-security-audit"
+
+
+def _emit_audit_record(event: str, source: str, details: object, input_hash: str, trace_id: str) -> None:
+    """
+    Emit a structured JSON audit record to the dedicated audit logger.
+    Wraps all I/O in try/except so a logging failure never silently
+    swallows the upstream security exception.
+    """
+    record = {
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "trace_id": trace_id,
+        "event": event,
+        "source": source,
+        "scanner_id": _SCANNER_ID,
+        "scanner_version": _SCANNER_VERSION,
+        "input_sha256": input_hash,
+        "principal": "system",  # replace with authenticated principal when available
+        "retention_policy": _RETENTION_POLICY,
+        "details": details,
+    }
+    try:
+        _AUDIT_LOGGER.warning(json.dumps(record))
+    except Exception as log_exc:  # pragma: no cover
+        # Last-resort: write to stderr so the audit record is never lost
+        import sys
+        print(f"[AUDIT_LOG_FAILURE] {log_exc} | record={record}", file=sys.stderr)
 
 
 def sanitize_extracted_content(content: str, source: str = 'hidden_content') -> str:
@@ -60,6 +103,10 @@ def sanitize_extracted_content(content: str, source: str = 'hidden_content') -> 
     if not content:
         return content
 
+    # Generate a per-invocation correlation/trace ID and input hash
+    trace_id = str(uuid.uuid4())
+    input_hash = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+
     # Step 1 — remove dangerous control characters
     cleaned = _CONTROL_CHAR_RE.sub('', content)
 
@@ -70,11 +117,12 @@ def sanitize_extracted_content(content: str, source: str = 'hidden_content') -> 
             injection_hits.append(pattern.pattern)
 
     if injection_hits:
-        logger.warning(
-            "THREAT_BLOCK [%s]: prompt-injection pattern(s) detected in "
-            "extracted hidden content: %s",
-            source,
-            injection_hits,
+        _emit_audit_record(
+            event="THREAT_BLOCK",
+            source=source,
+            details={"reason": "prompt_injection", "matched_patterns": injection_hits},
+            input_hash=input_hash,
+            trace_id=trace_id,
         )
         raise ValueError(
             f"Security violation: prompt-injection content detected in "
@@ -83,9 +131,14 @@ def sanitize_extracted_content(content: str, source: str = 'hidden_content') -> 
 
     # Step 3 — PII detection (reuses existing helper)
     pii_violations = detect_singapore_pii(cleaned)
-    if pii_violations:
-        for v in pii_violations:
-            logger.warning("PII_BLOCK [%s]: %s", source, v)
+        if pii_violations:
+        _emit_audit_record(
+            event="PII_BLOCK",
+            source=source,
+            details={"reason": "pii_detected", "violations": list(pii_violations)},
+            input_hash=input_hash,
+            trace_id=trace_id,
+        )
         raise ValueError(
             f"Security violation: PII detected in {source} — "
             f"content blocked before LLM invocation."
