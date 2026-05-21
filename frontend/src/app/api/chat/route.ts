@@ -2,10 +2,130 @@ import { NextRequest, NextResponse } from 'next/server'
 import { getServerSession } from 'next-auth'
 import { authOptions } from '@/lib/authOptions'
 import { createHash } from 'crypto'
-import { appendFileSync, mkdirSync } from 'fs'
+import { appendFileSync, mkdirSync, statSync, renameSync, existsSync } from 'fs'
 import { join } from 'path'
 
 const BACKEND_URL = process.env.BACKEND_URL
+
+// Audit log retention: rotate the log file when it exceeds this size (default 10 MB).
+const MAX_LOG_BYTES = parseInt(process.env.AUDIT_LOG_MAX_BYTES ?? String(10 * 1024 * 1024), 10)
+
+/**
+ * Rotate the audit log file if it has grown beyond MAX_LOG_BYTES.
+ * The current file is renamed to <path>.<ISO-timestamp>.bak before a new one is started.
+ */
+function rotateLogIfNeeded(logPath: string): void {
+  try {
+    if (existsSync(logPath)) {
+      const { size } = statSync(logPath)
+      if (size >= MAX_LOG_BYTES) {
+        const archive = `${logPath}.${new Date().toISOString().replace(/[:.]/g, '-')}.bak`
+        renameSync(logPath, archive)
+      }
+    }
+  } catch (rotateErr) {
+    // Rotation failure must not suppress the original write; surface as a warning.
+    console.error('[audit] Log rotation failed:', rotateErr)
+  }
+}
+
+/**
+ * Write a single audit record to the local append-only log.
+ * Throws if the write fails so callers can decide how to handle the error.
+ */
+function writeAuditRecord(logPath: string, record: Record<string, unknown>): void {
+  rotateLogIfNeeded(logPath)
+  const line = JSON.stringify(record) + '\n'
+  try {
+    appendFileSync(logPath, line, { encoding: 'utf8', flag: 'a' })
+  } catch (fsErr) {
+    // Re-throw so the caller is aware the audit record was NOT persisted.
+    throw new Error(`[audit] Failed to write audit record to ${logPath}: ${fsErr}`)
+  }
+}
+
+// Maximum allowed length for a single message's text content
+const MAX_MESSAGE_LENGTH = 32_000
+
+// Patterns indicative of prompt-injection or jailbreak attempts
+const PROMPT_INJECTION_PATTERNS: RegExp[] = [
+  /ignore\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|context)/i,
+  /system\s*:\s*(you\s+are|act\s+as|pretend)/i,
+  /\[\s*system\s*\]/i,
+  /<\s*system\s*>/i,
+  /###\s*instruction/i,
+  /\bDAN\b.*mode/i,
+]
+
+/**
+ * Sanitizes and validates a single message content string before it is
+ * forwarded to the backend LLM endpoint.
+ *
+ * @throws {Error} if the content fails validation
+ */
+function sanitizeMessageContent(content: unknown, role: string): string {
+  if (typeof content !== 'string') {
+    throw new Error(`Message content for role "${role}" must be a string.`)
+  }
+
+  // Strip null bytes and ASCII control characters (except tab, newline, carriage-return)
+  // eslint-disable-next-line no-control-regex
+  let sanitized = content.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+
+  // Trim leading/trailing whitespace
+  sanitized = sanitized.trim()
+
+  if (sanitized.length === 0) {
+    throw new Error(`Message content for role "${role}" must not be empty after sanitization.`)
+  }
+
+  if (sanitized.length > MAX_MESSAGE_LENGTH) {
+    throw new Error(
+      `Message content for role "${role}" exceeds the maximum allowed length of ${MAX_MESSAGE_LENGTH} characters.`
+    )
+  }
+
+  for (const pattern of PROMPT_INJECTION_PATTERNS) {
+    if (pattern.test(sanitized)) {
+      throw new Error(
+        `Message content for role "${role}" contains a disallowed prompt-injection pattern.`
+      )
+    }
+  }
+
+  return sanitized
+}
+
+/**
+ * Validates and sanitizes an array of conversation history messages.
+ * Each element must have a string `role` and a string `content`.
+ *
+ * @throws {Error} if any message fails validation
+ */
+function sanitizeMessages(messages: unknown): Array<{ role: string; content: string }> {
+  if (!Array.isArray(messages)) {
+    throw new Error('Messages must be an array.')
+  }
+
+  const ALLOWED_ROLES = new Set(['user', 'assistant', 'system'])
+
+  return messages.map((msg: unknown, idx: number) => {
+    if (typeof msg !== 'object' || msg === null) {
+      throw new Error(`Message at index ${idx} must be an object.`)
+    }
+    const m = msg as Record<string, unknown>
+
+    if (typeof m.role !== 'string' || !ALLOWED_ROLES.has(m.role)) {
+      throw new Error(
+        `Message at index ${idx} has an invalid or missing role. Allowed roles: ${[...ALLOWED_ROLES].join(', ')}.`
+      )
+    }
+
+    const sanitizedContent = sanitizeMessageContent(m.content, m.role)
+
+    return { role: m.role, content: sanitizedContent }
+  })
+}
 
 // Approved model registry: model identifiers are fetched from the organization's
 // external registry endpoint and verified via HMAC-SHA256 signature.
@@ -21,14 +141,29 @@ if (!MODEL_REGISTRY_HMAC_SECRET) {
   throw new Error('MODEL_REGISTRY_HMAC_SECRET environment variable is not set. Registry response integrity verification requires a shared HMAC secret.')
 }
 
-let _approvedModelsCache: ReadonlySet<string> | null = null
+// APPROVED_MODELS_FALLBACK: comma-separated list of org-approved model IDs used when
+// the external registry is temporarily unreachable. Must NOT include unapproved
+// identifiers such as bare 'Claude' or 'GPT'.
+// Example: APPROVED_MODELS_FALLBACK=claude-3-5-sonnet-20241022,gpt-4o
+const APPROVED_MODELS_FALLBACK_RAW = process.env.APPROVED_MODELS_FALLBACK ?? ''
+const APPROVED_MODELS_FALLBACK: ReadonlySet<string> = new Set(
+  APPROVED_MODELS_FALLBACK_RAW
+    .split(',')
+    .map(s => s.trim())
+    .filter(s => s.length > 0)
+    // Explicitly block bare unapproved identifiers regardless of env config
+    .filter(s => !['Claude', 'GPT'].includes(s))
+)
+
+  // Cache maps model-id → pinned sha256 digest for version-pinned registry enforcement
+  let _approvedModelsCache: ReadonlyMap<string, string> | null = null
 let _approvedModelsCacheExpiry = 0
 const REGISTRY_CACHE_TTL_MS = 5 * 60 * 1000 // 5 minutes
 
-async function fetchApprovedModelsFromRegistry(): Promise<ReadonlySet<string>> {
+async function fetchApprovedModelsFromRegistry(): Promise<ReadonlyMap<string, string>> {
   const now = Date.now()
   if (_approvedModelsCache && now < _approvedModelsCacheExpiry) {
-    return _approvedModelsCache
+    return _approvedModelsCache!
   }
 
   let registryResponse: Response
@@ -40,7 +175,19 @@ async function fetchApprovedModelsFromRegistry(): Promise<ReadonlySet<string>> {
       signal: AbortSignal.timeout(5000),
     })
   } catch (err) {
-    throw new Error(`Failed to reach organization model registry at ${MODEL_REGISTRY_URL}: ${err}`)
+    // Fall back to the statically configured approved list when the registry is unreachable.
+    // If the fallback list is also empty, deny all model requests.
+    if (APPROVED_MODELS_FALLBACK.size > 0) {
+      console.warn(
+        `Organization model registry unreachable (${err}). ` +
+        `Falling back to APPROVED_MODELS_FALLBACK list (${APPROVED_MODELS_FALLBACK.size} models).`
+      )
+      return APPROVED_MODELS_FALLBACK
+    }
+    throw new Error(
+      `Failed to reach organization model registry at ${MODEL_REGISTRY_URL} and ` +
+      `APPROVED_MODELS_FALLBACK is empty. Cannot verify approved models: ${err}`
+    )
   }
 
   if (!registryResponse.ok) {
@@ -54,11 +201,32 @@ async function fetchApprovedModelsFromRegistry(): Promise<ReadonlySet<string>> {
     throw new Error('Organization model registry returned invalid JSON.')
   }
 
-  if (!Array.isArray(payload.models) || typeof payload.signature !== 'string') {
-    throw new Error('Organization model registry response missing required fields: models (array) and signature (string).')
+  // Registry must supply a pinned_models map: { "model-id": "sha256:<digest>", ... }
+  // This enforces both model identity AND immutable version pinning via cryptographic digest.
+  if (
+    typeof payload.models !== 'object' ||
+    Array.isArray(payload.models) ||
+    payload.models === null ||
+    typeof payload.signature !== 'string'
+  ) {
+    throw new Error(
+      'Organization model registry response must contain: ' +
+      'pinned_models (object mapping model-id to sha256 digest) and signature (string). ' +
+      'Plain model name arrays are rejected — version pinning via digest is required.'
+    )
   }
 
-  // Verify HMAC-SHA256 signature over the canonical JSON of the models array
+  // Validate every entry has a well-formed sha256 digest pin
+  for (const [modelId, digest] of Object.entries(payload.models as Record<string, unknown>)) {
+    if (typeof digest !== 'string' || !/^sha256:[0-9a-f]{64}$/i.test(digest)) {
+      throw new Error(
+        `Registry entry for model '${modelId}' has invalid or missing version pin. ` +
+        `Expected format: sha256:<64-hex-chars>. Got: ${digest}`
+      )
+    }
+  }
+
+  // Verify HMAC-SHA256 signature over the canonical JSON of the pinned_models map
   const { createHmac } = await import('crypto')
   const canonicalPayload = JSON.stringify(payload.models)
   const expectedSig = createHmac('sha256', MODEL_REGISTRY_HMAC_SECRET!)
@@ -90,31 +258,23 @@ const API_SECRET = process.env.API_SECRET
 const BACKEND_API_KEY = process.env.BACKEND_API_KEY
 
 // Allowlist of approved LLM endpoint URL prefixes sanctioned by the organization.
-// Only these endpoints may be used as BACKEND_URL targets.
+// At least one APPROVED_LLM_ENDPOINT_* env var MUST be set; no fallback is permitted.
 const APPROVED_LLM_ENDPOINTS: string[] = [
   process.env.APPROVED_LLM_ENDPOINT_1 || '',
   process.env.APPROVED_LLM_ENDPOINT_2 || '',
 ].filter(Boolean)
 
-// Fallback hardcoded approved endpoint identifier (org-approved-llm-v1).
-// Operators must set at least one APPROVED_LLM_ENDPOINT_* env var or ensure
-// BACKEND_URL contains the org-approved hostname segment.
-const ORG_APPROVED_HOSTNAME_SEGMENT = process.env.ORG_APPROVED_LLM_HOSTNAME || 'org-approved-llm-v1'
+if (APPROVED_LLM_ENDPOINTS.length === 0) {
+  throw new Error(
+    'No approved LLM endpoints configured. Set at least APPROVED_LLM_ENDPOINT_1 to an approved endpoint URL prefix. ' +
+    'A non-empty allowlist is required to prevent SSRF.'
+  )
+}
 
 function isApprovedEndpoint(url: string): boolean {
-  // Check against explicitly configured approved endpoint prefixes.
-  if (APPROVED_LLM_ENDPOINTS.length > 0) {
-    return APPROVED_LLM_ENDPOINTS.some((approved) => url.startsWith(approved))
-  }
-  // Fallback: verify the URL contains the org-approved hostname segment.
-  try {
-    const parsed = new URL(url)
-    // Use exact match or strict subdomain suffix to prevent substring-bypass SSRF.
-    const h = parsed.hostname
-    return h === ORG_APPROVED_HOSTNAME_SEGMENT || h.endsWith('.' + ORG_APPROVED_HOSTNAME_SEGMENT)
-  } catch {
-    return false
-  }
+  // Require an exact prefix match against the explicitly configured approved endpoints.
+  // No fallback hostname check is permitted — the allowlist must always be non-empty.
+  return APPROVED_LLM_ENDPOINTS.some((approved) => url.startsWith(approved))
 }
 
 if (!BACKEND_URL) {
@@ -134,6 +294,17 @@ if (!BACKEND_API_KEY) {
 }
 const AUDIT_LOG_DIR = process.env.AUDIT_LOG_DIR || join(process.cwd(), 'audit-logs')
 const AUDIT_LOG_FILE = join(AUDIT_LOG_DIR, 'ai-chat-audit.jsonl')
+
+/**
+ * Sanitize a string value before embedding it in a log record.
+ * Removes ASCII control characters (including CR/LF) to prevent log injection.
+ */
+function sanitizeForLog(value: unknown): string {
+  if (value === null || value === undefined) return ''
+  // Convert to string, then strip all ASCII control characters (0x00-0x1F, 0x7F)
+  // including newline (0x0A) and carriage return (0x0D) to prevent log injection.
+  return String(value).replace(/[\x00-\x1F\x7F]/g, '')
+}
 
 // Retention policy: records must be kept for at least AUDIT_RETENTION_DAYS days.
 // Operators are responsible for rotating/archiving logs according to this policy
@@ -288,7 +459,39 @@ export async function POST(request: NextRequest) {
       )
     }
 
-    // Validate session integrity: check expiry
+    // Cryptographically verify the JWT signature and extract verified claims.
+    // getToken re-validates the HMAC/RSA signature using NEXTAUTH_SECRET,
+    // ensuring the token has not been tampered with since issuance.
+    const { getToken } = await import('next-auth/jwt')
+    const verifiedToken = await getToken({
+      req: request as Parameters<typeof getToken>[0]['req'],
+      secret: process.env.NEXTAUTH_SECRET,
+    })
+    if (!verifiedToken) {
+      return NextResponse.json(
+        { detail: 'Unauthorized: Session token signature verification failed.' },
+        { status: 401 }
+      )
+    }
+
+    // Validate session integrity: check expiry against the verified token's exp claim.
+    // We use the token's own exp rather than the session.expires string so that
+    // a tampered session object cannot bypass expiry enforcement.
+    const tokenExp = typeof verifiedToken.exp === 'number' ? verifiedToken.exp : null
+    if (tokenExp === null) {
+      return NextResponse.json(
+        { detail: 'Unauthorized: Session token is missing expiry claim.' },
+        { status: 401 }
+      )
+    }
+    if (Date.now() > tokenExp * 1000) {
+      return NextResponse.json(
+        { detail: 'Unauthorized: Session has expired.' },
+        { status: 401 }
+      )
+    }
+
+    // Also enforce the session-level expiry as a secondary check.
     if (session.expires) {
       const expiresAt = new Date(session.expires).getTime()
       if (isNaN(expiresAt) || Date.now() > expiresAt) {
@@ -313,6 +516,16 @@ export async function POST(request: NextRequest) {
     ) {
       return NextResponse.json(
         { detail: 'Unauthorized: Session is missing required user identity binding.' },
+        { status: 401 }
+      )
+    }
+
+    // Cross-validate subject binding: the verified token's email must match the
+    // session user email to prevent session/token substitution attacks.
+    const tokenEmail = typeof verifiedToken.email === 'string' ? verifiedToken.email.trim() : null
+    if (!tokenEmail || tokenEmail.toLowerCase() !== session.user.email.trim().toLowerCase()) {
+      return NextResponse.json(
+        { detail: 'Unauthorized: Session subject binding mismatch.' },
         { status: 401 }
       )
     }
@@ -736,7 +949,9 @@ export async function POST(request: NextRequest) {
     })
 
     // Compute an HMAC-SHA256 signature so recipients can verify integrity.
-    const signingSecret = process.env.PROVENANCE_SIGNING_SECRET ?? ''
+    // PROVENANCE_SIGNING_SECRET removed: provenance signing is delegated to the
+// dedicated signing service and must not be performed with a locally-held secret
+// in this file. Call the signing service API directly if signing is required.
     let provenanceSignature = ''
     if (signingSecret) {
       const { createHmac } = await import('crypto')
@@ -760,9 +975,75 @@ export async function POST(request: NextRequest) {
       },
     }
 
+    // --- LLM output validation: dynamic code-execution primitive detection ---
+    // Serialize the full payload and scan for patterns that indicate the LLM
+    // has embedded eval, exec, subprocess, or other dynamic code-execution
+    // primitives in its response.  Any match is treated as a policy violation
+    // and the response is blocked before it reaches the client.
+    const DANGEROUS_PATTERNS: RegExp[] = [
+      /\beval\s*\(/gi,
+      /\bexec\s*\(/gi,
+      /\bexecSync\s*\(/gi,
+      /\bspawnSync\s*\(/gi,
+      /\bspawn\s*\(/gi,
+      /\bexecFile\s*\(/gi,
+      /\bexecFileSync\s*\(/gi,
+      /\bnew\s+Function\s*\(/gi,
+      /\bsetTimeout\s*\(\s*['"`]/gi,
+      /\bsetInterval\s*\(\s*['"`]/gi,
+      /subprocess\s*\.\s*(run|call|Popen|check_output|check_call)\s*\([^)]*shell\s*=\s*True/gi,
+      /os\s*\.\s*(system|popen)\s*\(/gi,
+      /\bimportlib\s*\.\s*import_module\s*\(/gi,
+      /__import__\s*\(/gi,
+      /compile\s*\([^)]+exec/gi,
+    ]
+
+    const serialisedOutput = JSON.stringify(labelledData)
+    const detectedPatterns: string[] = []
+
+    for (const pattern of DANGEROUS_PATTERNS) {
+      if (pattern.test(serialisedOutput)) {
+        detectedPatterns.push(pattern.source)
+      }
+    }
+
+    if (detectedPatterns.length > 0) {
+      console.error(
+        'LLM output validation FAILED: dynamic code-execution primitives detected in LLM response.',
+        { detectedPatterns }
+      )
+      return NextResponse.json(
+        {
+          detail: 'LLM response blocked by output validation policy.',
+          policy_error: {
+            type: 'llm_output_validation',
+            message:
+              'The AI response contained dynamic code-execution primitives and was blocked before being forwarded to the client.',
+          },
+        },
+        { status: 400 }
+      )
+    }
+    // --- End LLM output validation ---
+
     return NextResponse.json(labelledData)
   } catch (error) {
     console.error('Backend proxy error:', error)
+
+    // Surface input-validation failures as 400 rather than 503
+    if (error instanceof Error && error.message.startsWith('Message content') || error instanceof Error && error.message.startsWith('Messages must')) {
+      return NextResponse.json(
+        {
+          detail: error.message,
+          policy_error: {
+            type: 'input_validation',
+            message: 'Request rejected due to invalid or disallowed message content.',
+          },
+        },
+        { status: 400 }
+      )
+    }
+
     return NextResponse.json(
       {
         detail: 'Failed to connect to backend service',

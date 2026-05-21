@@ -62,9 +62,9 @@ async function redactSingaporePII(file: File): Promise<PIIRedactionResult> {
 
   if (!isTextReadable) {
     // Binary files (PDF, DOC, images) cannot be scanned or redacted client-side.
-    // Return isBinary=true so callers can send them for server-side redaction
-    // or substitute a placeholder instead of the original binary content.
-    return { redactedContent: null, redactedTypes: [], isBinary: true }
+    // Mark with 'binary:unscanned' so callers MUST explicitly handle the risk
+    // rather than silently forwarding unvalidated binary content to the AI model.
+    return { redactedContent: null, redactedTypes: ['binary:unscanned'], isBinary: true }
   }
 
   let content: string
@@ -73,6 +73,23 @@ async function redactSingaporePII(file: File): Promise<PIIRedactionResult> {
   } catch {
     return { redactedContent: '', redactedTypes: ['unreadable file'], isBinary: false }
   }
+
+  // --- Malicious-content / prompt-injection gate ---
+  // Check for hidden/invisible characters, base64-encoded instructions,
+  // leetspeak obfuscation, shell commands, and prompt-injection phrases
+  // BEFORE the content is forwarded to the AI agent.
+  for (const injectionPattern of PROMPT_INJECTION_PATTERNS) {
+    // Reset stateful patterns before testing
+    if (injectionPattern.global) injectionPattern.lastIndex = 0
+    if (injectionPattern.test(content)) {
+      return {
+        redactedContent: null,
+        redactedTypes: ['__INJECTION_BLOCKED__'],
+        isBinary: false,
+      }
+    }
+  }
+  // --- End malicious-content gate ---
 
   const redactedTypes: string[] = []
   let redacted = content
@@ -90,6 +107,20 @@ async function redactSingaporePII(file: File): Promise<PIIRedactionResult> {
     }
   }
 
+  // Check redacted text for prompt-injection / hidden instructions
+  for (const pattern of PROMPT_INJECTION_PATTERNS) {
+    if (pattern.test(redacted)) {
+      redactedTypes.push('prompt-injection')
+      // Scrub the injected instruction by replacing the matched span
+      const globalPat = new RegExp(
+        pattern.source,
+        pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g'
+      )
+      redacted = redacted.replace(globalPat, '[REDACTED:prompt-injection]')
+      break // one pass is enough to flag and sanitize
+    }
+  }
+
   return { redactedContent: redacted, redactedTypes, isBinary: false }
 }
 
@@ -97,8 +128,9 @@ async function redactSingaporePII(file: File): Promise<PIIRedactionResult> {
 async function containsSingaporePII(file: File): Promise<string | null> {
   const result = await redactSingaporePII(file)
   if (result.isBinary) {
-    // Binary files are forwarded for server-side redaction; not blocked
-    return null
+    // Binary files cannot be sanitized client-side; surface the sentinel so
+    // callers can block or explicitly warn the user instead of silently forwarding.
+    return 'binary:unscanned'
   }
   return result.redactedTypes.length > 0 ? result.redactedTypes[0] : null
 }

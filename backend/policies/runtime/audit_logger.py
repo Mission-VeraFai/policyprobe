@@ -27,16 +27,69 @@ _file_handler = TimedRotatingFileHandler(
     filename=_AUDIT_LOG_FILE,
     when="midnight",
     interval=1,
-    backupCount=90,          # retain 90 daily log files
+    backupCount=365,         # retain 365 daily log files (1-year minimum retention policy)
     encoding="utf-8",
     delay=False,
 )
+
+# Attempt to set append-only flag on the log file to prevent truncation/deletion.
+# This is a best-effort hardening step; failures are logged but do not abort startup.
+def _set_append_only(path: str) -> None:
+    """Set the append-only immutable flag on *path* using chattr (Linux only)."""
+    import subprocess
+    try:
+        subprocess.run(
+            ["chattr", "+a", path],
+            check=True,
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "audit_logger: could not set append-only flag on %s: %s",
+            path,
+            exc,
+        )
+
+_set_append_only(_AUDIT_LOG_FILE)
 _file_handler.setFormatter(logging.Formatter("%(message)s"))
 
 _audit_file_logger = logging.getLogger("unifai.audit.persistent")
 _audit_file_logger.setLevel(logging.DEBUG)
 _audit_file_logger.addHandler(_file_handler)
 _audit_file_logger.propagate = False  # do not bubble up to root logger
+
+
+class _AppendOnlyList(list):
+    """A list subclass that forbids operations which would remove or replace entries.
+
+    Only ``append`` and read operations are permitted, enforcing an append-only
+    guarantee on the in-memory audit event store.
+    """
+
+    _MUTATING_METHODS = (
+        "clear", "pop", "remove", "__delitem__", "__setitem__", "__iadd__",
+        "__imul__", "insert",  # insert could be used to overwrite via slice
+    )
+
+    def _raise(self, *_args: Any, **_kwargs: Any) -> None:  # type: ignore[override]
+        raise RuntimeError(
+            "Audit event log is append-only: destructive operations are not permitted."
+        )
+
+    clear = _raise  # type: ignore[assignment]
+    pop = _raise  # type: ignore[assignment]
+    remove = _raise  # type: ignore[assignment]
+
+    def __delitem__(self, key: Any) -> None:  # type: ignore[override]
+        raise RuntimeError(
+            "Audit event log is append-only: deletion is not permitted."
+        )
+
+    def __setitem__(self, key: Any, value: Any) -> None:  # type: ignore[override]
+        raise RuntimeError(
+            "Audit event log is append-only: item replacement is not permitted."
+        )
 
 
 class AuditLogger:
@@ -94,7 +147,7 @@ class AuditLogger:
         self._validate_model(resolved_model_id, resolved_model_version)
 
         # Append-only in-memory buffer (tuple-based to prevent mutation).
-        self.__events: list[dict] = []
+        self.__events: "_AppendOnlyList" = _AppendOnlyList()
         self._model_id: str = resolved_model_id
         self._model_version: str = resolved_model_version
 

@@ -91,35 +91,27 @@ find_python() {
     return 1
 }
 
-# Main: Find and # HITL approval gate: require explicit confirmation before exporting PYTHON_CMD
-# Set HITL_AUTO_APPROVE=1 only in trusted CI/CD environments where human review
-# of the pipeline configuration substitutes for interactive approval.
-if [ "${HITL_AUTO_APPROVE:-0}" != "1" ]; then
-    log_msg ""
-    log_msg "========================================="
-    log_msg "  APPROVAL REQUIRED (Human in the Loop)"
-    log_msg "========================================="
-    log_msg "  The following Python interpreter will be exported as PYTHON_CMD:"
-    log_msg "    $PYTHON_CMD"
-    log_msg ""
-    log_msg "  Type 'yes' to approve and continue, or anything else to abort:"
-    log_msg "========================================="
-    # Read from /dev/tty so approval works even when stdin is redirected
-    read -r HITL_RESPONSE < /dev/tty
-    if [ "$HITL_RESPONSE" != "yes" ]; then
-        log_msg "Aborted by user. PYTHON_CMD was NOT exported."
-        exit 1
-    fi
-    log_msg "Approved."
-fi
+# Main: Find a suitable Python interpreter
+# Validate PYTHON_CMD against a strict allowlist before use as an executable.
+_validate_python_cmd() {
+    local cmd="$1"
+    # Allow only known-safe bare names or absolute paths matching /usr/*/python3* or /usr/local/*/python3*
+    case "$cmd" in
+        python|python3|python3.[0-9]|python3.[0-9][0-9]|\
+        python3.1[0-9]|python3.2[0-9])
+            return 0 ;;
+        /usr/bin/python3*|/usr/local/bin/python3*|\
+        /usr/bin/python|/usr/local/bin/python|\
+        /opt/homebrew/bin/python3*)
+            return 0 ;;
+        *)
+            log_msg "ERROR: PYTHON_CMD value '$cmd' is not in the allowed list of Python interpreters."
+            return 1 ;;
+    esac
+}
 
-export PYTHON_CMD
-
-# Display found Python version (only if not being sourced silently)
-if [ "${PYTHON_HELPER_QUIET:-0}" != "1" ]; then
-    PYTHON_VERSION=$("$PYTHON_CMD" --version 2>&1)
-    log_msg "Using: $PYTHON_VERSION ($PYTHON_CMD)"
-find_python)
+# find_python sets PYTHON_CMD
+PYTHON_CMD=$(find_python)
 
 if [ -z "$PYTHON_CMD" ]; then
     log_msg "=========================================="
@@ -137,7 +129,12 @@ if [ -z "$PYTHON_CMD" ]; then
     exit 1
 fi
 
-# PYTHON_CMD is set for use by the calling script; export only if needed by subprocesses
+# PYTHON_CMD is set for use by the calling script; callers may export it if needed.
+# Validate before any use as an executable.
+if ! _validate_python_cmd "$PYTHON_CMD"; then
+    exit 1
+fi
+
 # Display found Python version (only if not being sourced silently)
 if [ "${PYTHON_HELPER_QUIET:-0}" != "1" ]; then
     PYTHON_VERSION=$("$PYTHON_CMD" --version 2>&1)

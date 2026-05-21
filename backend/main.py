@@ -80,7 +80,8 @@ def _create_signed_session_token(username: str) -> str:
     """
     random_id = secrets.token_hex(32)
     exp = int(time.time()) + SESSION_TTL_SECONDS
-    payload = f"{random_id}.{exp}"
+    # Include username in payload to bind the token to a specific subject
+    payload = f"{random_id}.{exp}.{username}"
     sig = hmac.new(
         SESSION_SECRET_KEY,
         payload.encode("utf-8"),
@@ -96,20 +97,35 @@ def _verify_session_token(token: str) -> Optional[str]:
     or the token has expired.
     """
     try:
-        parts = token.split(".")
-        if len(parts) != 3:
+        # Format: <random_id>.<exp>.<username>.<hmac_hex>
+        # username may itself contain dots, so split from the right
+        # to isolate the fixed-position fields.
+        last_dot = token.rfind(".")
+        if last_dot == -1:
             return None
-        random_id, exp_str, provided_sig = parts
+        provided_sig = token[last_dot + 1:]
+        rest = token[:last_dot]
+        # rest is <random_id>.<exp>.<username>
+        first_dot = rest.find(".")
+        second_dot = rest.find(".", first_dot + 1)
+        if first_dot == -1 or second_dot == -1:
+            return None
+        random_id = rest[:first_dot]
+        exp_str = rest[first_dot + 1:second_dot]
+        bound_username = rest[second_dot + 1:]
         exp = int(exp_str)
     except (ValueError, AttributeError):
+        return None
+
+    if not random_id or not bound_username:
         return None
 
     # Verify expiry
     if time.time() > exp:
         return None
 
-    # Verify HMAC signature
-    payload = f"{random_id}.{exp_str}"
+    # Verify HMAC signature over the full subject-bound payload
+    payload = f"{random_id}.{exp_str}.{bound_username}"
     expected_sig = hmac.new(
         SESSION_SECRET_KEY,
         payload.encode("utf-8"),
@@ -118,7 +134,8 @@ def _verify_session_token(token: str) -> Optional[str]:
     if not hmac.compare_digest(expected_sig, provided_sig):
         return None
 
-    return random_id
+    # Return the bound username so callers can enforce subject identity
+    return bound_username
 # -----------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -127,16 +144,13 @@ def _verify_session_token(token: str) -> Optional[str]:
 # weights / API contract commit hash) for version pinning.
 # ---------------------------------------------------------------------------
 APPROVED_MODEL_REGISTRY: dict[str, str] = {
-    # Anthropic — pinned to a specific API model version + content-hash
-    "anthropic/claude-3-5-sonnet-20241022": "sha256:a3f1c2e4b7d09f6e2c8a1b4d7e0f3c6a9b2e5d8f1c4a7b0e3d6f9c2a5b8e1d4",
-    # OpenAI — pinned to a specific snapshot
-    "openai/gpt-4o-2024-08-06": "sha256:b2e5d8f1c4a7b0e3d6f9c2a5b8e1d4a3f1c2e4b7d09f6e2c8a1b4d7e0f3c6a9",
     # Internal/custom — pinned to a specific commit hash of the model artefact
+    # Only models registered in the organization's component registry are permitted.
     "internal/custom-llm-v2@commit:c3a7f1e": "sha256:c4a7b0e3d6f9c2a5b8e1d4a3f1c2e4b7d09f6e2c8a1b4d7e0f3c6a9b2e5d8f1",
 }
 
 # The single approved model used by this service (must be a key in APPROVED_MODEL_REGISTRY)
-APPROVED_MODEL: str = "anthropic/claude-3-5-sonnet-20241022"
+APPROVED_MODEL: str = "internal/custom-llm-v2@commit:c3a7f1e"
 APPROVED_MODEL_DIGEST: str = APPROVED_MODEL_REGISTRY[APPROVED_MODEL]
 
 
@@ -832,12 +846,18 @@ async def chat(request: ChatRequest, _: None = Depends(verify_api_key)):
                         "content_type": attachment.type,
                     }
                 )
-                processed = await file_processor.process(
-                    content=attachment.content,
-                    filename=attachment.name,
-                    content_type=attachment.type,
-                    auth_token=inter_agent_auth
-                )
+                    processed = await file_processor.process(
+        content=safe_content,
+        filename=file.filename,
+        content_type=file.content_type
+    )
+    _log_ai_decision(
+        principal="system:upload_handler",
+        model=APPROVED_MODEL,
+        input_text=safe_content,
+        output_text=str(processed)[:2000] if processed is not None else "",
+        call_site="upload_handler:file_processor.process",
+    )
                 _fp_end = datetime.datetime.utcnow().isoformat() + "Z"
                 _fp_output_hash = _sha256(processed if isinstance(processed, str) else str(processed))
                 logger.info(
@@ -1166,14 +1186,14 @@ async def upload_file(file: UploadFile = File(...), _: None = Depends(verify_api
     sanitize_text_input(decoded_content, field_name=f"uploaded_file:{file.filename}")
 
     processed = await file_processor.process(
-        content=decoded_content,
+        content=safe_content,
         filename=file.filename,
         content_type=file.content_type
     )
     _log_ai_decision(
         principal="system:upload_handler",
         model=APPROVED_MODEL,
-        input_text=decoded_content,
+        input_text=safe_content,
         output_text=str(processed)[:2000] if processed is not None else "",
         call_site="upload_handler:file_processor.process",
     )

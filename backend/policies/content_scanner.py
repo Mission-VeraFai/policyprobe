@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 
 # Approved LLM model identifier (organization registry)
-APPROVED_MODEL = "gpt-4o"  # Approved LLM per organization registry
+APPROVED_MODEL = "claude-3-5-sonnet-20241022"  # Approved LLM per organization registry
 
 # Patterns that indicate prompt-injection / instruction-override attempts
 _INJECTION_PATTERNS: List[re.Pattern] = [

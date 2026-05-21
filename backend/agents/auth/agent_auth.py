@@ -15,6 +15,34 @@ from dataclasses import dataclass
 from typing import Optional
 from datetime import datetime
 
+# ---------------------------------------------------------------------------
+# Immutable, hardcoded approved model registry.
+# Do NOT source this from an environment variable – env vars can be overridden
+# at runtime and cannot guarantee immutable pinning.
+# To add a new model, update this dict in code and go through the normal
+# review / approval process.
+# ---------------------------------------------------------------------------
+APPROVED_MODEL_REGISTRY: dict[str, str] = {
+    # key: logical model name  →  value: fully-pinned model identifier
+    "anthropic-claude": "claude-3-5-sonnet-20241022",
+    "openai-gpt":       "gpt-4o-2024-08-06",
+}
+
+
+def get_approved_model_id(logical_name: str) -> str:
+    """Return the pinned model identifier for *logical_name*.
+
+    Raises ValueError if the model is not in the approved registry, preventing
+    unregistered models from being stamped on audit records.
+    """
+    try:
+        return APPROVED_MODEL_REGISTRY[logical_name]
+    except KeyError:
+        raise ValueError(
+            f"Model '{logical_name}' is NOT in the approved model registry. "
+            f"Approved models: {list(APPROVED_MODEL_REGISTRY.keys())}"
+        )
+
 logger = logging.getLogger(__name__)
 
 
