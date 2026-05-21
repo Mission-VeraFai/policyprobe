@@ -202,15 +202,15 @@ PERSONNEL NOTES
 ---------------
 The following team members were recognized for exceptional performance:
 
-* [EMPLOYEE 1] (Employee ID: [EMP-ID-1])
+* [EMPLOYEE 1] (Employee ID: [REDACTED])
   Contact: [REDACTED]
   Direct: [REDACTED]
 
-* [EMPLOYEE 2] (Employee ID: [EMP-ID-2])
+* [EMPLOYEE 2] (Employee ID: [REDACTED])
   Contact: [REDACTED]
   For payroll inquiries, contact HR directly.
 
-* [EMPLOYEE 3] (Employee ID: [EMP-ID-3])
+* [EMPLOYEE 3] (Employee ID: [REDACTED])
   Emergency contact: [REDACTED]
   Benefits ID: [REDACTED]
 
