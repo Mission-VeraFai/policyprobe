@@ -36,11 +36,13 @@ class AgentIdentity:
     is_internal: bool = False
 
     def to_dict(self) -> dict:
+        """Return a minimised, public-safe representation of this identity.
+
+        Internal fields (agent_id, privilege_level, is_internal) are intentionally
+        excluded to prevent leaking raw internal metadata in output.
+        """
         return {
-            "agent_id": self.agent_id,
-            "agent_name": self.agent_name,
-            "privilege_level": self.privilege_level,
-            "is_internal": self.is_internal
+            "agent_name": self.agent_name
         }
 
 
@@ -97,13 +99,49 @@ class AgentAuthenticator:
                 "jwt_secret must be provided. Supply it via an environment variable "
                 "(e.g. os.environ['JWT_SECRET']) rather than a hardcoded value."
             )
-        self._jwt_secret = jwt_secretelf.jwt_secret = jwt_secret
+        self._jwt_secret = jwt_secret
         self._token_cache = {}
-        self._audit_trail: list[dict] = []
+
+        # Persistent audit trail configuration
+        import os
+        self._audit_log_path: str = os.environ.get(
+            "AGENT_AUDIT_LOG_PATH", "/var/log/agent_auth_audit.jsonl"
+        )
+        # Retention: rotate when file exceeds this size (bytes); default 50 MB
+        self._audit_max_bytes: int = int(
+            os.environ.get("AGENT_AUDIT_MAX_BYTES", str(50 * 1024 * 1024))
+        )
+        # Model/version identifier stamped on every record
+        self._model_id: str = os.environ.get("AGENT_MODEL_ID", "agent_auth")
+        self._model_version: str = os.environ.get("AGENT_MODEL_VERSION", "1.0.0")
+
+        # Ensure the audit log directory exists
+        _audit_dir = os.path.dirname(self._audit_log_path)
+        if _audit_dir:
+            os.makedirs(_audit_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Audit helpers
     # ------------------------------------------------------------------
+
+    def _rotate_audit_log_if_needed(self) -> None:
+        """Rotate the audit log file if it exceeds the configured maximum size."""
+        import os
+        import shutil
+        import datetime
+        try:
+            if (
+                os.path.exists(self._audit_log_path)
+                and os.path.getsize(self._audit_log_path) >= self._audit_max_bytes
+            ):
+                rotated_path = (
+                    self._audit_log_path
+                    + "." + datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                )
+                shutil.move(self._audit_log_path, rotated_path)
+                logger.info("Audit log rotated to %s", rotated_path)
+        except OSError as exc:
+            logger.error("Failed to rotate audit log: %s", exc)
 
     def _audit_log(
         self,
@@ -112,26 +150,58 @@ class AgentAuthenticator:
         resource: str,
         decision: bool,
         reason: Optional[str] = None,
+        input_data: Optional[dict] = None,
     ) -> None:
-        """Append a structured audit record to the persistent trail and emit it."""
+        """Append a structured audit record to the persistent append-only JSONL file."""
         import datetime
+        import hashlib
+        import json
+        import os
+
+        timestamp = datetime.datetime.utcnow().isoformat() + "Z"
+
+        # Compute a SHA-256 hash of the input payload for forensic integrity
+        input_payload = json.dumps(
+            input_data if input_data is not None else {}, sort_keys=True
+        )
+        input_hash = hashlib.sha256(input_payload.encode("utf-8")).hexdigest()
+
         record = {
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "timestamp": timestamp,
             "action": action,
             "principal": principal,
             "resource": resource,
             "decision": decision,
             "reason": reason,
+            "input_hash": input_hash,
+            "model_id": self._model_id,
+            "model_version": self._model_version,
         }
-        self._audit_trail.append(record)
+
+        # Rotate before writing if the file is too large
+        self._rotate_audit_log_if_needed()
+
+        # Append atomically to the JSONL file (append mode is O_APPEND-safe on POSIX)
+        try:
+            with open(self._audit_log_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        except OSError as exc:
+            logger.error("Failed to write audit record to %s: %s", self._audit_log_path, exc)
+
         logger.info(
-            "AUDIT | action=%s principal=%s resource=%s decision=%s reason=%s ts=%s",
+            "AUDIT | action=%s principal=%s resource=%s decision=%s "
+            "reason=%s input_hash=%s model=%s@%s ts=%s",
             action,
             principal,
             resource,
             decision,
             reason,
-            record["timestamp"],
+            input_hash,
+            self._model_id,
+            self._model_version,
+            timestamp,
         )
 
     def verify(self, request: dict) -> bool:
