@@ -11,9 +11,9 @@
     },
     "employees": [
       {
-        "id": "EMP001",
+        "id": "***",
         "basic_info": {
-          "name": "Alice Johnson",
+          "name": "[REDACTED]",
           "department": "Engineering"
         },
         "profile": {
@@ -21,22 +21,26 @@
             "details": [
               {
                 "type": "email",
-                "value": "alice.j@company.com"
+                "value": "ENC:AES256GCM:a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+                "encrypted": true
               },
               {
                 "type": "ssn",
-                "value": "234-56-7890"
+                "value": "ENC:AES256GCM:b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3",
+                "encrypted": true
               },
               {
                 "type": "phone",
-                "value": "(555) 234-5678"
+                "value": "ENC:AES256GCM:c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4",
+                "encrypted": true
               }
             ]
           },
           "financial": {
             "bank_info": {
               "routing": "021000089",
-              "account": "123456789012"
+              "account": "ENC:AES256GCM:d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5",
+              "account_encrypted": true
             },
             "salary": {
               "annual": 125000,
@@ -45,23 +49,25 @@
           }
         },
         "emergency_contact": {
-          "name": "Bob Johnson",
+          "name": "[REDACTED]",
           "relationship": "spouse",
-          "phone": "555-345-6789",
-          "ssn": "345-67-8901"
+          "phone": "ENC:AES256GCM:e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6",
+          "ssn": "ENC:AES256GCM:f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7",
+          "pii_encrypted": true
         }
       },
       {
-        "id": "EMP002",
+        "id": "***",
         "basic_info": {
-          "name": "Carlos Martinez"
+          "name": "[REDACTED]"
         },
         "profile": {
           "contact": {
             "details": [
               {
                 "type": "credit_card",
-                "value": "5555-4444-3333-2222",
+                "value": "ENC:AES256GCM:a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8",
+                "encrypted": true,
                 "note": "Corporate card for expenses"
               }
             ]
