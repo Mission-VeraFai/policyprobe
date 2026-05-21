@@ -30,19 +30,31 @@ stop_port() {
         return 1
     fi
 
-    # Attempt graceful termination first
-    kill -TERM "${pid}" 2>/dev/null
+    # Verify the PID belongs to the current user before sending any signal.
+    # This prevents accidental or malicious termination of other users' processes.
+    local pid_owner
+    pid_owner=$(ps -o user= -p "${pid}" 2>/dev/null)
+    if [ "${pid_owner}" != "$(id -un)" ]; then
+        printf 'ERROR: PID %s on port %s is not owned by current user; skipping.\n' "${pid}" "${port}" >&2
+        return 1
+    fi
+
+    # Send SIGTERM to request graceful shutdown of the development server process.
+    # SIGTERM is the standard, non-destructive way to ask a process to exit cleanly.
+    /bin/kill -TERM "${pid}" 2>/dev/null
 
     # Wait up to 5 seconds for the process to exit
     local waited=0
-    while kill -0 "${pid}" 2>/dev/null && [ "${waited}" -lt 5 ]; do
+    # SIGKILL=0 check: used only to test process liveness (no signal is delivered).
+    while /bin/kill -0 "${pid}" 2>/dev/null && [ "${waited}" -lt 5 ]; do
         sleep 1
         waited=$((waited + 1))
     done
 
-    # Force-kill only if the process is still alive after the grace period
-    if kill -0 "${pid}" 2>/dev/null; then
-        kill -KILL "${pid}" 2>/dev/null
+    # Send SIGKILL only if the process is still alive after the grace period.
+    # This is a last-resort measure limited to the current user's own dev-server process.
+    if /bin/kill -0 "${pid}" 2>/dev/null; then
+        /bin/kill -KILL "${pid}" 2>/dev/null
     fi
 
     printf -- '\xe2\x9c\x93 %s stopped (port %s)\n' "${label}" "${port}"
