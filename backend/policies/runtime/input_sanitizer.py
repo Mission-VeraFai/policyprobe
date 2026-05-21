@@ -51,8 +51,36 @@ class InputSanitizer:
             }
         )
 
-        # VULNERABILITY: No sanitization performed
-        return input_data
+        # Dispatch sanitization based on input type
+        if isinstance(input_data, str):
+            sanitized = self._sanitize_string(input_data)
+        elif isinstance(input_data, dict):
+            sanitized = {k: await self.sanitize(v) for k, v in input_data.items()}
+        elif isinstance(input_data, list):
+            sanitized = [await self.sanitize(item) for item in input_data]
+        else:
+            sanitized = input_data
+
+        if sanitized is not input_data:
+            logger.info(
+                "Input was modified during sanitization",
+                extra={"input_type": type(input_data).__name__}
+            )
+        return sanitized
+
+    def _sanitize_string(self, text: str) -> str:
+        """Apply all string-level sanitization passes."""
+        # 1. Normalize unicode to NFC to collapse lookalike sequences
+        text = unicodedata.normalize("NFC", text)
+        # 2. Strip invisible / zero-width / control characters
+        text = self._INVISIBLE_RE.sub("", text)
+        # 3. Remove null bytes
+        text = text.replace("\x00", "")
+        # 4. Collapse binary magic byte patterns
+        text = self._BINARY_MAGIC_RE.sub("", text)
+        # 5. Reject / strip shell command patterns (replace with empty string)
+        text = self._SHELL_CMD_RE.sub("", text)
+        return text
 
     # ---------------------------------------------------------------------------
     # Patterns that indicate potentially malicious prompt content
@@ -160,7 +188,49 @@ class InputSanitizer:
 
         VULNERABILITY: Not implemented.
         """
-        return filename
+        if not isinstance(filename, str):
+            raise ValueError("Filename must be a string")
+
+        # 1. Strip null bytes (used to truncate paths in some runtimes)
+        sanitized_name = filename.replace("\x00", "")
+
+        # 2. Decode percent-encoding so traversal sequences like %2F are caught
+        try:
+            from urllib.parse import unquote
+            sanitized_name = unquote(sanitized_name)
+        except Exception:
+            pass
+
+        # 3. Normalize unicode so homoglyph dots/slashes are collapsed
+        sanitized_name = unicodedata.normalize("NFC", sanitized_name)
+
+        # 4. Remove any directory component — keep only the final basename
+        #    This defeats  ../../etc/passwd  and  /absolute/path  attacks.
+        import os
+        sanitized_name = os.path.basename(sanitized_name)
+
+        # 5. After basename, strip any remaining leading dots or slashes
+        #    (e.g. a filename that *is* just ".." after basename)
+        sanitized_name = sanitized_name.lstrip("./\\\ ")
+
+        # 6. Allow only safe filename characters: alphanumerics, dash, underscore,
+        #    dot (but not leading), and space.  Everything else is removed.
+        sanitized_name = re.sub(r"[^\w.\- ]", "", sanitized_name)
+
+        # 7. Collapse multiple consecutive dots to prevent extension spoofing
+        sanitized_name = re.sub(r"\.{2,}", ".", sanitized_name)
+
+        # 8. Enforce a maximum length
+        sanitized_name = sanitized_name[:255]
+
+        if not sanitized_name:
+            raise ValueError("Filename is empty after sanitization")
+
+        logger.debug(
+            "Filename sanitized",
+            extra={"original": filename[:100], "sanitized": sanitized_name},
+        )
+        return sanitized_name
 
     async def normalize_encoding(self, content: str) -> str:
         """
