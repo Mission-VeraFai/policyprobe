@@ -36,7 +36,7 @@ if [ "$_hitl_approval" != "yes" ]; then
     printf 'Deletion not approved. Aborting setup.\n' >&2
     exit 1
 fi
-rm -f "$_helper_out"
+unlink "$_helper_out"
 fi
 if [ -z "$PYTHON_CMD" ]; then
     printf 'ERROR: Could not determine PYTHON_CMD from python_helper.sh\n' >&2
@@ -48,21 +48,21 @@ cd "$PROJECT_ROOT/backend"
 
 # Create virtual environment if it doesn't exist
 if [ -d ".venv" ]; then
-    echo "✓ Virtual environment already exists"
-    echo "  To recreate, remove the .venv directory manually and re-run this script."
-    echo ""
+    printf '✓ Virtual environment already exists\n'
+    printf '  To recreate, remove the .venv directory manually and re-run this script.\n'
+    printf '\n'
 else
-    echo "Creating Python virtual environment..."
+    printf 'Creating Python virtual environment...\n'
     "$PYTHON_CMD" -m venv .venv
-    echo "✓ Virtual environment created"
-    echo ""
+    printf '✓ Virtual environment created\n'
+    printf '\n'
 fi
 
 # Activate virtual environment
-echo "Activating virtual environment..."
+printf 'Activating virtual environment...\n'
 # Validate activate script before sourcing
 if [ ! -f ".venv/bin/activate" ]; then
-    echo "ERROR: Virtual environment activation script not found" >&2
+    printf 'ERROR: Virtual environment activation script not found\n' >&2
     exit 1
 fi
 # Use venv binaries directly instead of sourcing the activate script
@@ -76,30 +76,30 @@ printf 'Virtual environment ready\n'
 echo ""
 
 # Upgrade pip
-echo "Upgrading pip..."
+printf 'Upgrading pip...\n'
 # Upgrade pip to a known-safe minimum version rather than unconditionally fetching latest
 "$VENV_PIP" install --upgrade "pip>=23.3,<25"
-echo "✓ pip upgraded"
-echo ""
+printf '✓ pip upgraded\n'
+printf '\n'
 
 # Install requirements
-echo "Installing Python dependencies..."
+printf 'Installing Python dependencies...\n'
 "$VENV_PIP" install -r requirements.txt
-echo "✓ Dependencies installed"
-echo ""
+printf '✓ Dependencies installed\n'
+printf '\n'
 
 # Install frontend dependencies
-echo "Installing frontend dependencies..."
+printf 'Installing frontend dependencies...\n'
 cd "$PROJECT_ROOT/frontend"
 if [ ! -d "node_modules" ] || [ ! -f "node_modules/.bin/next" ]; then
-    echo "Installing npm packages..."
+    printf 'Installing npm packages...\n'
     # Use 'npm ci' to install strictly from package-lock.json, preventing arbitrary dependency resolution
     npm ci
-    echo "✓ Frontend dependencies installed"
+    printf '✓ Frontend dependencies installed\n'
 else
-    echo "✓ Frontend dependencies already installed"
+    printf '✓ Frontend dependencies already installed\n'
 fi
-echo ""
+printf '\n'
 
 printf 'Setup complete. Virtual environment: backend/.venv\n'
 printf 'To activate manually: source backend/.venv/bin/activate\n'
