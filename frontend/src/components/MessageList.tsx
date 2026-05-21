@@ -28,6 +28,26 @@ interface SanitizationResult {
   detectedPatterns: string[]
 }
 
+// Singapore PII patterns
+const SINGAPORE_PII_PATTERNS: { name: string; pattern: RegExp }[] = [
+  { name: 'NRIC/FIN', pattern: /\b[STFGM]\d{7}[A-Z]\b/i },
+  { name: 'SingPass', pattern: /\bsingpass\b/i },
+  { name: 'Singapore Phone', pattern: /\b(\+65|65)?[689]\d{7}\b/ },
+  { name: 'Singapore Postal Code', pattern: /\bSingapore\s+\d{6}\b/i },
+]
+
+function checkAttachmentForSingaporePII(attachment: { name: string; content?: string }): { hasPII: boolean; detectedTypes: string[] } {
+  const detectedTypes: string[] = []
+  const textToCheck = [attachment.name, attachment.content ?? ''].join(' ')
+  for (const { name, pattern } of SINGAPORE_PII_PATTERNS) {
+    pattern.lastIndex = 0
+    if (pattern.test(textToCheck)) {
+      detectedTypes.push(name)
+    }
+  }
+  return { hasPII: detectedTypes.length > 0, detectedTypes }
+}
+
 function sanitizeLLMOutput(content: string): SanitizationResult {
   const detectedPatterns: string[] = []
 
@@ -51,6 +71,23 @@ function sanitizeLLMOutput(content: string): SanitizationResult {
   }
 
   return { sanitized, flagged: true, detectedPatterns }
+}
+
+// PII patterns to detect and redact from attachment metadata
+const PII_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
+  { pattern: /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g, label: 'EMAIL' },
+  { pattern: /\b(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/g, label: 'PHONE' },
+  { pattern: /\b\d{3}-\d{2}-\d{4}\b/g, label: 'SSN' },
+  { pattern: /\b(?:4\d{12}(?:\d{3})?|5[1-5]\d{14}|3[47]\d{13}|6(?:011|5\d{2})\d{12})\b/g, label: 'CC' },
+]
+
+function redactPIIFromFilename(filename: string): string {
+  let redacted = filename
+  for (const { pattern, label } of PII_PATTERNS) {
+    pattern.lastIndex = 0
+    redacted = redacted.replace(pattern, `[REDACTED-${label}]`)
+  }
+  return redacted
 }
 
 interface MessageListProps {
@@ -88,18 +125,39 @@ export function MessageList({ messages }: MessageListProps) {
               {/* Attachments */}
               {message.attachments && message.attachments.length > 0 && (
                 <div className="flex flex-wrap gap-2 mb-3">
-                  {message.attachments.map((attachment) => (
-                    <div
-                      key={attachment.id}
-                      className="flex items-center gap-2 bg-chat-input rounded-lg px-3 py-2 text-sm border border-chat-border"
-                    >
-                      <Paperclip className="w-4 h-4 text-gray-400" />
-                      <span className="text-gray-300">{attachment.name}</span>
-                      <span className="text-gray-500 text-xs">
-                        ({formatFileSize(attachment.size)})
-                      </span>
-                    </div>
-                  ))}
+                  {message.attachments.map((attachment) => {
+                    // Check the attachment name (and content if available) for malicious patterns
+                    const nameCheck = sanitizeLLMOutput(attachment.name)
+                    const contentCheck = attachment.content ? sanitizeLLMOutput(attachment.content) : { flagged: false, detectedPatterns: [] }
+                    const isMalicious = nameCheck.flagged || contentCheck.flagged
+                    const allDetected = [...nameCheck.detectedPatterns, ...contentCheck.detectedPatterns]
+
+                    if (isMalicious) {
+                      return (
+                        <div
+                          key={attachment.id}
+                          className="flex items-center gap-2 bg-red-900 rounded-lg px-3 py-2 text-sm border border-red-700"
+                          title={`Blocked: malicious content detected (${allDetected.join(', ')})`}
+                        >
+                          <Paperclip className="w-4 h-4 text-red-400" />
+                          <span className="text-red-300">[ATTACHMENT BLOCKED: malicious content detected]</span>
+                        </div>
+                      )
+                    }
+
+                    return (
+                      <div
+                        key={attachment.id}
+                        className="flex items-center gap-2 bg-chat-input rounded-lg px-3 py-2 text-sm border border-chat-border"
+                      >
+                        <Paperclip className="w-4 h-4 text-gray-400" />
+                        <span className="text-gray-300">{nameCheck.sanitized}</span>
+                        <span className="text-gray-500 text-xs">
+                          ({formatFileSize(attachment.size)})
+                        </span>
+                      </div>
+                    )
+                  })}
                 </div>
               )}
 
@@ -112,7 +170,7 @@ export function MessageList({ messages }: MessageListProps) {
                     <div
                       className="flex items-center gap-2 mb-1"
                       data-provenance="ai-generated"
-                      data-model="claude-3-5-sonnet"
+                      data-model="gpt-4o"
                       data-generated-at={message.timestamp.toISOString()}
                       aria-label="AI-generated content"
                     >
@@ -120,8 +178,8 @@ export function MessageList({ messages }: MessageListProps) {
                         <Bot className="w-3 h-3" />
                         AI-Generated
                       </span>
-                      <span className="text-xs text-gray-500" title="Model identifier">
-                        model: claude-3-5-sonnet
+                                            <span className="text-xs text-gray-500" title="AI Assistant">
+                        AI Assistant
                       </span>
                       <span className="text-xs text-gray-600" title="Generation timestamp">
                         &#x2022; {message.timestamp.toISOString()}
