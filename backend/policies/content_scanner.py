@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 
 # Approved LLM model identifier (organization registry)
-APPROVED_MODEL = "approved-llm-v1"  # Replace with the exact approved model name from the org registry
+APPROVED_MODEL = "gpt-4"  # Approved LLM per organization registry
 
 # Patterns that indicate prompt-injection / instruction-override attempts
 _INJECTION_PATTERNS: List[re.Pattern] = [
@@ -59,12 +59,42 @@ _SCANNER_VERSION = "1.0.0"
 _RETENTION_POLICY = "7-years-security-audit"
 
 
+_PII_DETAIL_KEYS = {"content", "text", "raw", "body", "message", "data", "extracted", "value"}
+
+
+def _redact_details(details: object) -> object:
+    """
+    Recursively redact string values in the details object that may contain
+    PII or raw document content. Only safe scalar types (bool, int, float)
+    and known-safe keys (e.g. pattern names, reason codes) are preserved.
+    Any string value whose key suggests it may hold raw content is replaced
+    with a fixed redaction marker.
+    """
+    if isinstance(details, dict):
+        redacted = {}
+        for k, v in details.items():
+            if isinstance(v, str) and k.lower() in _PII_DETAIL_KEYS:
+                redacted[k] = "[REDACTED]"
+            elif isinstance(v, (dict, list)):
+                redacted[k] = _redact_details(v)
+            else:
+                redacted[k] = v
+        return redacted
+    elif isinstance(details, list):
+        return [_redact_details(item) for item in details]
+    elif isinstance(details, str):
+        # Top-level string — redact entirely to be safe
+        return "[REDACTED]"
+    return details
+
+
 def _emit_audit_record(event: str, source: str, details: object, input_hash: str, trace_id: str) -> None:
     """
     Emit a structured JSON audit record to the dedicated audit logger.
     Wraps all I/O in try/except so a logging failure never silently
     swallows the upstream security exception.
     """
+    safe_details = _redact_details(details)
     record = {
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         "trace_id": trace_id,
@@ -75,7 +105,7 @@ def _emit_audit_record(event: str, source: str, details: object, input_hash: str
         "input_sha256": input_hash,
         "principal": "system",  # replace with authenticated principal when available
         "retention_policy": _RETENTION_POLICY,
-        "details": details,
+        "details": safe_details,
     }
     try:
         _AUDIT_LOGGER.warning(json.dumps(record))
@@ -600,6 +630,20 @@ class ContentScanner:
             re.compile(r'\\n\s*(human|assistant|user|system)\s*:', re.IGNORECASE),
         ]
 
+        # Additional patterns: base64-encoded payloads, shell/binary commands, leetspeak
+        base64_pattern = re.compile(
+            r'(?:[A-Za-z0-9+/]{20,}={0,2})', re.ASCII
+        )
+        shell_command_pattern = re.compile(
+            r'(?:^|\s)(?:bash|sh|cmd|powershell|exec|eval|system|os\.system|subprocess|\$\(|`[^`]+`)',
+            re.IGNORECASE | re.MULTILINE,
+        )
+        binary_pattern = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]')
+        leetspeak_injection_pattern = re.compile(
+            r'(?:1gn[o0]r[e3]|[i1]nstruct[i1][o0]n|pr[o0]mpt|[s5]y[s5]t[e3]m)',
+            re.IGNORECASE,
+        )
+
         if hidden_elements:
             warnings.append(
                 f"Hidden HTML elements detected ({len(hidden_elements)} element(s)). "
@@ -608,6 +652,71 @@ class ContentScanner:
             logger.warning(
                 "Hidden HTML content detected — validating before use",
                 extra={"hidden_elements_found": len(hidden_elements)}
+            )
+
+        blocked_count = 0
+        for element_text in hidden_elements:
+            flagged = False
+            flag_reason = ""
+
+            # Check prompt-injection patterns
+            for pat in injection_patterns:
+                if pat.search(element_text):
+                    flagged = True
+                    flag_reason = "prompt injection pattern"
+                    break
+
+            # Check base64-encoded content
+            if not flagged and base64_pattern.search(element_text):
+                import base64 as _b64
+                for match in base64_pattern.finditer(element_text):
+                    try:
+                        decoded = _b64.b64decode(match.group() + '==').decode('utf-8', errors='ignore')
+                        for pat in injection_patterns:
+                            if pat.search(decoded):
+                                flagged = True
+                                flag_reason = "base64-encoded prompt injection"
+                                break
+                        if not flagged and shell_command_pattern.search(decoded):
+                            flagged = True
+                            flag_reason = "base64-encoded shell command"
+                    except Exception:
+                        pass
+                    if flagged:
+                        break
+
+            # Check shell/binary commands
+            if not flagged and shell_command_pattern.search(element_text):
+                flagged = True
+                flag_reason = "shell/binary command"
+
+            # Check binary/non-printable characters
+            if not flagged and binary_pattern.search(element_text):
+                flagged = True
+                flag_reason = "binary or non-printable characters"
+
+            # Check leetspeak injection
+            if not flagged and leetspeak_injection_pattern.search(element_text):
+                flagged = True
+                flag_reason = "leetspeak prompt injection"
+
+            if flagged:
+                blocked_count += 1
+                warnings.append(
+                    f"Blocked hidden element containing {flag_reason}."
+                )
+                logger.error(
+                    "Prompt injection detected in hidden HTML element — content blocked",
+                    extra={"flag_reason": flag_reason, "snippet": element_text[:120]},
+                )
+            else:
+                sanitized_hidden_elements.append(element_text)
+
+        if blocked_count:
+            raise ValueError(
+                f"Prompt injection detected in uploaded HTML content: "
+                f"{blocked_count} hidden element(s) contained malicious content "
+                f"({', '.join(w for w in warnings if 'Blocked' in w)}). Upload rejected."
             )
 
         for element_text in hidden_elements:
