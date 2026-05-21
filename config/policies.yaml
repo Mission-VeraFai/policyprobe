@@ -46,6 +46,25 @@ policies:
     severity: medium
 
 # Privilege levels for agent access control
+#
+# TOOL ACCESS CONTROL
+# -------------------
+# Each privilege level carries an explicit `allowed_tools` allow list.
+# Tool invocations NOT present in this list MUST be blocked by the
+# enforcement layer regardless of the agent's identity or resource access.
+# Enforcement mode: deny-by-default (implicit deny for unlisted tools).
+#
+# Master list of all known tools (reference only – enforcement is per-level):
+#   search_public_kb, submit_support_ticket, read_user_query,
+#   upload_file, parse_file, read_file_metadata,
+#   read_financial_report, generate_financial_summary,
+#   manage_users, view_audit_logs, modify_policy, escalate_privilege
+
+tool_access_control:
+  enforcement_mode: deny_by_default   # block any tool not in the allow list
+  audit_blocked_invocations: true
+  alert_on_unlisted_tool: true
+
 privilege_levels:
   low:
     level: 1
@@ -54,6 +73,10 @@ privilege_levels:
     allowed_resources:
       - public_data
       - user_queries
+    allowed_tools:
+      - search_public_kb
+      - submit_support_ticket
+      - read_user_query
 
   medium:
     level: 2
@@ -64,6 +87,13 @@ privilege_levels:
       - public_data
       - user_queries
       - file_processing
+    allowed_tools:
+      - search_public_kb
+      - submit_support_ticket
+      - read_user_query
+      - upload_file
+      - parse_file
+      - read_file_metadata
 
   high:
     level: 3
@@ -76,6 +106,15 @@ privilege_levels:
       - user_queries
       - file_processing
       - financial_data
+    allowed_tools:
+      - search_public_kb
+      - submit_support_ticket
+      - read_user_query
+      - upload_file
+      - parse_file
+      - read_file_metadata
+      - read_financial_report
+      - generate_financial_summary
 
   admin:
     level: 4
@@ -87,6 +126,19 @@ privilege_levels:
       - file_processing
       - financial_data
       - admin_resources
+    allowed_tools:
+      - search_public_kb
+      - submit_support_ticket
+      - read_user_query
+      - upload_file
+      - parse_file
+      - read_file_metadata
+      - read_financial_report
+      - generate_financial_summary
+      - manage_users
+      - view_audit_logs
+      - modify_policy
+      - escalate_privilege
     escalation_detection:
       enabled: true
       block_on_escalation: true
@@ -99,3 +151,36 @@ logging:
   log_level: INFO
   include_content: false  # FIXED: Full content excluded from logs to prevent PII exposure
   mask_pii: true  # FIXED: PII masked in all log output
+
+  # Forensic-required fields — must be captured in every audit log entry
+  required_fields:
+    - model_id          # Identifier of the AI model that produced the action/decision
+    - model_version     # Semantic version of the model (e.g. "gpt-4o-2024-05-13")
+    - input_hash        # SHA-256 hash of the sanitised input payload (no raw PII)
+    - principal         # Authenticated user or agent identity that triggered the action
+    - session_id        # Correlation ID linking all events in a single session
+    - timestamp_utc     # ISO-8601 UTC timestamp of the event
+    - action            # The AI-driven action or decision that was taken
+    - policy_outcome    # Result of policy evaluation (allow / block / flag)
+
+  # Retention and rotation policy
+  retention:
+    min_retention_days: 365   # Logs must be kept for at least 1 year
+    max_retention_days: 2555  # Hard cap at 7 years for compliance archival
+    rotation:
+      strategy: time_based    # Rotate on a calendar schedule
+      interval: daily         # New log file / stream segment every 24 hours
+      compress_after_days: 7  # Compress rotated files after 7 days
+      archive_after_days: 90  # Move to cold/archival storage after 90 days
+
+  # Append-only / immutability guarantees
+  immutability:
+    append_only: true                  # Log sink must reject any update or delete operation
+    write_once_storage: true           # Persist to WORM-capable storage backend
+    integrity_check:
+      enabled: true
+      algorithm: SHA-256               # Hash-chain each log entry to detect tampering
+      verify_on_read: true             # Re-verify hashes when logs are retrieved for review
+    tamper_alert:
+      enabled: true
+      notify_channel: security_alerts  # Alert channel if integrity violation is detected
