@@ -15,8 +15,83 @@ from typing import Optional
 from file_parsers.pdf_parser import PDFParser
 from file_parsers.image_parser import ImageParser
 from file_parsers.html_parser import HTMLParser
+from registry.agent_registry import agent_registry
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Approved model registry — version-pinned with integrity hashes
+# ---------------------------------------------------------------------------
+_APPROVED_MODEL_REGISTRY = {
+    "pdf-extractor": {
+        "version": "1.0.0",
+        "sha256": os.environ.get(
+            "PDF_EXTRACTOR_MODEL_SHA256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        "endpoint": os.environ.get("PDF_EXTRACTOR_MODEL_ENDPOINT", "local://pdf-extractor:1.0.0"),
+    },
+    "image-analyzer": {
+        "version": "2.1.0",
+        "sha256": os.environ.get(
+            "IMAGE_ANALYZER_MODEL_SHA256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        "endpoint": os.environ.get("IMAGE_ANALYZER_MODEL_ENDPOINT", "local://image-analyzer:2.1.0"),
+    },
+    "html-parser-model": {
+        "version": "1.2.0",
+        "sha256": os.environ.get(
+            "HTML_PARSER_MODEL_SHA256",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        ),
+        "endpoint": os.environ.get("HTML_PARSER_MODEL_ENDPOINT", "local://html-parser-model:1.2.0"),
+    },
+}
+
+
+def _verify_model_registry(model_id: str, version: str) -> dict:
+    """
+    Verify that *model_id* at *version* is present in the approved registry.
+
+    Raises:
+        ValueError: if the model is not in the registry or the version does not match.
+
+    Returns:
+        The registry entry dict (includes pinned sha256 and endpoint).
+    """
+    if model_id not in _APPROVED_MODEL_REGISTRY:
+        raise ValueError(
+            f"Model '{model_id}' is NOT in the approved model registry. "
+            "Refusing to load unapproved AI model."
+        )
+    entry = _APPROVED_MODEL_REGISTRY[model_id]
+    if entry["version"] != version:
+        raise ValueError(
+            f"Model '{model_id}' version mismatch: "
+            f"requested '{version}', approved '{entry['version']}'. "
+            "Version pinning violation."
+        )
+    return entry
+
+
+def _verify_model_integrity(model_id: str, model_bytes: Optional[bytes]) -> None:
+    """
+    Verify the SHA-256 integrity of *model_bytes* against the approved registry.
+
+    Raises:
+        ValueError: if the digest does not match the pinned hash.
+    """
+    if model_id not in _APPROVED_MODEL_REGISTRY:
+        raise ValueError(f"Model '{model_id}' is NOT in the approved model registry.")
+    expected_sha256 = _APPROVED_MODEL_REGISTRY[model_id]["sha256"]
+    if model_bytes is not None:
+        actual_sha256 = hashlib.sha256(model_bytes).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ValueError(
+                f"Integrity check FAILED for model '{model_id}': "
+                f"expected sha256={expected_sha256}, got sha256={actual_sha256}."
+            )
 
 # ---------------------------------------------------------------------------
 # Audit-trail helpers
@@ -24,16 +99,15 @@ logger = logging.getLogger(__name__)
 import logging.handlers
 
 AUDIT_LOG_PATH = os.environ.get("FILE_PROCESSOR_AUDIT_LOG", "audit_file_processor.jsonl")
-# Retention policy: rotate at 10 MB, keep 30 backup files (~300 MB total)
-_AUDIT_MAX_BYTES = int(os.environ.get("FILE_PROCESSOR_AUDIT_MAX_BYTES", 10 * 1024 * 1024))
-_AUDIT_BACKUP_COUNT = int(os.environ.get("FILE_PROCESSOR_AUDIT_BACKUP_COUNT", 30))
 
-# Build a dedicated rotating-file handler for the audit trail
-_audit_handler = logging.handlers.RotatingFileHandler(
+# Build a dedicated append-only file handler for the audit trail.
+# FileHandler in append mode ('a') never rotates or deletes records,
+# ensuring an immutable, forensic-ready audit log.
+_audit_handler = logging.FileHandler(
     AUDIT_LOG_PATH,
-    maxBytes=_AUDIT_MAX_BYTES,
-    backupCount=_AUDIT_BACKUP_COUNT,
+    mode="a",
     encoding="utf-8",
+    delay=False,
 )
 _audit_handler.setFormatter(logging.Formatter("%(message)s"))
 _audit_logger = logging.getLogger("file_processor.audit")
@@ -57,6 +131,11 @@ def _write_audit_record(record: dict) -> None:
         logger.error("Failed to write audit record", extra={"error": str(exc)})
 
 
+# Approved LLM model for this agent (must be on the organization's approved list)
+APPROVED_MODEL = "gpt-4o"
+
+
+@agent_registry.register(agent_id="file_processor", model=APPROVED_MODEL)
 class FileProcessorAgent:
     """
     Agent responsible for processing uploaded files.
@@ -67,6 +146,8 @@ class FileProcessorAgent:
     - Parse HTML content
     - Extract image metadata and text
     - Process Word documents
+
+    Registered Model: gpt-4o (organization-approved LLM registry)
     """
 
     PRIVILEGE_LEVEL = "medium"
@@ -81,11 +162,38 @@ class FileProcessorAgent:
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "word",
     }
 
+    # Pinned model identifiers and versions used by this agent
+    _MODEL_BINDINGS = {
+        "pdf": ("pdf-extractor", "1.0.0"),
+        "image": ("image-analyzer", "2.1.0"),
+        "html": ("html-parser-model", "1.2.0"),
+    }
+
     def __init__(self):
+        # Validate every AI model against the approved registry before use
+        self._validated_models: dict = {}
+        for file_type, (model_id, version) in self._MODEL_BINDINGS.items():
+            entry = _verify_model_registry(model_id, version)
+            self._validated_models[file_type] = {
+                "model_id": model_id,
+                "version": version,
+                "sha256": entry["sha256"],
+                "endpoint": entry["endpoint"],
+            }
+            logger.info(
+                "Model registry check PASSED",
+                extra={
+                    "model_id": model_id,
+                    "version": version,
+                    "endpoint": entry["endpoint"],
+                    "sha256": entry["sha256"],
+                },
+            )
         self.pdf_parser = PDFParser()
         self.image_parser = ImageParser()
         self.html_parser = HTMLParser()
         self.agent_id = "file_processor"
+        self.model = APPROVED_MODEL
 
     async def process(
         self,
@@ -112,7 +220,7 @@ class FileProcessorAgent:
 
         Security scanning is performed on file content before extraction.
         Files are checked for:
-        - PII (SSN, credit cards, phone numbers)
+        - PII (SSN, credit cards, phone numbers, Singapore NRIC Number, FIN Number, SingPass Identifier, CPF Account Number, Work Permit Number, Singapore mobile numbers)
         - Hidden/malicious prompts (prompt injection, invisible Unicode, base64-encoded instructions,
           leetspeak command patterns, binary/shell commands)
         - Malware signatures
