@@ -16,15 +16,16 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
+import uuid
 from typing import Any, Optional
 
 from .auth.agent_auth import AgentIdentity, AgentAuthenticator
 from llm.registry import RegistryLLMClient, ModelRegistry
 
 # Approved model registry entry — version-pinned and integrity-verified
-_APPROVED_MODEL_ID = "gpt-4o"          # registry canonical name
-_APPROVED_MODEL_VERSION = "2024-08-06"  # pinned release date / version tag
-_APPROVED_MODEL_SHA256 = "a3f1c2e4b5d6789012345678abcdef01234567890abcdef01234567890abcdef01"  # expected artifact digest
+_APPROVED_MODEL_ID = "claude-3-5-sonnet-20241022"  # registry canonical name
+_APPROVED_MODEL_VERSION = "20241022"            # pinned release date / version tag
+_APPROVED_MODEL_SHA256 = ""                     # set to the approved artifact digest from the registry
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,9 @@ class FinanceAgent:
 
     ALLOWED_ROLES = ["finance_admin", "cfo", "admin"]
     PRIVILEGE_LEVEL = "high"
+    # No bypass is permitted for any caller origin, including 'internal' callers.
+    # All callers must satisfy role and privilege checks via the authenticator.
+    _INTERNAL_BYPASS_ENABLED = False
 
     def __init__(self, llm_client: RegistryLLMClient):
         # Enforce registry membership, version pin, and integrity check at startup
@@ -55,6 +59,7 @@ class FinanceAgent:
             expected_sha256=_APPROVED_MODEL_SHA256,
         )
         self.llm_client = llm_client
+        self._llm_logger = logging.getLogger(__name__ + ".llm_audit")
         self.authenticator = AgentAuthenticator()
         self.agent_id = "finance"
         self.agent_name = "Finance Agent"
@@ -86,6 +91,48 @@ class FinanceAgent:
             }
         }
 
+    # Dangerous dynamic code execution primitives to detect in LLM output
+    _DANGEROUS_LLM_PATTERNS = [
+        r'\beval\s*\(',
+        r'\bexec\s*\(',
+        r'\bcompile\s*\(',
+        r'\b__import__\s*\(',
+        r'\bsubprocess\b',
+        r'\bos\.system\s*\(',
+        r'\bos\.popen\s*\(',
+        r'\bos\.exec[a-z]*\s*\(',
+        r'\bos\.spawn[a-z]*\s*\(',
+        r'\bimportlib\b',
+        r'\bctypes\b',
+        r'\bgetattr\s*\(.*,\s*[\'"]__',
+        r'\b__builtins__\b',
+        r'\b__globals__\b',
+        r'\b__class__\b.*__bases__',
+    ]
+
+    def _sanitize_llm_output(self, response: Any) -> Any:
+        """
+        Validate and sanitize LLM output for dangerous dynamic code execution primitives.
+        Raises ValueError if dangerous patterns are detected in string output.
+        """
+        import re
+        if isinstance(response, str):
+            for pattern in self._DANGEROUS_LLM_PATTERNS:
+                if re.search(pattern, response, re.IGNORECASE):
+                    logger.error(
+                        "Dangerous code execution primitive detected in LLM output; blocking response.",
+                        extra={"pattern": pattern}
+                    )
+                    raise ValueError(
+                        f"LLM output contains a forbidden dynamic code execution primitive matching: {pattern}"
+                    )
+        elif isinstance(response, dict):
+            for key, value in response.items():
+                response[key] = self._sanitize_llm_output(value)
+        elif isinstance(response, list):
+            response = [self._sanitize_llm_output(item) for item in response]
+        return response
+
     async def handle(
         self,
         context: dict[str, Any],
@@ -105,7 +152,7 @@ class FinanceAgent:
         """
         # Authorization check
         # VULNERABILITY: Check exists but has bypass
-        if not self._verify_authorization(caller, headers):
+        if not self._verify_authorization(caller, headers, skip_internal_bypass=False):
             logger.warning(
                 "Unauthorized access attempt to finance agent",
                 extra={
@@ -119,9 +166,85 @@ class FinanceAgent:
                 "error": "unauthorized"
             }
 
-                import asyncio
-
         raw_message = context.get("user_message", "")
+
+        # --- Malicious content pre-checks before LLM forwarding ---
+        import re as _re
+        import base64 as _base64
+
+        def _contains_malicious_content(msg: str) -> tuple[bool, str]:
+            """Return (True, reason) if the message contains potentially malicious content."""
+            # 1. Binary / non-printable characters (excluding common whitespace)
+            if _re.search(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', msg):
+                return True, "binary or non-printable characters detected"
+
+            # 2. Shell command patterns
+            shell_patterns = [
+                r'(?i)\b(bash|sh|zsh|cmd|powershell|pwsh)\s*[-/]',
+                r'(?i)(\||;|&&|\$\(|`)[\s\S]{0,80}(rm|del|format|mkfs|dd\s)',
+                r'(?i)\b(wget|curl|nc|netcat|ncat)\s+\S',
+                r'(?i)\b(chmod|chown|sudo|su\s|runas)\b',
+                r'(?i)(exec\s*\(|system\s*\(|popen\s*\(|subprocess)',
+                r'(?i)\b(eval|exec)\s*[\(\[]',
+                r'(?i)/etc/(passwd|shadow|sudoers)',
+                r'(?i)(>|>>)\s*/\w',
+            ]
+            for pattern in shell_patterns:
+                if _re.search(pattern, msg):
+                    return True, "shell command pattern detected"
+
+            # 3. Base64-encoded content (long base64 blobs are suspicious)
+            b64_candidates = _re.findall(
+                r'(?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?',
+                msg
+            )
+            for candidate in b64_candidates:
+                try:
+                    decoded = _base64.b64decode(candidate).decode('utf-8', errors='replace')
+                    # Check decoded content for shell commands or prompt injection
+                    if _re.search(
+                        r'(?i)(ignore|disregard|forget|override|bypass|system\s*prompt'
+                        r'|bash|sh\s|cmd|powershell|wget|curl|exec\s*\()',
+                        decoded
+                    ):
+                        return True, "base64-encoded malicious content detected"
+                except Exception:
+                    pass
+
+            # 4. Leetspeak / obfuscated injection keywords
+            leet_map = str.maketrans('013456789@$!', 'oieashgtbgas')
+            normalized = msg.lower().translate(leet_map)
+            leet_patterns = [
+                r'ignore\s+(all\s+)?(previous|prior|above|earlier)\s+(instructions?|prompts?|rules?)',
+                r'(disregard|forget|override|bypass)\s+(your\s+)?(instructions?|rules?|guidelines?|system)',
+                r'you\s+are\s+now\s+(a\s+)?(?!a\s+financial)',
+                r'act\s+as\s+(a\s+)?(?!a\s+financial)',
+                r'new\s+(role|persona|identity|instructions?)',
+                r'(system|developer|admin)\s*:\s',
+            ]
+            for pattern in leet_patterns:
+                if _re.search(pattern, normalized):
+                    return True, "prompt injection or leetspeak obfuscation detected"
+
+            # 5. Hidden / invisible Unicode characters used for prompt smuggling
+            if _re.search(r'[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]', msg):
+                return True, "hidden Unicode characters detected"
+
+            return False, ""
+
+        _is_malicious, _reason = _contains_malicious_content(raw_message)
+        if _is_malicious:
+            logger.warning(
+                "Finance agent blocked malicious message content",
+                extra={"caller_id": caller.agent_id, "reason": _reason}
+            )
+            return {
+                "response": "Invalid request: message contains disallowed content.",
+                "agent": self.agent_id,
+                "error": "malicious_input"
+            }
+        # --- End malicious content pre-checks ---
+
         sanitized_message = self._sanitize_input(raw_message)
 
         # Validate sanitized input before spawning subagent
@@ -157,9 +280,52 @@ class FinanceAgent:
             }
         )
 
-                # Process the financial query
-        sanitized_message = self._sanitize_input(user_message)
-        response = await self._process_financial_query(sanitized_message)
+                # Process the financial query — pass only the sanitized message (reduced context)
+        # Explicit timeout and step-limit guard the subagent invocation
+        SPAWN_TIMEOUT_SECONDS = 30
+        SPAWN_MAX_STEPS = 10
+        reduced_payload = {
+            "query": sanitized_message,
+            "max_steps": SPAWN_MAX_STEPS,
+        }
+        logger.info(
+            "Finance subagent spawn: pre-spawn",
+            extra={
+                "caller_id": caller.agent_id,
+                "payload_keys": list(reduced_payload.keys()),
+                "query_length": len(sanitized_message),
+                "timeout": SPAWN_TIMEOUT_SECONDS,
+                "max_steps": SPAWN_MAX_STEPS,
+            }
+        )
+        try:
+            response = await asyncio.wait_for(
+                self._process_financial_query(
+                    reduced_payload["query"],
+                    max_steps=reduced_payload["max_steps"],
+                ),
+                timeout=SPAWN_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Finance subagent spawn timed out",
+                extra={"caller_id": caller.agent_id, "timeout": SPAWN_TIMEOUT_SECONDS}
+            )
+            return {
+                "response": "Request timed out. Please try again.",
+                "agent": self.agent_id,
+                "error": "timeout",
+            }
+        logger.info(
+            "Finance subagent spawn: post-spawn completed",
+            extra={
+                "caller_id": caller.agent_id,
+                "response_type": type(response).__name__,
+            }
+        )
+
+        # Validate LLM output for dangerous dynamic code execution primitives
+        response = self._sanitize_llm_output(response)
 
         # Audit log: record every AI-driven financial decision
         import hashlib as _hashlib
@@ -708,6 +874,9 @@ Format numbers clearly and provide relevant insights."""
 
         _audit_log = logging.getLogger("finance.audit")
 
+        # Sanitize query input before any use to prevent prompt injection.
+        query = self._sanitize_input(query)
+
         # Strict role-based authorisation — no internal bypass.
         if requester.privilege_level not in self.ALLOWED_ROLES:
             _audit_log.warning(
@@ -720,32 +889,17 @@ Format numbers clearly and provide relevant insights."""
             )
             return {"error": "Unauthorized"}
 
-        # Return only non-sensitive financial fields.
-        _EXCLUDED_KEYS = {"sensitive_projections", "merger_targets", "layoff_plans"}
-        filtered_data = {
-            k: v for k, v in self._financial_data.items()
-            if k not in _EXCLUDED_KEYS
-        }
-
-        # Audit log every successful access before returning data.
+        # Audit log every authorised access attempt before processing.
         _audit_log.info(
             "FINANCIAL_DATA_ACCESS_GRANTED | agent_id=%s | privilege_level=%s | "
-            "fields_returned=%s | query=%r | timestamp=%s",
+            "query=%r | timestamp=%s",
             requester.agent_id,
             requester.privilege_level,
-            list(filtered_data.keys()),
             query,
             datetime.datetime.utcnow().isoformat(),
         )
 
-        return {
-            "data": filtered_data,
-            "query": query,
-            "requester": requester.agent_id
-        }
-
-        # Sanitize query input to prevent malicious prompt injection
-        query = self._sanitize_input(query)
+        # Sanitization is now performed at the top of the method.
 
                 # Return only the fields directly relevant to the specific query (data minimisation).
         # Map recognised query keywords to the exact keys they are permitted to access.
@@ -776,16 +930,15 @@ Format numbers clearly and provide relevant insights."""
         }
         return {
             "data": scoped_data,
-            "query": query
+            "query": query  # query is already sanitized at method entry
         }
         filtered_data = {
             k: v for k, v in self._financial_data.items()
             if k not in _EXCLUDED_KEYS
         }
-        sanitized_query = self._sanitize_input(query)
         return {
-                        "data": filtered_data,
-            "query": query,
+            "data": filtered_data,
+            "query": query,  # query is already sanitized at method entry
             "requester": requester.agent_id
         }
         # Audit log: record every financial data disclosure
