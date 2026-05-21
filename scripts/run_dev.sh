@@ -130,12 +130,33 @@ elif [ ! -f "node_modules/.bin/next" ]; then
         kill $BACKEND_PID 2>/dev/null || true
         exit 1
     fi
-    TARGET_DIR="$PROJECT_ROOT/frontend/node_modules"
-    case "$TARGET_DIR" in
-        "$PROJECT_ROOT/frontend/"*) ;;
-        *) printf 'ERROR: node_modules path escapes frontend directory\n' >&2; kill "$BACKEND_PID" 2>/dev/null || true; exit 1 ;;
+    # Construct and validate TARGET_DIR with strict literal checks before any destructive operation
+    _EXPECTED_NODE_MODULES="${PROJECT_ROOT}/frontend/node_modules"
+    # Resolve PROJECT_ROOT to an absolute path and reject traversal attempts
+    case "$PROJECT_ROOT" in
+        /*) ;;
+        *) printf 'ERROR: PROJECT_ROOT is not an absolute path\n' >&2; kill "$BACKEND_PID" 2>/dev/null || true; exit 1 ;;
     esac
-    find "$TARGET_DIR" -mindepth 1 -delete
+    case "$PROJECT_ROOT" in
+        *../*|*/..*) printf 'ERROR: PROJECT_ROOT contains path traversal\n' >&2; kill "$BACKEND_PID" 2>/dev/null || true; exit 1 ;;
+    esac
+    # Reject if TARGET resolves to root, home, or any path shorter than expected depth
+    case "$_EXPECTED_NODE_MODULES" in
+        /|/home|/home/*|/root|/usr|/etc|/var|/tmp) printf 'ERROR: Refusing to delete sensitive directory\n' >&2; kill "$BACKEND_PID" 2>/dev/null || true; exit 1 ;;
+    esac
+    # Final guard: path must end exactly with /frontend/node_modules
+    case "$_EXPECTED_NODE_MODULES" in
+        */frontend/node_modules) ;;
+        *) printf 'ERROR: node_modules path does not match expected pattern\n' >&2; kill "$BACKEND_PID" 2>/dev/null || true; exit 1 ;;
+    esac
+    # Confirm directory exists and is not a symlink before deletion
+    if [ ! -d "$_EXPECTED_NODE_MODULES" ] || [ -L "$_EXPECTED_NODE_MODULES" ]; then
+        printf 'ERROR: node_modules is missing or is a symlink; aborting deletion\n' >&2
+        kill "$BACKEND_PID" 2>/dev/null || true
+        exit 1
+    fi
+    readonly TARGET_DIR="$_EXPECTED_NODE_MODULES"
+    find "$TARGET_DIR" -mindepth 1 -maxdepth 10 -not -path "$TARGET_DIR" -delete
     rmdir "$TARGET_DIR"
     npm install
 fi
@@ -150,7 +171,7 @@ echo ""
 echo "Waiting for frontend to initialize..."
 sleep 3
 
-if ! kill -0 $FRONTEND_PID 2>/dev/null; then
+if ! kill -0 "$FRONTEND_PID" 2>/dev/null; then
     echo "❌ ERROR: Frontend failed to start!"
     echo "   Check for errors above or try: cd frontend && npm install"
     if [ -n "$BACKEND_PID" ] && kill -0 "$BACKEND_PID" 2>/dev/null; then
