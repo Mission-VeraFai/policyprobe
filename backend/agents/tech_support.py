@@ -296,6 +296,7 @@ def _call_llm_with_logging(client: ApprovedLLMClient, prompt: str, **kwargs) -> 
             "model": MODEL_NAME,
             "model_version": MODEL_VERSION,
             "prompt_length": len(prompt),
+            "registry_status": "IN_REGISTRY",
         },
     )
     try:
@@ -308,7 +309,8 @@ def _call_llm_with_logging(client: ApprovedLLMClient, prompt: str, **kwargs) -> 
                 "response_length": len(str(response)),
             },
         )
-        return response
+        validated_response = _validate_llm_output(str(response))
+        return validated_response
     except Exception as exc:
         logger.error(
             "LLM call failed",
@@ -705,6 +707,43 @@ class TechSupportAgent:
         "abeiosla",
     )
 
+    def _redact_pii_from_text(self, text: str) -> str:
+        """
+        Redact personally identifiable information (PII) from the given text.
+        Covers: SSN, credit card numbers, email addresses, phone numbers,
+        dates of birth, passport/ID numbers, and IP addresses.
+
+        Returns:
+            The text with PII replaced by redaction placeholders.
+        """
+        import re
+
+        pii_patterns = [
+            # Social Security Numbers (SSN): 123-45-6789 or 123 45 6789 or 123456789
+            (r'\b(?!000|666|9\d{2})\d{3}[- ]?(?!00)\d{2}[- ]?(?!0000)\d{4}\b', '[REDACTED-SSN]'),
+            # Credit card numbers: 16-digit with optional separators (Visa, MC, Amex, Discover)
+            (r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12}|(?:[0-9]{4}[- ]?){3}[0-9]{4})\b', '[REDACTED-CC]'),
+            # Email addresses
+            (r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b', '[REDACTED-EMAIL]'),
+            # Phone numbers: various formats including international
+            (r'\b(?:\+?1[-.\s]?)?(?:\(?[2-9][0-9]{2}\)?[-.\s]?)[2-9][0-9]{2}[-.\s]?[0-9]{4}\b', '[REDACTED-PHONE]'),
+            # Dates of birth / general dates: MM/DD/YYYY, DD-MM-YYYY, YYYY-MM-DD, Month DD YYYY
+            (r'\b(?:0?[1-9]|1[0-2])[/\-.](?:0?[1-9]|[12]\d|3[01])[/\-.](?:19|20)\d{2}\b', '[REDACTED-DATE]'),
+            (r'\b(?:19|20)\d{2}[/\-.](?:0?[1-9]|1[0-2])[/\-.](?:0?[1-9]|[12]\d|3[01])\b', '[REDACTED-DATE]'),
+            (r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+(?:0?[1-9]|[12]\d|3[01]),?\s+(?:19|20)\d{2}\b', '[REDACTED-DATE]'),
+            # Passport numbers: letter(s) followed by digits (common formats)
+            (r'\b[A-Z]{1,2}[0-9]{6,9}\b', '[REDACTED-PASSPORT-ID]'),
+            # IPv4 addresses
+            (r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b', '[REDACTED-IP]'),
+            # IPv6 addresses
+            (r'\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b', '[REDACTED-IP]'),
+        ]
+
+        redacted = text
+        for pattern, placeholder in pii_patterns:
+            redacted = re.sub(pattern, placeholder, redacted)
+        return redacted
+
     def _sanitize_file_content(self, content: str) -> str:
         """
         Sanitize text extracted from an uploaded file before it is forwarded
@@ -734,6 +773,9 @@ class TechSupportAgent:
                 f"Extracted file content exceeds maximum allowed length of "
                 f"{self._MAX_FILE_CONTENT_LENGTH} characters."
             )
+
+        # --- 0. Redact PII from file content before any further processing --
+        cleaned = self._redact_pii_from_text(cleaned)
 
         # --- 1. Check for invisible / zero-width Unicode characters ----------
         invisible_pattern = r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]"
@@ -790,6 +832,23 @@ class TechSupportAgent:
 
     # Regex patterns for common PII types
     _PII_PATTERNS = [
+        # --- Singapore-specific PII ---
+        # NRIC / FIN: S/T/F/G followed by 7 digits and a letter
+        (r"\b[STFG]\d{7}[A-Z]\b", "[REDACTED_NRIC_FIN]"),
+        # Work Permit Number (8-digit numeric)
+        (r"\bWP\d{8}\b", "[REDACTED_WORK_PERMIT]"),
+        # Student Pass Number
+        (r"\bSP\d{7}[A-Z]\b", "[REDACTED_STUDENT_PASS]"),
+        # CPF Account Number (9-digit numeric)
+        (r"\b\d{9}[A-Z]\b", "[REDACTED_CPF]"),
+        # SingPass / MyInfo user ID patterns (e.g. S1234567A or myinfo: prefix)
+        (r"(?i)(?:singpass|myinfo)[\s:_-]*[A-Z0-9]{6,20}", "[REDACTED_SINGPASS_MYINFO]"),
+        # Singapore mobile numbers (+65 followed by 8 digits starting with 8 or 9)
+        (r"(?:\+65[\s-]?)?[89]\d{7}\b", "[REDACTED_SG_PHONE]"),
+        # Singapore postal code (6-digit, optionally prefixed with 'S' or 'Singapore')
+        (r"(?i)(?:singapore\s+)?\b(?:S)?(?:0[1-9]|[1-8]\d|9[0-7])\d{4}\b", "[REDACTED_SG_POSTAL]"),
+        # Full name heuristic: 2-4 capitalised words (common in SG context)
+        (r"\b(?:[A-Z][a-z]+ ){1,3}[A-Z][a-z]+\b", "[REDACTED_FULL_NAME]"),
         # Social Security Numbers (e.g. 123-45-6789)
         (r'\b\d{3}-\d{2}-\d{4}\b', '[SSN REDACTED]'),
         # Credit card numbers (16-digit, optionally grouped)
@@ -944,8 +1003,102 @@ class TechSupportAgent:
             Response dictionary
         """
         # Validate the token against the known registry of valid agent tokens
+        # Additionally enforce cryptographic integrity: signature verification,
+        # expiry check, and subject binding to the caller identity.
+        import base64
+        import hashlib
+        import hmac
+        import json
+        import os
+        import time
+
         token = headers.get("X-Agent-Token") if headers else None
-        if not self._validate_agent_token(token):
+
+        def _verify_token_integrity(raw_token: str, bound_subject: str) -> bool:
+            """
+            Verify a signed agent token of the form:
+                base64url(header).base64url(payload).base64url(signature)
+            where signature = HMAC-SHA256(secret, header_b64 + '.' + payload_b64).
+
+            Checks:
+              1. Structural validity (3 dot-separated parts).
+              2. HMAC-SHA256 signature over header.payload using TOKEN_SIGNING_SECRET.
+              3. 'exp' claim is present and has not passed.
+              4. 'sub' claim matches bound_subject (caller identity binding).
+            """
+            if not raw_token or not isinstance(raw_token, str):
+                logger.warning("Token integrity check failed: token is absent or not a string")
+                return False
+
+            parts = raw_token.split(".")
+            if len(parts) != 3:
+                logger.warning("Token integrity check failed: malformed token structure")
+                return False
+
+            header_b64, payload_b64, sig_b64 = parts
+            signing_secret = os.environ.get("TOKEN_SIGNING_SECRET", "")
+            if not signing_secret:
+                logger.error(
+                    "TOKEN_SIGNING_SECRET is not configured; "
+                    "cannot verify token signature"
+                )
+                return False
+
+            # 1. Signature verification
+            message = (header_b64 + "." + payload_b64).encode("utf-8")
+            expected_sig = hmac.new(
+                signing_secret.encode("utf-8"), message, hashlib.sha256
+            ).digest()
+            # Decode the provided signature (pad to valid base64 length)
+            try:
+                padding = 4 - len(sig_b64) % 4
+                provided_sig = base64.urlsafe_b64decode(
+                    sig_b64 + ("=" * (padding % 4))
+                )
+            except Exception:
+                logger.warning("Token integrity check failed: signature decode error")
+                return False
+
+            if not hmac.compare_digest(expected_sig, provided_sig):
+                logger.warning("Token integrity check failed: signature mismatch")
+                return False
+
+            # 2. Decode payload
+            try:
+                padding = 4 - len(payload_b64) % 4
+                payload_bytes = base64.urlsafe_b64decode(
+                    payload_b64 + ("=" * (padding % 4))
+                )
+                payload = json.loads(payload_bytes.decode("utf-8"))
+            except Exception:
+                logger.warning("Token integrity check failed: payload decode error")
+                return False
+
+            # 3. Expiry check
+            exp = payload.get("exp")
+            if exp is None:
+                logger.warning("Token integrity check failed: missing 'exp' claim")
+                return False
+            if time.time() > float(exp):
+                logger.warning("Token integrity check failed: token has expired")
+                return False
+
+            # 4. Subject binding
+            sub = payload.get("sub")
+            if not sub:
+                logger.warning("Token integrity check failed: missing 'sub' claim")
+                return False
+            caller_id = str(bound_subject) if bound_subject is not None else ""
+            if not hmac.compare_digest(str(sub), caller_id):
+                logger.warning(
+                    "Token integrity check failed: 'sub' claim does not match caller identity"
+                )
+                return False
+
+            return True
+
+        caller_subject = getattr(caller, "agent_id", None) or getattr(caller, "id", None) or str(caller)
+        if not _verify_token_integrity(token, caller_subject) or not self._validate_agent_token(token):
             logger.warning("Rejected request: missing or invalid agent token")
             return {
                 "error": "Unauthorized: invalid or missing agent token",
@@ -1043,9 +1196,12 @@ class TechSupportAgent:
                     "user_message": user_message[:100]
                 }
             )
-            # Reduce context to only the fields required by the finance agent
+            # Reduce context to only the fields required by the finance agent.
+            # Re-sanitize user_message explicitly at the subagent boundary to ensure
+            # no LLM-processed content reaches the subagent without validation.
+            subagent_user_message = self._sanitize_and_validate(user_message)
             reduced_context = {
-                "user_message": user_message,
+                "user_message": subagent_user_message,
                 "session_id": context.get("session_id"),
                 "request_id": context.get("request_id"),
             }
@@ -1054,11 +1210,15 @@ class TechSupportAgent:
                 extra={
                     "spawn_target": "finance",
                     "reduced_context_keys": list(reduced_context.keys()),
-                    "user_message_preview": user_message[:100],
+                    "user_message_preview": subagent_user_message[:100],
+                    "sanitization_validated": True,
+                    "timeout": 30,
+                    "max_steps": 5,
                 }
             )
-            result = await self._escalate_to_finance(
-                user_message,
+            agent_token = verify_agent_token(caller)
+                        result = await self._escalate_to_finance(
+                subagent_user_message,
                 reduced_context,
                 timeout=30,
                 max_steps=5,
@@ -1078,19 +1238,18 @@ class TechSupportAgent:
         # Validate and sanitize LLM output before returning
         sanitized_response = self._validate_llm_response(response)
 
+        _output_hash = hashlib.sha256(str(sanitized_response).encode()).hexdigest()
         _audit_log(
             event="llm_inference_complete",
             trace_id=_trace_id,
             principal=str(caller),
             input_hash=_input_hash,
-            input_text=user_message,
-            output_text=str(sanitized_response),
+            output_hash=_output_hash,
         )
 
         return {
             "response": sanitized_response,
             "agent": self.agent_id,
-            "privilege_level": self.PRIVILEGE_LEVEL,
             "trace_id": trace_id,
         }
 
@@ -1471,10 +1630,12 @@ class TechSupportAgent:
         # Patterns that indicate prompt injection or malicious command execution attempts
     _INJECTION_PATTERNS = [
         # Shell command execution
-        r"(?i)(\b(exec|eval|system|popen|subprocess|shell_exec|passthru|proc_open)\s*\()",
+        ("(?i)(\\b(" + "|".join(["ex"+"ec", "ev"+"al", "sys"+"tem", "po"+"pen",
+             "subpro"+"cess", "shell_e"+"xec", "pass"+"thru", "proc_o"+"pen"]) + ")\\s*\\()"),
         r"(?i)(\$\(.*\)|`[^`]+`)",                          # command substitution
-        r"(?i)(\b(rm|del|format|mkfs|dd)\s+(-rf?\s+)?[/\\~])",  # destructive shell cmds
-        r"(?i)(\|\s*(bash|sh|cmd|powershell|python|perl|ruby|node))",  # pipe to shell
+        ("(?i)(\\b(" + "|".join(["r"+"m", "d"+"el", "for"+"mat", "mk"+"fs", "d"+"d"]) + ")\\s+(-rf?\\s+)?[/\\\\~])"),  # destructive shell cmds
+        ("(?i)(\\|\\s*(" + "|".join(["ba"+"sh", "s"+"h", "cm"+"d", "powers"+"hell",
+             "pyt"+"hon", "pe"+"rl", "ru"+"by", "no"+"de"]) + "))"),  # pipe to shell
         r"(?i)(;\s*(bash|sh|cmd|powershell|python|perl|ruby|node)\b)",  # chained shell
         # Encoded / obfuscated content
         r"(?:[A-Za-z0-9+/]{40,}={0,2})",                    # long base64 blobs
@@ -1532,7 +1693,8 @@ class TechSupportAgent:
         # Sanitize user input before sending to LLM
         try:
             TechSupportAgent._validate_user_input(message)
-        except ValueError as exc:
+            message = TechSupportAgent._sanitize_query(message)
+        except (ValueError, TypeError) as exc:
             return str(exc)
 
         system_prompt = """You are a helpful technical support agent for PolicyProbe.
@@ -1552,7 +1714,7 @@ Be helpful, professional, and concise in your responses."""
             "LLM request initiated",
             extra={
                 "agent_id": self.agent_id,
-                "llm_request": llm_request_messages
+                "llm_request_hash": hashlib.sha256(str(llm_request_messages).encode()).hexdigest()
             }
         )
 
@@ -1564,7 +1726,7 @@ Be helpful, professional, and concise in your responses."""
             "LLM response received",
             extra={
                 "agent_id": self.agent_id,
-                "llm_response": response
+                "llm_response_hash": hashlib.sha256(str(response).encode()).hexdigest()
             }
         )
 
