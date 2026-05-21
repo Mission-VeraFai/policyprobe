@@ -156,7 +156,15 @@ elif [ ! -f "node_modules/.bin/next" ]; then
         exit 1
     fi
     readonly TARGET_DIR="$_EXPECTED_NODE_MODULES"
+    printf 'AUDIT: Deleting contents of %s\n' "$TARGET_DIR" >&2
+    read -r -p "Final confirmation: permanently delete '$TARGET_DIR' and all contents? [y/N]: " _DEL_CONFIRM
+    if [[ ! "$_DEL_CONFIRM" =~ ^[Yy]$ ]]; then
+        printf 'Deletion cancelled by user. Aborting.\n' >&2
+        kill "$BACKEND_PID" 2>/dev/null || true
+        exit 1
+    fi
     find "$TARGET_DIR" -mindepth 1 -maxdepth 10 -not -path "$TARGET_DIR" -delete
+    printf 'AUDIT: Removing directory %s\n' "$TARGET_DIR" >&2
     rmdir "$TARGET_DIR"
     npm install
 fi
@@ -175,7 +183,13 @@ if ! kill -0 "$FRONTEND_PID" 2>/dev/null; then
     echo "❌ ERROR: Frontend failed to start!"
     echo "   Check for errors above or try: cd frontend && npm install"
     if [ -n "$BACKEND_PID" ] && kill -0 "$BACKEND_PID" 2>/dev/null; then
-        kill -TERM "$BACKEND_PID"
+        printf 'AUDIT: About to send SIGTERM to backend PID %s due to frontend startup failure.\n' "$BACKEND_PID" >&2
+        read -r -p "Approve terminating backend process $BACKEND_PID? [y/N]: " _KILL_CONFIRM
+        if [[ "$_KILL_CONFIRM" =~ ^[Yy]$ ]]; then
+            kill -TERM "$BACKEND_PID"
+        else
+            printf 'Backend termination skipped by user.\n' >&2
+        fi
     fi
     exit 1
 fi
