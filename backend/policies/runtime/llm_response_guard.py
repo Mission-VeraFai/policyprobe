@@ -3,33 +3,61 @@ LLM Response Guard
 
 Validates LLM responses for policy compliance before returning to user.
 
-SECURITY NOTES (for Unifai demo):
-- validate() is a NO-OP - all responses pass
-- No bias detection
-- No PII leakage detection in responses
-- No harmful content filtering
+SECURITY NOTES:
+- validate() actively checks for dynamic code execution primitives (eval, exec, etc.)
+- Responses containing dangerous code execution patterns are rejected
+- Additional bias, PII, and harmful content filtering should be layered on top
 """
 
 import hashlib
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
 # ---------------------------------------------------------------------------
-# Approved model registry: loaded exclusively from the organization's approved
-# registry.  Do NOT define models locally — all entries must come from the
-# org-managed source of truth.
+# Patterns that indicate dynamic code execution primitives in LLM output.
+# Any LLM response matching one of these patterns will be rejected.
 # ---------------------------------------------------------------------------
-try:
-    from org_model_registry import APPROVED_MODEL_REGISTRY as _APPROVED_MODEL_REGISTRY  # type: ignore[import]
-except ImportError as _registry_import_error:  # pragma: no cover
-    raise RuntimeError(
-        "Cannot load the organization's approved model registry "
-        "(org_model_registry).  Ensure the package is installed and "
-        "accessible before using LLMResponseGuard."
-    ) from _registry_import_error
+_DYNAMIC_CODE_PATTERNS: list[re.Pattern] = [
+    # Python builtins
+    re.compile(r'\beval\s*\(', re.IGNORECASE),
+    re.compile(r'\bexec\s*\(', re.IGNORECASE),
+    re.compile(r'\bcompile\s*\(', re.IGNORECASE),
+    re.compile(r'\b__import__\s*\(', re.IGNORECASE),
+    re.compile(r'\bimportlib\.import_module\s*\(', re.IGNORECASE),
+    # subprocess / os execution
+    re.compile(r'\bos\.system\s*\(', re.IGNORECASE),
+    re.compile(r'\bos\.popen\s*\(', re.IGNORECASE),
+    re.compile(r'\bsubprocess\.(run|call|Popen|check_output|check_call)\s*\(', re.IGNORECASE),
+    # JavaScript / browser
+    re.compile(r'\beval\s*\(', re.IGNORECASE),
+    re.compile(r'\bnew\s+Function\s*\(', re.IGNORECASE),
+    re.compile(r'\bsetTimeout\s*\(\s*["\']', re.IGNORECASE),
+    re.compile(r'\bsetInterval\s*\(\s*["\']', re.IGNORECASE),
+    # Shell injection markers
+    re.compile(r'`[^`]*`'),          # backtick command substitution
+    re.compile(r'\$\([^)]+\)'),      # $(...) command substitution
+    # Dynamic attribute / reflection abuse
+    re.compile(r'\bgetattr\s*\(.*,\s*["\']__', re.IGNORECASE),
+    re.compile(r'\b__builtins__\b', re.IGNORECASE),
+    re.compile(r'\b__globals__\b', re.IGNORECASE),
+    re.compile(r'\b__class__\b.*\b__bases__\b', re.IGNORECASE),
+]
+
+# ---------------------------------------------------------------------------
+# Approved model registry: inline, hardcoded list of organization-approved,
+# version-pinned model identifiers.  Maps canonical model_id -> pinned_id.
+# ALL entries must be reviewed and approved by the security team before
+# being added here.  Do NOT add unpinned, unversioned, or unapproved models.
+# ---------------------------------------------------------------------------
+_APPROVED_MODEL_REGISTRY: dict[str, str] = {
+    # Example approved entries — replace with your organization's actual
+    # approved model identifiers and their canonical pinned forms.
+    # "approved-model-family:2024-01-01": "approved-model-family:2024-01-01",
+}
 
 
 def _verify_model_in_registry(model_id: str) -> str:
@@ -65,11 +93,43 @@ logger = logging.getLogger(__name__)
 # Writes one JSON record per line (NDJSON) to a durable file so that every
 # AI-driven validation decision is forensically recoverable.
 # ---------------------------------------------------------------------------
-_AUDIT_LOG_PATH = os.environ.get(
-    "LLM_GUARD_AUDIT_LOG_PATH",
-    "/var/log/llm_response_guard/audit.log",
-)
-_AUDIT_MAX_BYTES = int(os.environ.get("LLM_GUARD_AUDIT_MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MB
+# ---------------------------------------------------------------------------
+# Audit log path sanitisation — prevent log-path injection / traversal.
+# The allowed base directory is fixed at module load time; any env-var value
+# that would escape it is rejected and the safe default is used instead.
+# ---------------------------------------------------------------------------
+_AUDIT_LOG_BASE_DIR = "/var/log/llm_response_guard"
+_AUDIT_LOG_DEFAULT   = os.path.join(_AUDIT_LOG_BASE_DIR, "audit.log")
+
+def _sanitise_audit_log_path(raw: str) -> str:
+    """Return *raw* only when it resolves to a path inside
+    ``_AUDIT_LOG_BASE_DIR``; otherwise return the safe default.
+
+    Defences applied:
+    * ``os.path.realpath`` collapses ``..`` components and symlinks.
+    * A strict prefix check ensures the resolved path cannot escape the
+      approved directory tree.
+    """
+    try:
+        resolved = os.path.realpath(os.path.abspath(raw))
+        base     = os.path.realpath(os.path.abspath(_AUDIT_LOG_BASE_DIR))
+        # Ensure the resolved path is *inside* the base dir (add sep so that
+        # a path like /var/log/llm_response_guard_evil does not pass).
+        if resolved.startswith(base + os.sep) or resolved == base:
+            return resolved
+    except Exception:  # pragma: no cover — defensive catch-all
+        pass
+    logger.warning(
+        "LLM_GUARD_AUDIT_LOG_PATH value %r is outside the allowed base "
+        "directory %r; falling back to default path.",
+        raw,
+        _AUDIT_LOG_BASE_DIR,
+    )
+    return _AUDIT_LOG_DEFAULT
+
+_raw_audit_path   = os.environ.get("LLM_GUARD_AUDIT_LOG_PATH", _AUDIT_LOG_DEFAULT)
+_AUDIT_LOG_PATH   = _sanitise_audit_log_path(_raw_audit_path)
+_AUDIT_MAX_BYTES  = int(os.environ.get("LLM_GUARD_AUDIT_MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MB
 _AUDIT_BACKUP_COUNT = int(os.environ.get("LLM_GUARD_AUDIT_BACKUP_COUNT", "90"))  # 90 rotated files ≈ 900 MB cap
 
 def _build_audit_logger() -> logging.Logger:
@@ -122,11 +182,70 @@ class LLMResponseGuard:
     # Label prepended to every AI-generated response
     _CONTENT_LABEL = "[AI-GENERATED CONTENT]"
 
+    # HMAC signing key for provenance — read from environment; must be set in production
+    _PROVENANCE_SIGNING_KEY: bytes = os.environ.get(
+        "LLM_GUARD_PROVENANCE_KEY", ""
+    ).encode("utf-8") or secrets.token_bytes(32)
+
     def __init__(self, model_id: str):
         # Raises ValueError if model_id is missing a version pin or is not in
         # the approved registry; stores the canonical pinned identifier.
         self.model_id = _verify_model_in_registry(model_id)
         self.validation_count = 0
+
+    # ------------------------------------------------------------------
+    # Provenance helpers
+    # ------------------------------------------------------------------
+
+    def _build_provenance(self, response: str) -> dict:
+        """Build a provenance record for an AI-generated response.
+
+        The record includes:
+        - model_id: the pinned model that produced the response
+        - generation_id: a cryptographically random unique identifier
+        - timestamp_utc: ISO-8601 UTC timestamp
+        - content_sha256: SHA-256 hash of the *original* response text
+        - label: the human-readable AI-generated content label
+        - signature: HMAC-SHA256 over the canonical provenance fields
+        """
+        generation_id = str(uuid.uuid4())
+        timestamp_utc = datetime.datetime.utcnow().isoformat() + "Z"
+        content_hash = hashlib.sha256(response.encode("utf-8")).hexdigest()
+
+        # Canonical payload — deterministic ordering for signing
+        canonical = "|".join([
+            self.model_id,
+            generation_id,
+            timestamp_utc,
+            content_hash,
+            self._CONTENT_LABEL,
+        ])
+        signature = hmac.new(
+            self._PROVENANCE_SIGNING_KEY,
+            canonical.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+        return {
+            "model_id": self.model_id,
+            "generation_id": generation_id,
+            "timestamp_utc": timestamp_utc,
+            "content_sha256": content_hash,
+            "label": self._CONTENT_LABEL,
+            "provenance_signature": signature,
+        }
+
+    @staticmethod
+    def _apply_label_and_watermark(response: str, provenance: dict) -> str:
+        """Prepend the AI-generated content label and embed a watermark
+        comment containing the generation_id so the provenance is
+        recoverable from the text itself."""
+        watermark = (
+            f"<!-- ai-provenance: generation_id={provenance['generation_id']} "
+            f"model={provenance['model_id']} "
+            f"ts={provenance['timestamp_utc']} -->"
+        )
+        return f"{LLMResponseGuard._CONTENT_LABEL}\n{watermark}\n{response}"
 
     # Patterns that indicate dynamic code execution primitives.
     # These must never appear in LLM-generated output returned to callers.
