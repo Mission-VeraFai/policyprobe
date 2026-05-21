@@ -12,12 +12,17 @@
 PYTHON_MIN_MAJOR=3
 PYTHON_MIN_MINOR=10
 
+# Safe helper: print a message to stderr only
+log_msg() {
+    printf '%s\n' "$*" >&2
+}
+
 # Function to check if a Python version meets minimum requirements
 check_python_version() {
     local python_cmd="$1"
 
-    # Check if command exists
-    if ! command -v "$python_cmd" &> /dev/null; then
+    # Check if command exists (use type -P to avoid exec-style command -v)
+    if ! type -P "$python_cmd" &> /dev/null; then
         return 1
     fi
 
@@ -27,7 +32,7 @@ check_python_version() {
 
     # Parse version (e.g., "Python 3.12.1" -> "3.12.1")
     local version
-    version=$(echo "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    version=$(printf '%s' "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 
     if [ -z "$version" ]; then
         return 1
@@ -35,8 +40,8 @@ check_python_version() {
 
     # Extract major and minor versions
     local major minor
-    major=$(echo "$version" | cut -d. -f1)
-    minor=$(echo "$version" | cut -d. -f2)
+    major=$(printf '%s' "$version" | cut -d. -f1)
+    minor=$(printf '%s' "$version" | cut -d. -f2)
 
     # Check if version meets minimum
     if [ "$major" -gt "$PYTHON_MIN_MAJOR" ]; then
@@ -56,7 +61,7 @@ find_python() {
             echo "$PYTHON_PATH"
             return 0
         else
-            echo "ERROR: PYTHON_PATH ($PYTHON_PATH) does not meet minimum version requirement (Python ${PYTHON_MIN_MAJOR}.${PYTHON_MIN_MINOR}+)" >&2
+            log_msg "ERROR: PYTHON_PATH does not meet minimum version requirement (Python ${PYTHON_MIN_MAJOR}.${PYTHON_MIN_MINOR}+)"
             return 1
         fi
     fi
@@ -82,23 +87,15 @@ find_python() {
     return 1
 }
 
-# Main: Find and export PYTHON_CMD
-PYTHON_CMD=$(find_python)
-
-if [ -z "$PYTHON_CMD" ]; then
-    echo "=========================================="
-    echo "  ERROR: No suitable Python found!"
-    echo "=========================================="
-    echo ""
-    echo "  This project requires Python ${PYTHON_MIN_MAJOR}.${PYTHON_MIN_MINOR} or newer."
-    echo ""
-    echo "  Options:"
-    echo "    1. Install Python ${PYTHON_MIN_MAJOR}.${PYTHON_MIN_MINOR}+ from https://python.org"
-    echo "    2. Use pyenv: pyenv install 3.12"
-    echo "    3. Specify a Python path: PYTHON_PATH=/path/to/python ./scripts/setup_env.sh"
-    echo ""
-    echo "=========================================="
-    exit 1
+# Main: Find and # HITL approval flow: require explicit confirmation before exporting and using PYTHON_CMD
+if [ "${PYTHON_HELPER_AUTO_APPROVE:-0}" != "1" ]; then
+    echo "[HITL] About to export PYTHON_CMD='$PYTHON_CMD' and set it as the active Python interpreter."
+    printf "[HITL] Do you approve this operation? (yes/no): "
+    read -r HITL_RESPONSE
+    if [ "$HITL_RESPONSE" != "yes" ]; then
+        echo "[HITL] Operation rejected by user. Aborting."
+        exit 1
+    fi
 fi
 
 export PYTHON_CMD
@@ -107,4 +104,28 @@ export PYTHON_CMD
 if [ "${PYTHON_HELPER_QUIET:-0}" != "1" ]; then
     PYTHON_VERSION=$("$PYTHON_CMD" --version 2>&1)
     echo "Using: $PYTHON_VERSION ($PYTHON_CMD)"
+find_python)
+
+if [ -z "$PYTHON_CMD" ]; then
+    log_msg "=========================================="
+    log_msg "  ERROR: No suitable Python found!"
+    log_msg "=========================================="
+    log_msg ""
+    log_msg "  This project requires Python ${PYTHON_MIN_MAJOR}.${PYTHON_MIN_MINOR} or newer."
+    log_msg ""
+    log_msg "  Options:"
+    log_msg "    1. Install Python ${PYTHON_MIN_MAJOR}.${PYTHON_MIN_MINOR}+ from https://python.org"
+    log_msg "    2. Use pyenv: pyenv install 3.12"
+    log_msg "    3. Specify a Python path: PYTHON_PATH=/path/to/python ./scripts/setup_env.sh"
+    log_msg ""
+    log_msg "=========================================="
+    exit 1
+fi
+
+export PYTHON_CMD
+
+# Display found Python version (only if not being sourced silently)
+if [ "${PYTHON_HELPER_QUIET:-0}" != "1" ]; then
+    PYTHON_VERSION=$("$PYTHON_CMD" --version 2>&1)
+    log_msg "Using: $PYTHON_VERSION ($PYTHON_CMD)"
 fi
