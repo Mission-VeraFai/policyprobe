@@ -3,13 +3,7 @@ File Processor Agent
   
 """
 
-import base64
 import hashlib
-
-
-def _b64p(encoded: str) -> str:
-    """Decode a base64-encoded regex pattern string at runtime."""
-    return base64.b64decode(encoded).decode("utf-8")
 
 import json
 import logging
@@ -19,8 +13,29 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import re
-import re
 from file_parsers.pdf_parser import PDFParser
+
+# ---------------------------------------------------------------------------
+# Approved LLM Registry
+# ---------------------------------------------------------------------------
+# Only models listed here may be used. Update via the organization's
+# model-approval process; do NOT add models without registry approval.
+_APPROVED_LLM_REGISTRY = {
+    "default": os.environ.get("APPROVED_LLM_MODEL", "approved-gpt-4o"),
+}
+
+def _get_approved_model(alias: str = "default") -> str:
+    """Return an approved model name from the registry.
+
+    Raises:
+        KeyError: if *alias* is not present in the approved registry.
+    """
+    if alias not in _APPROVED_LLM_REGISTRY:
+        raise KeyError(
+            f"Model alias '{alias}' is not in the approved LLM registry. "
+            "Contact the security team to request approval."
+        )
+    return _APPROVED_LLM_REGISTRY[alias]
 from file_parsers.image_parser import ImageParser
 from file_parsers.html_parser import HTMLParser
 
@@ -30,16 +45,25 @@ from file_parsers.html_parser import HTMLParser
 # Base64-encoded patterns to avoid accidental triggering of static scanners
 _SG_PII_PATTERNS = [
     # NRIC / FIN: S/T/F/G/M followed by 7 digits and a letter
-    _b64p("W1NURkdNXVxcZHs3fVtBLVpdKD86XFxzKz8p"),
+    r'[STFGM]\d{7}[A-Z](?:\s+)?',
     # Singapore mobile numbers: +65 or 65 prefix, 8-digit starting with 8 or 9
-    _b64p("KD86XFwrNjVbXFxzXFwtXSk/Wzg5XVxkezd9"),
+    r'(?:\+65[\s\-])?[89]\d{7}',
     # CPF account number: 9 digits (common format)
-    _b64p("KD86XFxiKVxcZHs5fSg/OlxcYik="),
+    r'(?:\b)\d{9}(?:\b)',
+    # Passport number: 2 letters + 7 digits (Singapore passport)
+    r'[A-Z]{2}\d{7}',
+    # Singapore postal code: 6 digits (contextual)
+    r'(?:postal|postal code)\s:\s*\d{6}',
+]\d{7}[A-Z](?:\s+?)',
+    # Singapore mobile numbers: +65 or 65 prefix, 8-digit starting with 8 or 9
+    r'(?:\+65[\s\-])?[89]\d{7}',
+    # CPF account number: 9 digits (common format)
+    r'(?:\b)\d{9}(?:\b)',
     # SingPass ID pattern: NRIC-like or email-based (NRIC already covered)
     # Passport number: 2 letters + 7 digits (Singapore passport)
-    _b64p("W0EtWl17Mn1cXGR7N30="),
+    r'[A-Z]{2}\d{7}',
     # Singapore postal code: 6 digits (contextual)
-    _b64p("KD86cG9zdGFsfHBvc3RhbCBjb2RlKVxcczpcXHMqXFxkezZ9"),
+    r'(?:postal|postal code)\s:\s*\d{6}',
 ]
 
 _SG_PII_COMPILED = [re.compile(p, re.IGNORECASE) for p in _SG_PII_PATTERNS]
@@ -935,12 +959,77 @@ class FileProcessorAgent:
             call_fn:           Callable that performs the actual LLM call.
             *args / **kwargs:  Forwarded verbatim to call_fn.
         """
-        import concurrent.futures as _cf
+                import concurrent.futures as _cf
         import logging as _logging
+        import datetime as _datetime
+        import hashlib as _hashlib
+        import hmac as _hmac
+        import json as _json
+        import os as _os
         _log = _logging.getLogger(__name__)
         _LLM_TIMEOUT_SECONDS = 60
 
+        # --- provenance helpers ------------------------------------------------
+        _PROVENANCE_SECRET = _os.environ.get(
+            "LLM_PROVENANCE_HMAC_SECRET", "change-me-in-production"
+        ).encode()
+
+        def _attach_provenance(raw_result, description: str) -> dict:
+            """
+            Wrap *raw_result* in (or augment) a dict that carries:
+              • __ai_generated__   : bool flag — synthetic-content label
+              • __provenance__     : dict with model_id, timestamp, origin_tag
+              • __provenance_sig__ : hex HMAC-SHA256 over the provenance dict
+            """
+            model_id = _os.environ.get("LLM_MODEL_ID", "unknown-model")
+            provenance = {
+                "model_id": model_id,
+                "timestamp": _datetime.datetime.utcnow().isoformat() + "Z",
+                "origin_tag": "ai-generated",
+                "call_description": description,
+            }
+            provenance_bytes = _json.dumps(provenance, sort_keys=True).encode()
+            signature = _hmac.new(
+                _PROVENANCE_SECRET,
+                provenance_bytes,
+                _hashlib.sha256,
+            ).hexdigest()
+
+            if isinstance(raw_result, dict):
+                enriched = dict(raw_result)
+            else:
+                enriched = {"content": raw_result}
+
+            enriched["__ai_generated__"] = True
+            enriched["__provenance__"] = provenance
+            enriched["__provenance_sig__"] = signature
+            return enriched
+        # -----------------------------------------------------------------------
+
         _log.info("[LLM SPAWN] %s — starting", call_description)
+        try:
+            with _cf.ThreadPoolExecutor(max_workers=1) as _executor:
+                future = _executor.submit(call_fn, *args, **kwargs)
+                result = future.result(timeout=_LLM_TIMEOUT_SECONDS)
+            _log.info("[LLM SPAWN] %s — completed successfully", call_description)
+            result = _attach_provenance(result, call_description)
+            _log.info(
+                "[LLM SPAWN] %s — provenance attached (model=%s, sig=%s…)",
+                call_description,
+                result["__provenance__"]["model_id"],
+                result["__provenance_sig__"][:16],
+            )
+            return result
+        except _cf.TimeoutError:
+            _log.error("[LLM SPAWN] %s — timed out after %ds", call_description, _LLM_TIMEOUT_SECONDS)
+            raise RuntimeError(f"LLM call '{call_description}' exceeded timeout of {_LLM_TIMEOUT_SECONDS}s")
+        except Exception as exc:
+            _log.error("[LLM SPAWN] %s — failed: %s", call_description, exc)
+            raise ValueError(
+                    f"LLM call '{call_description}' blocked: malicious content detected "
+                    f"in argument '{_arg_name}': {_reason}"
+                )
+
         try:
             with _cf.ThreadPoolExecutor(max_workers=1) as _executor:
                 future = _executor.submit(call_fn, *args, **kwargs)
