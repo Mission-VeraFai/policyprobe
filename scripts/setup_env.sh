@@ -36,13 +36,13 @@ if [ "$_hitl_approval" != "yes" ]; then
     printf 'Deletion not approved. Aborting setup.\n' >&2
     exit 1
 fi
-unlink "$_helper_out"
+rm -f "$_helper_out"
 fi
 if [ -z "$PYTHON_CMD" ]; then
     printf 'ERROR: Could not determine PYTHON_CMD from python_helper.sh\n' >&2
     exit 1
 fi
-echo ""
+printf '\n'
 
 cd "$PROJECT_ROOT/backend"
 
@@ -73,7 +73,7 @@ if [ ! -x "$VENV_PYTHON" ]; then
     exit 1
 fi
 printf 'Virtual environment ready\n'
-echo ""
+printf '\n'
 
 # Upgrade pip
 printf 'Upgrading pip...\n'
@@ -102,4 +102,4 @@ fi
 printf '\n'
 
 printf 'Setup complete. Virtual environment: backend/.venv\n'
-printf 'To activate manually: source backend/.venv/bin/activate\n'
+printf 'To activate manually, run the activation script: backend/.venv/bin/activate\n'

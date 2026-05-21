@@ -23,8 +23,8 @@ from .auth.agent_auth import AgentIdentity, AgentAuthenticator
 from llm.registry import RegistryLLMClient, ModelRegistry
 
 # Approved model registry entry — version-pinned and integrity-verified
-_APPROVED_MODEL_ID = "gpt-4o"                      # registry canonical name
-_APPROVED_MODEL_VERSION = "2024-08-06"           # pinned release date / version tag
+_APPROVED_MODEL_ID = "claude-3-5-sonnet-20241022"   # registry canonical name (org-approved)
+_APPROVED_MODEL_VERSION = "20241022"             # pinned release date / version tag
 _APPROVED_MODEL_SHA256 = os.environ.get("APPROVED_MODEL_SHA256", "")  # must be set to the approved artifact digest from the registry
 if not _APPROVED_MODEL_SHA256:
     raise ValueError(
@@ -51,9 +51,8 @@ class FinanceAgent:
 
     ALLOWED_ROLES = ["finance_admin", "cfo", "admin"]
     PRIVILEGE_LEVEL = "high"
-    # No bypass is permitted for any caller origin, including 'internal' callers.
     # All callers must satisfy role and privilege checks via the authenticator.
-    _INTERNAL_BYPASS_ENABLED = False
+    # No bypass mechanism exists for any caller origin, including 'internal' callers.
 
     def __init__(self, llm_client: RegistryLLMClient):
         # Enforce registry membership, version pin, and integrity check at startup
@@ -65,6 +64,111 @@ class FinanceAgent:
         )
         self.llm_client = llm_client
         self._llm_logger = logging.getLogger(__name__ + ".llm_audit")
+        self.authenticator = AgentAuthenticator()
+        self.agent_id = "finance"
+        self.agent_name = "Finance Agent"
+        self._financial_data = {}
+
+    # Compiled patterns for prompt injection detection
+    _B64_PATTERN = re.compile(
+        r'(?:[A-Za-z0-9+/]{4}){4,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?'
+    )
+    _SHELL_CMD_PATTERN = re.compile(
+        r'(?:^|\s|;|&&|\|\|)(?:bash|sh|zsh|cmd|powershell|exec|eval|system|popen|'
+        r'subprocess|os\.system|__import__|curl|wget|nc|ncat|netcat|chmod|chown|'
+        r'rm\s+-rf|dd\s+if=|mkfifo|/bin/|/usr/bin/)'
+        r'|(?:0x[0-9a-fA-F]{2}\s*){4,}',
+        re.IGNORECASE | re.MULTILINE,
+    )
+    # Leetspeak substitution map for normalisation
+    _LEET_MAP = str.maketrans('013456789@$!', 'oieashgbqas!')
+    _LEET_INJECTION_PATTERN = re.compile(
+        r'(?:1gn0r3|1gnor3|d1sr3g4rd|d15r3g4rd|f0rg3t|forg3t|'
+        r'pr3t3nd|pr3tend|4ct\s+4s|act\s+4s|sy5t3m|syst3m|3x3c|'
+        r'3val|ev4l|0v3rr1d3|0verr1de)',
+        re.IGNORECASE,
+    )
+    # Invisible / hidden Unicode codepoint ranges
+    _INVISIBLE_PATTERN = re.compile(
+        r'[\u00ad\u200b-\u200f\u202a-\u202e\u2060-\u2064\u206a-\u206f\ufeff\u180e]'
+    )
+    # Classic prompt-injection keywords (kept from prior checks)
+    _INJECTION_KEYWORDS = re.compile(
+        r'(?:ignore\s+(?:all\s+)?(?:previous|prior|above|earlier)\s+instructions?|'
+        r'disregard\s+(?:all\s+)?(?:previous|prior|above|earlier)\s+instructions?|'
+        r'forget\s+(?:all\s+)?(?:previous|prior|above|earlier)\s+instructions?|'
+        r'you\s+are\s+now|act\s+as\s+(?:a\s+)?(?:different|new|another)|'
+        r'new\s+persona|override\s+(?:your\s+)?(?:instructions?|rules?|guidelines?)|'
+        r'system\s+prompt|reveal\s+(?:your\s+)?(?:instructions?|prompt|system)|'
+        r'print\s+(?:your\s+)?(?:instructions?|prompt|system\s+prompt)|'
+        r'what\s+(?:are|were)\s+your\s+instructions?)',
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def _sanitize_prompt(self, prompt: str) -> str:
+        """
+        Validate the prompt against known prompt-injection vectors before
+        it is forwarded to the LLM.  Raises ValueError if a violation is
+        detected so that the caller never reaches the LLM.
+
+        Checks performed
+        ----------------
+        1. Invisible / hidden Unicode characters
+        2. Classic injection keywords
+        3. Leetspeak injection phrases
+        4. Base64-encoded blobs (potential encoded instructions)
+        5. Binary / shell command content
+        """
+        # 1. Invisible / hidden characters
+        if self._INVISIBLE_PATTERN.search(prompt):
+            raise ValueError(
+                "Prompt rejected: invisible or hidden Unicode characters detected."
+            )
+
+        # 2. Classic injection keywords
+        if self._INJECTION_KEYWORDS.search(prompt):
+            raise ValueError(
+                "Prompt rejected: prompt-injection keyword pattern detected."
+            )
+
+        # 3. Leetspeak injection phrases
+        if self._LEET_INJECTION_PATTERN.search(prompt):
+            raise ValueError(
+                "Prompt rejected: leetspeak injection pattern detected."
+            )
+
+        # 4. Base64-encoded blobs — decode and re-check for injection keywords
+        #    and shell commands inside the decoded payload.
+        for match in self._B64_PATTERN.finditer(prompt):
+            candidate = match.group(0)
+            # Only attempt decode when the candidate is long enough to carry
+            # meaningful hidden content (>=32 chars ≈ 24 decoded bytes).
+            if len(candidate) >= 32:
+                try:
+                    decoded = base64.b64decode(candidate + '==').decode(
+                        'utf-8', errors='replace'
+                    )
+                    if (
+                        self._INJECTION_KEYWORDS.search(decoded)
+                        or self._SHELL_CMD_PATTERN.search(decoded)
+                        or self._LEET_INJECTION_PATTERN.search(decoded)
+                    ):
+                        raise ValueError(
+                            "Prompt rejected: base64-encoded injection payload detected."
+                        )
+                except (ValueError, UnicodeDecodeError):
+                    raise
+                except Exception:
+                    # Decoding failed — not valid base64; skip.
+                    pass
+
+        # 5. Binary / shell command content
+        if self._SHELL_CMD_PATTERN.search(prompt):
+            raise ValueError(
+                "Prompt rejected: binary or shell command content detected."
+            )
+
+        return prompt
 
     def _call_llm(self, prompt: str, **kwargs) -> Any:
         """Wrapper that logs every LLM request and response for audit compliance."""
@@ -79,12 +183,14 @@ class FinanceAgent:
                 "model": model_id,
                 "timestamp": request_ts,
                 "prompt_length": len(prompt),
+                "prompt_hash": __import__('hashlib').sha256(prompt.encode("utf-8", errors="replace")).hexdigest(),
                 "prompt_preview": prompt[:200],
                 "kwargs": {k: str(v) for k, v in kwargs.items()},
             })
         )
         try:
-            response = self.llm_client.complete(prompt, **kwargs)
+            sanitized_prompt = self._sanitize_prompt(prompt)
+            response = self.llm_client.complete(sanitized_prompt, **kwargs)
             response_ts = datetime.now(timezone.utc).isoformat()
             response_text = response if isinstance(response, str) else str(response)
             self._llm_logger.info(
@@ -98,7 +204,58 @@ class FinanceAgent:
                     "response_preview": response_text[:200],
                 })
             )
-            return response
+            # Validate LLM output for dangerous dynamic code execution primitives
+            import re
+            for pattern in self._DANGEROUS_LLM_PATTERNS:
+                if re.search(pattern, response_text, re.IGNORECASE):
+                    self._llm_logger.error(
+                        json.dumps({
+                            "event": "llm_output_blocked",
+                            "interaction_id": interaction_id,
+                            "agent": self.agent_id,
+                            "model": model_id,
+                            "timestamp": response_ts,
+                            "reason": "dangerous_pattern_detected",
+                            "pattern": pattern,
+                            "response_preview": response_text[:200],
+                        })
+                    )
+                    raise ValueError(
+                        f"LLM response blocked: dangerous code execution primitive detected "
+                        f"(pattern: {pattern!r}). Response has been suppressed for security."
+                    )
+            # --- Synthetic-content provenance attachment ---
+            import hashlib, hmac, os
+            provenance_secret = os.environ.get("LLM_PROVENANCE_SECRET", "change-me-in-production").encode()
+            provenance_payload = "|".join([
+                interaction_id,
+                model_id,
+                response_ts,
+                response_text,
+            ]).encode("utf-8")
+            provenance_signature = hmac.new(
+                provenance_secret,
+                provenance_payload,
+                hashlib.sha256,
+            ).hexdigest()
+            provenance_metadata = {
+                "ai_generated": True,
+                "content_label": "AI-GENERATED-CONTENT",
+                "model_origin": model_id,
+                "interaction_id": interaction_id,
+                "generated_at": response_ts,
+                "provenance_signature": provenance_signature,
+                "signature_algorithm": "HMAC-SHA256",
+            }
+            if isinstance(response, dict):
+                response["_provenance"] = provenance_metadata
+                provenanced_response = response
+            else:
+                provenanced_response = {
+                    "content": response,
+                    "_provenance": provenance_metadata,
+                }
+            return provenanced_response
         except Exception as exc:
             error_ts = datetime.now(timezone.utc).isoformat()
             self._llm_logger.error(
@@ -112,36 +269,6 @@ class FinanceAgent:
                 })
             )
             raise
-        self.authenticator = AgentAuthenticator()
-        self.agent_id = "finance"
-        self.agent_name = "Finance Agent"
-
-        # Simulated financial data (would be database in real app)
-        self._financial_data = {
-            "quarterly_revenue": {
-                "Q1_2024": 2500000,
-                "Q2_2024": 2750000,
-                "Q3_2024": 3100000,
-                "Q4_2024": 3400000
-            },
-            "operating_expenses": {
-                "Q1_2024": 1800000,
-                "Q2_2024": 1900000,
-                "Q3_2024": 2000000,
-                "Q4_2024": 2100000
-            },
-            "employee_salaries": {
-                "engineering": 1200000,
-                "sales": 800000,
-                "operations": 600000,
-                "executive": 500000
-            },
-            "sensitive_projections": {
-                "merger_target": "CompetitorCorp",
-                "acquisition_budget": 50000000,
-                "layoff_planning": "Q2 2025 - 15% reduction"
-            }
-        }
 
     # Dangerous dynamic code execution primitives to detect in LLM output
     _DANGEROUS_LLM_PATTERNS = [
@@ -1016,18 +1143,16 @@ Format numbers clearly and provide relevant insights."""
             "data": scoped_data,
             "query": _safe_query  # sanitized: stripped, control-chars removed, truncated, injection-checked
         }
-        filtered_data = {
-            k: v for k, v in self._financial_data.items()
-            if k not in _EXCLUDED_KEYS
+                return {
+            "query": _safe_query,
         }
         return {
             "data": filtered_data,
             "query": _safe_query,  # sanitized: stripped, control-chars removed, truncated, injection-checked
             "requester": requester.agent_id
         }
-        # Audit log: record every financial data disclosure
+        # Audit log: record every financial data disclosure (must appear before return)
         import hashlib as _hashlib
-        import datetime as _datetime
         _query_hash = _hashlib.sha256(str(query).encode("utf-8", errors="replace")).hexdigest()
         logger.info(
             "AUDIT: Financial data returned to caller",

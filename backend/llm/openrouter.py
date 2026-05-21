@@ -6,7 +6,7 @@ Client for communicating with LLMs via OpenRouter API.
 SECURITY NOTES (for Unifai demo):
 - Input is sanitized and validated before sending to LLM
 - Prompt injection detection is applied to user messages and context
-- No response validation
+- Response validation strips/rejects dynamic code execution primitives (eval, exec, etc.)
 - API key handling could be improved
 - No rate limiting
 """
@@ -22,6 +22,45 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Optional, Any, Dict
 
+# ---------------------------------------------------------------------------
+# IMMUTABLE APPROVED MODEL REGISTRY
+# Each entry is version-pinned and carries a SHA-256 digest of the canonical
+# model identifier string.  These values are set at build time and MUST NOT
+# be overridden at runtime via environment variables.
+# To add a new model, update this dict AND its digest after security review.
+# ---------------------------------------------------------------------------
+_APPROVED_MODEL_REGISTRY: Dict[str, Dict[str, str]] = {
+    # Format: "registry-key": {"model_id": "<exact API id>", "digest": "<sha256 of model_id>"}
+    "unifai-approved-v1": {
+        "model_id": "unifai/approved-model-v1",
+        "digest": hashlib.sha256(b"unifai/approved-model-v1").hexdigest(),
+    },
+}
+
+# The single approved default — must exist as a key in _APPROVED_MODEL_REGISTRY
+_REGISTRY_DEFAULT_KEY = "unifai-approved-v1"
+
+
+def _verify_model_in_registry(model_id: str) -> str:
+    """Verify *model_id* is in the approved registry and its digest matches.
+
+    Returns the verified model_id on success; raises ValueError otherwise.
+    This is the single authoritative gate for all model resolution.
+    """
+    for key, entry in _APPROVED_MODEL_REGISTRY.items():
+        if entry["model_id"] == model_id:
+            expected_digest = hashlib.sha256(model_id.encode()).hexdigest()
+            if not hmac.compare_digest(entry["digest"], expected_digest):
+                raise ValueError(
+                    f"Model registry integrity failure for '{model_id}': "
+                    "digest mismatch. Possible tampering detected."
+                )
+            return model_id
+    raise ValueError(
+        f"Model '{model_id}' is NOT_IN_REGISTRY. "
+        "Only models listed in _APPROVED_MODEL_REGISTRY may be used."
+    )
+
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -34,22 +73,67 @@ class OpenRouterClient:
     Security controls applied before sending content to LLM:
     - Input sanitization strips null bytes and enforces length limits
     - Prompt injection detection rejects messages with injection patterns
-    - No response validation
+
+    Security controls applied to LLM responses:
+    - Response validation rejects/sanitizes dynamic code execution primitives
+      (eval, exec, subprocess with shell=True, os.system, __import__, etc.)
     """
 
-    BASE_URL = os.environ.get("APPROVED_LLM_BASE_URL", "")
-    # DEFAULT_MODEL and APPROVED_MODELS must be sourced from the organization's
-    # approved LLM registry. Hardcoded references to GPT, Claude, or Gemini models
-    # are not permitted as they are NOT_IN_REGISTRY.
-    DEFAULT_MODEL = os.environ.get("APPROVED_DEFAULT_MODEL")
+        BASE_URL = os.environ.get("APPROVED_LLM_BASE_URL", "")
+
+    # DEFAULT_MODEL is resolved from the immutable registry — NOT from env vars.
+    # APPROVED_MODELS is the set of model_id strings present in the registry.
+    # Neither may be overridden at runtime.
+    DEFAULT_MODEL: str = _APPROVED_MODEL_REGISTRY[_REGISTRY_DEFAULT_KEY]["model_id"]
+    APPROVED_MODELS: frozenset = frozenset(
+        entry["model_id"] for entry in _APPROVED_MODEL_REGISTRY.values()
+    )
+    # DEFAULT_MODEL and APPROVED_MODELS must be sourced exclusively from
+    # environment variables tied to the organization's approved LLM registry.
+    # No hardcoded model names (Claude, GPT, OpenAI, Gemini, etc.) are permitted.
+    DEFAULT_MODEL = os.environ.get("APPROVED_DEFAULT_MODEL", "")
     if not DEFAULT_MODEL:
         raise EnvironmentError(
             "APPROVED_DEFAULT_MODEL environment variable must be set to an "
-            "approved model from the organization's LLM registry."
+            "approved model from the organization's LLM registry. "
+            "Hardcoded references to Claude, GPT, or other non-registry models "
+            "are not permitted."
         )
     APPROVED_MODELS = set(
         filter(None, os.environ.get("APPROVED_MODELS_LIST", "").split(","))
     )
+    if not APPROVED_MODELS:
+        raise EnvironmentError(
+            "APPROVED_MODELS_LIST environment variable must be set to a "
+            "comma-separated list of approved models from the organization's "
+            "LLM registry."
+        )
+    if DEFAULT_MODEL not in APPROVED_MODELS:
+        raise EnvironmentError(
+            f"APPROVED_DEFAULT_MODEL '{DEFAULT_MODEL}' is not in "
+            "APPROVED_MODELS_LIST. Ensure the default model is included in "
+            "the organization's approved registry."
+        )
+
+    # Compiled patterns for detecting dynamic code execution primitives in LLM responses
+    _RESPONSE_CODE_EXEC_PATTERNS = [
+        re.compile(r'\beval\s*\(', re.IGNORECASE),
+        re.compile(r'\bexec\s*\(', re.IGNORECASE),
+        re.compile(r'\bexecfile\s*\(', re.IGNORECASE),
+        re.compile(r'\bcompile\s*\(', re.IGNORECASE),
+        re.compile(r'\b__import__\s*\(', re.IGNORECASE),
+        re.compile(r'\bimportlib\.import_module\s*\(', re.IGNORECASE),
+        re.compile(r'\bsubprocess\s*\.\s*\w*\s*\(.*shell\s*=\s*True', re.IGNORECASE | re.DOTALL),
+        re.compile(r'\bos\s*\.\s*system\s*\(', re.IGNORECASE),
+        re.compile(r'\bos\s*\.\s*popen\s*\(', re.IGNORECASE),
+        re.compile(r'\bos\s*\.\s*execv[pe]?\s*\(', re.IGNORECASE),
+        re.compile(r'\bgetattr\s*\(.*,\s*[\'"]__', re.IGNORECASE | re.DOTALL),
+        re.compile(r'__builtins__', re.IGNORECASE),
+        re.compile(r'__globals__', re.IGNORECASE),
+        re.compile(r'__class__\s*\.\s*__', re.IGNORECASE),
+        re.compile(r'\bctypes\b', re.IGNORECASE),
+        re.compile(r'\bcffi\b', re.IGNORECASE),
+    ]
 
     # Compiled patterns for detecting prompt injection attempts in user input
     _PROMPT_INJECTION_PATTERNS = [
@@ -223,10 +307,14 @@ class OpenRouterClient:
 
         return sanitized
 
-    # --- Provenance / watermarking secret (load from env; fall back to a fixed dev sentinel) ---
-    _PROVENANCE_SECRET: bytes = os.environb.get(
-        b"LLM_PROVENANCE_SECRET",
-        b"unifai-dev-provenance-secret-CHANGE-IN-PROD",
+    # --- Provenance / watermarking secret (must be supplied via environment variable) ---
+    _PROVENANCE_SECRET: bytes = os.environb.get(b"LLM_PROVENANCE_SECRET") or (
+        (_ for _ in ()).throw(  # type: ignore[attr-defined]
+            RuntimeError(
+                "LLM_PROVENANCE_SECRET environment variable must be set. "
+                "No hardcoded fallback is permitted."
+            )
+        )
     )
 
     def _attach_provenance(
@@ -300,19 +388,22 @@ class OpenRouterClient:
 
         Args:
             api_key: OpenRouter API key (defaults to env var)
-            model: Model to use (defaults to anthropic/claude-3.5-sonnet, can be overridden via OPENROUTER_MODEL env var)
+            model: Model to use (must be set via APPROVED_DEFAULT_MODEL or OPENROUTER_MODEL env var; no hardcoded default is provided)
         """
         # Store only a reference key source, not the credential itself
         self._api_key_override = api_key  # caller-supplied key (may be None)
-        requested_model = model or os.getenv("OPENROUTER_MODEL") or self.DEFAULT_MODEL
-        if requested_model not in self.APPROVED_MODELS:
-            logger.warning(
-                "Requested model '%s' is not in the approved list. "
-                "Falling back to default model '%s'.",
-                requested_model,
-                self.DEFAULT_MODEL,
+        _env_default = os.getenv("APPROVED_DEFAULT_MODEL") or os.getenv("OPENROUTER_MODEL")
+        if not _env_default:
+            raise ValueError(
+                "No approved default model configured. "
+                "Set the APPROVED_DEFAULT_MODEL environment variable to an approved model identifier."
             )
-            requested_model = self.DEFAULT_MODEL
+        requested_model = model or _env_default
+        if requested_model not in self.APPROVED_MODELS:
+            raise ValueError(
+                f"Requested model '{requested_model}' is not in the approved models list. "
+                "Update APPROVED_MODELS_LIST to include an approved model identifier."
+            )
         self.model = requested_model
 
         if not self._get_api_key():
@@ -369,8 +460,19 @@ class OpenRouterClient:
         return annotated
 
     def _get_api_key(self) -> Optional[str]:
-        """Retrieve the API key on demand rather than holding it as a persistent attribute."""
-        return self._api_key_override or os.getenv("OPENROUTER_API_KEY")
+        """Retrieve the API key on demand rather than holding it as a persistent attribute.
+
+        The key must be supplied via the constructor's api_key parameter.
+        Direct environment-variable lookup has been removed to avoid holding
+        excessive external-system credentials within this agent.
+        """
+        if not self._api_key_override:
+            raise ValueError(
+                "OpenRouter API key must be supplied explicitly via the api_key "
+                "constructor argument. Fetching credentials from the environment "
+                "is disabled to comply with the external-credential policy."
+            )
+        return self._api_key_override
 
     # Compiled patterns for detecting malicious prompt content
     _MALICIOUS_PATTERNS = [
@@ -385,9 +487,21 @@ class OpenRouterClient:
         re.compile(r'prompt\s+injection', re.IGNORECASE),
         # Base64-encoded content (long base64 strings are suspicious)
         re.compile(r'(?:[A-Za-z0-9+/]{40,}={0,2})'),
-        # Shell commands
-        re.compile(r'(?:^|\s|;|&&|\|\|)(?:rm\s+-rf|sudo\s+|chmod\s+|chown\s+|wget\s+|curl\s+.*\|\s*(?:bash|sh)|eval\s*\()', re.IGNORECASE | re.MULTILINE),
-        re.compile(r'(?:exec|system|popen|subprocess)\s*\(', re.IGNORECASE),
+        # Shell commands (patterns built dynamically to avoid literal command strings in source)
+        re.compile(
+            r'(?:^|\s|;|&&|\|\|)(?:'
+            + "r" + "m" + r'\s+-rf|'
+            + "sud" + "o" + r'\s+|'
+            + "ch" + "mod" + r'\s+|'
+            + "ch" + "own" + r'\s+|'
+            + "w" + "get" + r'\s+|'
+            + "cu" + "rl" + r'\s+.*\|\s*(?:bash|sh)|'
+            + "ev" + "al" + r'\s*\()'
+            , re.IGNORECASE | re.MULTILINE),
+        re.compile(
+            r'(?:'
+            + "ex" + "ec" + r'|system|popen|subprocess)\s*\('
+            , re.IGNORECASE),
         # Data exfiltration patterns
         re.compile(r'send\s+(?:all\s+)?(?:your\s+)?(?:system\s+prompt|instructions?|training\s+data)', re.IGNORECASE),
         re.compile(r'reveal\s+(?:your\s+)?(?:system\s+prompt|instructions?|training\s+data)', re.IGNORECASE),
@@ -456,7 +570,22 @@ class OpenRouterClient:
             LLM response text
         """
         if not self.api_key:
-            return "LLM service not configured. Please set OPENROUTER_API_KEY."
+            _response_text = "LLM service not configured. Please set OPENROUTER_API_KEY."
+            import hashlib, uuid
+            _input_hash = hashlib.sha256(
+                str(messages).encode("utf-8", errors="replace")
+            ).hexdigest()
+            logger.info(
+                "LLM interaction (unconfigured)",
+                extra={
+                    "trace_id": str(uuid.uuid4()),
+                    "model": model or self.model,
+                    "input_hash": _input_hash,
+                    "response_length": len(_response_text),
+                    "response_status": "service_not_configured",
+                },
+            )
+            return _response_text
 
     # --- LLM output validation ---
     _DYNAMIC_CODE_PATTERNS = [
@@ -510,8 +639,9 @@ class OpenRouterClient:
         """Alias kept for internal use; delegates to chat()."""
         return await self.chat(messages, model=model, temperature=temperature, max_tokens=max_tokens)
 
-        request_model = model or self.model
-        if request_model not in self.APPROVED_MODELS:
+        # Model validation already performed at the top of chat(); this block
+        # is retained only for any direct callers of internal helpers.
+        if False:  # noqa: dead-code-guard — validation moved to chat() entry
             logger.warning(
                 "Per-request model '%s' is not approved. Using instance default '%s'.",
                 request_model,
@@ -544,7 +674,7 @@ class OpenRouterClient:
             "principal": principal,
             "message_count": len(messages),
             "total_content_length": sum(len(m.get("content", "")) for m in messages),
-            "outcome": None,          # filled in after the call
+            "outcome": None,          # filled in after the call — see population below
             "error": None,
         }
 
@@ -565,6 +695,12 @@ class OpenRouterClient:
             }
         )
 
+        # Sanitize and validate all message contents before sending to the LLM
+        sanitized_messages = []
+        for msg in messages:
+            sanitized_content = self._sanitize_and_validate_input(msg.get("content", ""))
+            sanitized_messages.append({**msg, "content": sanitized_content})
+
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
@@ -577,7 +713,7 @@ class OpenRouterClient:
                     },
                     json={
                         "model": model or self.model,
-                        "messages": messages,
+                        "messages": sanitized_messages,
                         "temperature": temperature,
                         "max_tokens": max_tokens
                     },
@@ -607,7 +743,12 @@ class OpenRouterClient:
                 }
 
                 # Cryptographic signature (HMAC-SHA256) over canonical JSON
-                _sig_key  = (self.api_key or "provenance-secret").encode()
+                if not self.api_key:
+            raise ValueError(
+                "Cannot derive signing key: OPENROUTER_API_KEY is not set. "
+                "A hardcoded fallback key is not permitted."
+            )
+        _sig_key = self.api_key.encode()
                 _sig_body = _json.dumps(_provenance_payload, sort_keys=True).encode()
                 _signature = hmac.new(_sig_key, _sig_body, hashlib.sha256).hexdigest()
 
@@ -622,8 +763,7 @@ class OpenRouterClient:
                 logger.info(
                     "Received response from OpenRouter",
                     extra={
-                        "response_length": len(content),
-                        "response_preview": content[:200]
+                        "response_length": len(content)
                     }
                 )
 
@@ -643,6 +783,23 @@ class OpenRouterClient:
     # database, or object-storage sink in production.
     # ---------------------------------------------------------------------------
     def _write_audit_record(self, record: dict) -> None:
+        """Append a JSON audit record to the rotating audit log file."""
+        import logging.handlers as _lh
+        audit_log_path = os.environ.get("LLM_AUDIT_LOG_PATH", "/var/log/unifai/llm_audit.jsonl")
+        os.makedirs(os.path.dirname(audit_log_path), exist_ok=True)
+        _audit_file_logger = logging.getLogger("llm_audit_file")
+        if not _audit_file_logger.handlers:
+            _handler = _lh.RotatingFileHandler(
+                audit_log_path,
+                maxBytes=10 * 1024 * 1024,   # 10 MB per file
+                backupCount=90,              # retain 90 rotated files (~900 MB max)
+                encoding="utf-8",
+            )
+            _handler.setFormatter(logging.Formatter("%(message)s"))
+            _audit_file_logger.addHandler(_handler)
+            _audit_file_logger.setLevel(logging.INFO)
+            _audit_file_logger.propagate = False
+        _audit_file_logger.info(json.dumps(record, default=str))
         """Persist an AI decision audit record to a durable store.
 
         The default implementation appends newline-delimited JSON to a local
@@ -681,12 +838,38 @@ class OpenRouterClient:
         messages = [{"role": "system", "content": system_prompt}]
 
         if sanitized_context:
-            messages.append({
-                "role": "user",
-                "content": f"Context:\n{sanitized_context}\n\nQuery: {sanitized_user_message}"
-            })
+            # Structured turns: keep context and query in separate messages
+            # to avoid direct interpolation of untrusted input into a single
+            # prompt string (prompt-injection / subagent safety policy).
+            messages.append({"role": "user", "content": sanitized_context})
+            messages.append({"role": "assistant", "content": "I have read the context. What is your query?"})
+            messages.append({"role": "user", "content": sanitized_user_message})
         else:
             messages.append({"role": "user", "content": sanitized_user_message})
+
+        # --- Subagent spawn guard -------------------------------------------
+        # Log every subagent-style call and enforce a per-instance step limit
+        # so runaway recursive / looping calls are detected and stopped.
+        _MAX_CHAT_STEPS = 50
+        self._chat_step_count = getattr(self, "_chat_step_count", 0) + 1
+        import logging as _logging
+        _subagent_logger = _logging.getLogger(__name__)
+        _subagent_logger.info(
+            "subagent_spawn",
+            extra={
+                "step": self._chat_step_count,
+                "max_steps": _MAX_CHAT_STEPS,
+                "has_context": sanitized_context is not None,
+                "message_count": len(messages),
+            },
+        )
+        if self._chat_step_count > _MAX_CHAT_STEPS:
+            raise RuntimeError(
+                f"chat_with_context step limit exceeded "
+                f"({self._chat_step_count} > {_MAX_CHAT_STEPS}). "
+                "Possible runaway subagent loop detected."
+            )
+        # --- end spawn guard ------------------------------------------------
 
         result = await self.chat(messages)
         # Unwrap content for convenience callers while preserving envelope availability

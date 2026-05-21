@@ -25,7 +25,7 @@ def create_pdf_with_hidden_text():
     try:
         from reportlab.lib.pagesizes import letter
         from reportlab.pdfgen import canvas
-        from reportlab.lib.colors import white, black
+        from reportlab.lib.colors import black
 
         output_path = TEST_FILES_DIR / "advanced" / "hidden_text.pdf"
 

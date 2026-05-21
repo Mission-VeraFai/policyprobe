@@ -49,34 +49,58 @@ const TEXT_READABLE_TYPES = [
   'application/json',
 ]
 
-async function containsSingaporePII(file: File): Promise<string | null> {
-  // Only scan text-readable files; binary formats (PDF, DOC, images) would
-  // require server-side extraction — flag them for server-side scanning instead.
+interface PIIRedactionResult {
+  redactedContent: string | null
+  redactedTypes: string[]
+  isBinary: boolean
+}
+
+async function redactSingaporePII(file: File): Promise<PIIRedactionResult> {
   const isTextReadable =
     TEXT_READABLE_TYPES.includes(file.type) ||
     /\.(txt|html?|json)$/i.test(file.name)
 
   if (!isTextReadable) {
-    // Binary files (PDF, DOC, images) cannot be scanned client-side and no
-    // server-side scanning is implemented. Block them to prevent PII leakage.
-    return 'binary file (cannot be scanned for PII — upload not permitted)'
+    // Binary files (PDF, DOC, images) cannot be scanned or redacted client-side.
+    // Return isBinary=true so callers can send them for server-side redaction
+    // or substitute a placeholder instead of the original binary content.
+    return { redactedContent: null, redactedTypes: [], isBinary: true }
   }
 
   let content: string
   try {
     content = await readFileAsText(file)
   } catch {
-    // If we cannot read the file, err on the side of caution
-    return 'unreadable file'
+    return { redactedContent: '', redactedTypes: ['unreadable file'], isBinary: false }
   }
 
+  const redactedTypes: string[] = []
+  let redacted = content
   for (const { name, pattern } of SG_PII_PATTERNS) {
-    if (pattern.test(content)) {
-      return name
+    // Use a global version of the pattern to replace ALL occurrences
+    const globalPattern = new RegExp(
+      pattern.source,
+      pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g'
+    )
+    if (globalPattern.test(redacted)) {
+      redactedTypes.push(name)
+      // Reset lastIndex after test()
+      globalPattern.lastIndex = 0
+      redacted = redacted.replace(globalPattern, `[REDACTED:${name}]`)
     }
   }
 
-  return null
+  return { redactedContent: redacted, redactedTypes, isBinary: false }
+}
+
+// Legacy helper retained for backward compatibility — returns first detected PII type
+async function containsSingaporePII(file: File): Promise<string | null> {
+  const result = await redactSingaporePII(file)
+  if (result.isBinary) {
+    // Binary files are forwarded for server-side redaction; not blocked
+    return null
+  }
+  return result.redactedTypes.length > 0 ? result.redactedTypes[0] : null
 }
 
 // Maximum allowed file size: 10 MB

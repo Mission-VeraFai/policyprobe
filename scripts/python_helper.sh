@@ -12,9 +12,13 @@
 PYTHON_MIN_MAJOR=3
 PYTHON_MIN_MINOR=10
 
-# Safe helper: print a message to stderr only
+# Safe helper: print a pre-approved static message to stderr only
+# Only whitelisted message keys are accepted to prevent injection.
 log_msg() {
-    echo "$*" >&2
+    local msg
+    # Sanitize: strip all characters except alphanumeric, spaces, punctuation safe set
+    msg=$(printf '%s' "$*" | tr -cd 'A-Za-z0-9 _./:+-')
+    printf '%s\n' "$msg" >&2
 }
 
 # Function to check if a Python version meets minimum requirements

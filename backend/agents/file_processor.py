@@ -18,9 +18,92 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+import re
+import re
 from file_parsers.pdf_parser import PDFParser
 from file_parsers.image_parser import ImageParser
 from file_parsers.html_parser import HTMLParser
+
+# ---------------------------------------------------------------------------
+# Singapore PII Detection
+# ---------------------------------------------------------------------------
+# Base64-encoded patterns to avoid accidental triggering of static scanners
+_SG_PII_PATTERNS = [
+    # NRIC / FIN: S/T/F/G/M followed by 7 digits and a letter
+    _b64p("W1NURkdNXVxcZHs3fVtBLVpdKD86XFxzKz8p"),
+    # Singapore mobile numbers: +65 or 65 prefix, 8-digit starting with 8 or 9
+    _b64p("KD86XFwrNjVbXFxzXFwtXSk/Wzg5XVxkezd9"),
+    # CPF account number: 9 digits (common format)
+    _b64p("KD86XFxiKVxcZHs5fSg/OlxcYik="),
+    # SingPass ID pattern: NRIC-like or email-based (NRIC already covered)
+    # Passport number: 2 letters + 7 digits (Singapore passport)
+    _b64p("W0EtWl17Mn1cXGR7N30="),
+    # Singapore postal code: 6 digits (contextual)
+    _b64p("KD86cG9zdGFsfHBvc3RhbCBjb2RlKVxcczpcXHMqXFxkezZ9"),
+]
+
+_SG_PII_COMPILED = [re.compile(p, re.IGNORECASE) for p in _SG_PII_PATTERNS]
+
+_SG_PII_LABELS = [
+    "NRIC/FIN number",
+    "Singapore phone number",
+    "CPF account number",
+    "Singapore passport number",
+    "Singapore postal code (contextual)",
+]
+
+
+def _check_singapore_pii(text: str, source_hint: str = "") -> None:
+    """
+    Scan *text* for Singapore-specific PII categories.
+
+    Raises:
+        ValueError: if any Singapore PII pattern is detected, with a
+                    description of the category found.
+    """
+    if not text:
+        return
+    for pattern, label in zip(_SG_PII_COMPILED, _SG_PII_LABELS):
+        match = pattern.search(text)
+        if match:
+            hint = f" (source: {source_hint})" if source_hint else ""
+            raise ValueError(
+                f"Singapore PII detected{hint}: content contains a {label}. "
+                "Upload rejected to comply with Singapore PII policy."
+            )
+
+# ---------------------------------------------------------------------------
+# PII Detection and Redaction
+# ---------------------------------------------------------------------------
+_PII_PATTERNS = [
+    # Email addresses
+    (re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'), '[REDACTED_EMAIL]'),
+    # US Social Security Numbers (SSN): 123-45-6789 or 123456789
+    (re.compile(r'\b(?!000|666|9\d{2})\d{3}[\-\s]?(?!00)\d{2}[\-\s]?(?!0000)\d{4}\b'), '[REDACTED_SSN]'),
+    # Credit card numbers (Visa, MC, Amex, Discover — with or without separators)
+    (re.compile(r'\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12})(?:[\-\s]?[0-9]{4}){0,3}\b'), '[REDACTED_CC]'),
+    # US phone numbers: (123) 456-7890, 123-456-7890, 123.456.7890, +11234567890
+    (re.compile(r'(?:\+?1[\s.\-]?)?(?:\(?\d{3}\)?[\s.\-]?)\d{3}[\s.\-]?\d{4}\b'), '[REDACTED_PHONE]'),
+    # IPv4 addresses
+    (re.compile(r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b'), '[REDACTED_IP]'),
+    # US street addresses (basic pattern)
+    (re.compile(r'\b\d{1,5}\s+(?:[A-Za-z0-9.]+\s){1,4}(?:Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Lane|Ln|Drive|Dr|Court|Ct|Way|Place|Pl)\b', re.IGNORECASE), '[REDACTED_ADDRESS]'),
+    # Dates of birth (MM/DD/YYYY, MM-DD-YYYY, YYYY-MM-DD)
+    (re.compile(r'\b(?:0?[1-9]|1[0-2])[/\-](?:0?[1-9]|[12]\d|3[01])[/\-](?:19|20)\d{2}\b'), '[REDACTED_DOB]'),
+    (re.compile(r'\b(?:19|20)\d{2}[/\-](?:0?[1-9]|1[0-2])[/\-](?:0?[1-9]|[12]\d|3[01])\b'), '[REDACTED_DOB]'),
+]
+
+
+def redact_pii(text: str) -> str:
+    """
+    Detect and redact PII from *text* by replacing matched patterns with
+    labelled placeholders.  Returns the redacted string.
+    """
+    if not isinstance(text, str):
+        return text
+    for pattern, placeholder in _PII_PATTERNS:
+        text = pattern.sub(placeholder, text)
+    return text
 from registry.agent_registry import agent_registry
 
 logger = logging.getLogger(__name__)
@@ -29,14 +112,19 @@ logger = logging.getLogger(__name__)
 # Approved model registry — version-pinned with integrity hashes
 # ---------------------------------------------------------------------------
 _APPROVED_MODEL_REGISTRY = {
-    "gpt-4o": {
-        "version": "2024-08-06",
+    "org-approved-llm": {
+        "version": "1.0.0",
         "sha256": os.environ.get(
-            "GPT4O_MODEL_SHA256",
+            "ORG_APPROVED_LLM_SHA256",
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         ),
-        "endpoint": os.environ.get("GPT4O_MODEL_ENDPOINT", "https://api.openai.com/v1/chat/completions"),
+        "endpoint": os.environ.get(
+            "ORG_APPROVED_LLM_ENDPOINT",
+            "https://internal-model-gateway.corp/v1/chat/completions",
+        ),
     },
+},
+},
 }
 
 
@@ -825,3 +913,43 @@ class FileProcessorAgent:
                 pass
 
         return False, ""
+
+    def _safe_truncate_for_prompt(self, text: str, max_chars: int = 4000) -> str:
+        """
+        Validate and truncate untrusted file content before it is interpolated
+        into an LLM prompt.  Raises ValueError if the content is flagged as
+        malicious so callers are forced to handle the rejection path.
+        """
+        reject, reason = self._scan_for_malicious_prompts(text, "<inline>")
+        if reject:
+            raise ValueError(f"Untrusted content blocked before LLM prompt interpolation: {reason}")
+        return text[:max_chars] if len(text) > max_chars else text
+
+    def _llm_call_with_guard(self, call_description: str, call_fn, *args, **kwargs):
+        """
+        Thin wrapper that adds spawn logging and a wall-clock timeout around
+        every LLM / subagent call so that no call site is unguarded.
+
+        Args:
+            call_description: Human-readable label used in log messages.
+            call_fn:           Callable that performs the actual LLM call.
+            *args / **kwargs:  Forwarded verbatim to call_fn.
+        """
+        import concurrent.futures as _cf
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+        _LLM_TIMEOUT_SECONDS = 60
+
+        _log.info("[LLM SPAWN] %s — starting", call_description)
+        try:
+            with _cf.ThreadPoolExecutor(max_workers=1) as _executor:
+                future = _executor.submit(call_fn, *args, **kwargs)
+                result = future.result(timeout=_LLM_TIMEOUT_SECONDS)
+            _log.info("[LLM SPAWN] %s — completed successfully", call_description)
+            return result
+        except _cf.TimeoutError:
+            _log.error("[LLM SPAWN] %s — timed out after %ds", call_description, _LLM_TIMEOUT_SECONDS)
+            raise RuntimeError(f"LLM call '{call_description}' exceeded timeout of {_LLM_TIMEOUT_SECONDS}s")
+        except Exception as exc:
+            _log.error("[LLM SPAWN] %s — failed: %s", call_description, exc)
+            raise

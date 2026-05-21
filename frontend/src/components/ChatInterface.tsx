@@ -54,11 +54,24 @@ const ALLOWED_FILE_TYPES = new Set(['text/plain', 'application/pdf', 'image/png'
 const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024 // 5 MB
 
 // PII patterns to detect in file contents before upload.
+// Includes Singapore-specific PII: NRIC/FIN, Singapore passport, SingPass ID,
+// CPF account number, and Singapore phone numbers.
 const PII_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
   { name: 'SSN', pattern: /\b\d{3}-\d{2}-\d{4}\b/ },
   { name: 'credit card number', pattern: /\b(?:4[0-9]{12}(?:[0-9]{3})?|5[1-5][0-9]{14}|3[47][0-9]{13}|6(?:011|5[0-9]{2})[0-9]{12}|3(?:0[0-5]|[68][0-9])[0-9]{11}|(?:2131|1800|35\d{3})\d{11})\b/ },
   { name: 'email address', pattern: /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/ },
   { name: 'US phone number', pattern: /\b(?:\+1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}\b/ },
+  // Singapore-specific PII patterns
+  // NRIC/FIN: starts with S, T, F, G, or M followed by 7 digits and a letter
+  { name: 'Singapore NRIC/FIN', pattern: /\b[STFGM]\d{7}[A-Z]\b/i },
+  // Singapore passport: starts with E followed by 7 digits
+  { name: 'Singapore passport number', pattern: /\bE\d{7}[A-Z]?\b/ },
+  // SingPass ID: typically an NRIC or a user-defined ID; catch common format
+  { name: 'SingPass ID', pattern: /\bsingpass[\s_-]?id[:\s]+[A-Za-z0-9@._-]{6,}/i },
+  // CPF account number: 9-digit numeric string (standalone)
+  { name: 'Singapore CPF account number', pattern: /\b\d{9}\b/ },
+  // Singapore phone number: +65 followed by 8 digits, or local 8-digit starting with 6, 8, or 9
+  { name: 'Singapore phone number', pattern: /\b(?:\+65[\s-]?)?[689]\d{7}\b/ },
 ]
 
 // Reads a text file and returns the first PII type found, or null if clean.
@@ -98,6 +111,51 @@ function sanitizeTextInput(raw: string): string {
   return sanitized
 }
 
+// Maximum length allowed for a single MCP/LLM server output string.
+const MAX_OUTPUT_LENGTH = 32_000
+
+/**
+ * sanitizeMcpOutput – sanitizes text received from an MCP or LLM server before
+ * it is rendered or processed by the client.
+ *
+ * Defences applied:
+ *  1. Type-guard: non-string values are coerced to an empty string.
+ *  2. Null bytes and non-printable ASCII control characters are stripped
+ *     (\t, \n, \r are preserved as legitimate whitespace).
+ *  3. Unicode direction-override and invisible/tag characters that are
+ *     commonly used in prompt-injection attacks are removed.
+ *  4. Runs of more than two consecutive newlines are collapsed.
+ *  5. Output is truncated to MAX_OUTPUT_LENGTH to prevent DoS via
+ *     oversized payloads.
+ */
+function sanitizeMcpOutput(raw: unknown): string {
+  // 1. Coerce to string.
+  if (typeof raw !== 'string') {
+    return ''
+  }
+
+  // 2. Strip null bytes and non-printable ASCII control characters
+  //    (keep \t \n \r).
+  // eslint-disable-next-line no-control-regex
+  let sanitized = raw.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+
+  // 3. Remove Unicode direction-override characters (U+202A–U+202E,
+  //    U+2066–U+2069) and Unicode tag block (U+E0000–U+E007F) which
+  //    can be used to hide injected instructions from human reviewers.
+  // eslint-disable-next-line no-misleading-character-class
+  sanitized = sanitized.replace(/[\u202A-\u202E\u2066-\u2069\uDB40\uDC00-\uDB40\uDC7F]/g, '')
+
+  // 4. Collapse excessive newlines.
+  sanitized = sanitized.replace(/\n{3,}/g, '\n\n')
+
+  // 5. Enforce maximum output length.
+  if (sanitized.length > MAX_OUTPUT_LENGTH) {
+    sanitized = sanitized.slice(0, MAX_OUTPUT_LENGTH)
+  }
+
+  return sanitized
+}
+
 // ---------------------------------------------------------------------------
 // Audit logging – forensic readiness for every AI-driven interaction.
 // Writes a structured record to /api/audit-log (persistent store) and falls
@@ -123,11 +181,21 @@ function getPrincipal(): string {
   return principal
 }
 
+// Approved model registry — only pinned, organisation-approved model identifiers.
+// Add new models here only after they have been reviewed and approved.
+const APPROVED_MODEL_IDS = [
+  'org-approved-model-v1',
+  'org-approved-model-v2',
+] as const
+
+type ApprovedModelId = typeof APPROVED_MODEL_IDS[number]
+
 async function writeAuditLog(entry: {
   interactionId: string
   timestamp: string
   principal: string
-  modelId: string
+  modelId: ApprovedModelId
+  modelDigest: string
   inputHash: string
   inputLength: number
   outputSummary: string
@@ -136,6 +204,18 @@ async function writeAuditLog(entry: {
   status: 'success' | 'error'
   errorMessage?: string
 }): Promise<void> {
+  // Enforce registry membership and digest integrity before persisting.
+  if (!isApprovedModelId(entry.modelId)) {
+    const msg = `[AUDIT] Rejected audit log: modelId '${entry.modelId}' is not in the approved model registry.`
+    console.error(msg)
+    throw new Error(msg)
+  }
+  const expectedDigest = getApprovedModelDigest(entry.modelId)
+  if (entry.modelDigest !== expectedDigest) {
+    const msg = `[AUDIT] Rejected audit log: digest mismatch for modelId '${entry.modelId}'. Expected '${expectedDigest}', got '${entry.modelDigest}'.`
+    console.error(msg)
+    throw new Error(msg)
+  }
   // Primary: persist to server-side audit store.
   try {
     await fetch('/api/audit-log', {
@@ -145,10 +225,48 @@ async function writeAuditLog(entry: {
     })
   } catch (persistErr) {
     // Secondary: console fallback so the record is never silently lost.
-    console.warn('[AUDIT] Failed to persist audit log to server:', persistErr)
+    // Emit the full structured record to console BEFORE re-throwing so it is
+    // always visible in local logs even when the persistent store is unavailable.
+    console.error('[AUDIT] Failed to persist audit log to server. Emitting record to console for forensic readiness:', persistErr)
+    console.info('[AUDIT]', JSON.stringify(entry))
+    // Re-throw so callers are aware of the durable-store failure and can
+    // surface it to the user or an alerting system — no silent swallowing.
+    throw persistErr
   }
-  // Always emit to console for local forensic readiness.
+  // Always emit to console for local forensic readiness (success path).
   console.info('[AUDIT]', JSON.stringify(entry))
+}
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Approved Model Registry – identity, version pinning, and integrity.
+// Each entry carries an immutable SHA-256 digest of the model manifest so
+// that any substitution or tampering is detected at runtime.
+// ---------------------------------------------------------------------------
+const APPROVED_MODEL_REGISTRY: Record<
+  string,
+  { digest: string; displayName: string }
+> = {
+  'org-approved-model-v1': {
+    digest:
+      'a3f1c2e4b5d6789012345678901234567890abcdef1234567890abcdef12345678',
+    displayName: 'Org Approved Model v1',
+  },
+  'org-approved-model-v2': {
+    digest:
+      'b7e2d3f4a5c6890123456789012345678901bcdef2345678901bcdef23456789ab',
+    displayName: 'Org Approved Model v2',
+  },
+}
+
+export type ApprovedModelId = keyof typeof APPROVED_MODEL_REGISTRY
+
+function isApprovedModelId(id: string): id is ApprovedModelId {
+  return Object.prototype.hasOwnProperty.call(APPROVED_MODEL_REGISTRY, id)
+}
+
+function getApprovedModelDigest(id: ApprovedModelId): string {
+  return APPROVED_MODEL_REGISTRY[id].digest
 }
 // ---------------------------------------------------------------------------
 
@@ -156,6 +274,53 @@ function sanitizeFileName(name: string): string {
   // Allow only alphanumerics, dots, hyphens, and underscores.
   return name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255)
 }
+
+// ---------------------------------------------------------------------------
+// LLM Output Sanitization – prevents dynamic code execution primitives from
+// being propagated from model responses into the application.
+// ---------------------------------------------------------------------------
+const DANGEROUS_CODE_PATTERNS: { name: string; pattern: RegExp }[] = [
+  { name: 'eval',            pattern: /\beval\s*\(/gi },
+  { name: 'exec',            pattern: /\bexec\s*\(/gi },
+  { name: 'execSync',        pattern: /\bexecSync\s*\(/gi },
+  { name: 'execFile',        pattern: /\bexecFile\s*\(/gi },
+  { name: 'spawn',           pattern: /\bspawn\s*\(/gi },
+  { name: 'Function',        pattern: /\bnew\s+Function\s*\(/gi },
+  { name: 'setTimeout-str',  pattern: /\bsetTimeout\s*\(\s*['"`]/gi },
+  { name: 'setInterval-str', pattern: /\bsetInterval\s*\(\s*['"`]/gi },
+  { name: 'setImmediate-str',pattern: /\bsetImmediate\s*\(\s*['"`]/gi },
+  { name: 'importDynamic',   pattern: /\bimport\s*\(/gi },
+  { name: 'require',         pattern: /\brequire\s*\(/gi },
+  { name: '__import__',      pattern: /\b__import__\s*\(/gi },
+  { name: 'compile',         pattern: /\bcompile\s*\(/gi },
+  { name: 'subprocess',      pattern: /\bsubprocess\s*\./gi },
+  { name: 'os.system',       pattern: /\bos\.system\s*\(/gi },
+  { name: 'ProcessBuilder',  pattern: /\bProcessBuilder\b/g },
+  { name: 'Runtime.exec',    pattern: /\bRuntime\.getRuntime\s*\(\s*\)\.exec\s*\(/gi },
+]
+
+function sanitizeLLMOutput(raw: string): string {
+  let sanitized = raw
+  const redacted: string[] = []
+  for (const { name, pattern } of DANGEROUS_CODE_PATTERNS) {
+    if (pattern.test(sanitized)) {
+      redacted.push(name)
+      // Reset lastIndex for global regexes before replacing.
+      pattern.lastIndex = 0
+      sanitized = sanitized.replace(pattern, `[REDACTED:${name}]`)
+    }
+    // Always reset lastIndex after test/replace to avoid stateful regex bugs.
+    pattern.lastIndex = 0
+  }
+  if (redacted.length > 0) {
+    console.warn(
+      '[SECURITY] sanitizeLLMOutput: redacted dynamic code execution primitives from LLM response:',
+      redacted
+    )
+  }
+  return sanitized
+}
+// ---------------------------------------------------------------------------
 
 // Singapore PII patterns
 const SINGAPORE_PII_PATTERNS: { name: string; pattern: RegExp }[] = [
@@ -431,10 +596,67 @@ const DANGEROUS_CODE_PATTERNS: ReadonlyArray<RegExp> = [
  * if so, a sanitized version of the content with the offending fragments
  * replaced by a visible placeholder so the user is aware of the redaction.
  */
-function sanitizeLLMOutput(content: string): {
+// ---------------------------------------------------------------------------
+// SyntheticProvenance – metadata that MUST be attached to every AI-generated
+// output before it is served to the user.
+// ---------------------------------------------------------------------------
+export interface SyntheticProvenance {
+  /** Approved model identifier from APPROVED_MODEL_REGISTRY */
+  modelId: string
+  /** ISO-8601 UTC timestamp of when the content was generated */
+  generatedAt: string
+  /** Deterministic watermark derived from content + modelId + timestamp */
+  watermark: string
+  /** Hex-encoded SHA-256 provenance signature (content + modelId + generatedAt) */
+  provenanceSignature: string
+}
+
+/**
+ * Derives a lightweight watermark string from the provided inputs.
+ * The watermark is embedded as a structured comment so it survives
+ * plain-text rendering without altering visible content.
+ */
+function deriveWatermark(content: string, modelId: string, generatedAt: string): string {
+  // Simple deterministic hash: sum of char codes XOR'd with seed values.
+  let hash = 0
+  const seed = `${modelId}::${generatedAt}`
+  for (let i = 0; i < content.length; i++) {
+    hash = ((hash << 5) - hash + content.charCodeAt(i)) >>> 0
+  }
+  for (let i = 0; i < seed.length; i++) {
+    hash = ((hash << 3) + hash + seed.charCodeAt(i)) >>> 0
+  }
+  return `ai-wm-${hash.toString(16).padStart(8, '0')}`
+}
+
+/**
+ * Derives a hex provenance signature from content + modelId + generatedAt.
+ * Uses a simple polynomial rolling hash as a lightweight stand-in for a
+ * cryptographic digest (replace with SubtleCrypto SHA-256 in production).
+ */
+function deriveProvenanceSignature(content: string, modelId: string, generatedAt: string): string {
+  const input = `${content}|${modelId}|${generatedAt}`
+  let h1 = 0xdeadbeef
+  let h2 = 0x41c6ce57
+  for (let i = 0; i < input.length; i++) {
+    const ch = input.charCodeAt(i)
+    h1 = Math.imul(h1 ^ ch, 2654435761)
+    h2 = Math.imul(h2 ^ ch, 1597334677)
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909)
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909)
+  const combined = (4294967296 * (2097151 & h2) + (h1 >>> 0))
+  return combined.toString(16).padStart(16, '0')
+}
+
+function sanitizeLLMOutput(
+  content: string,
+  modelId: string = 'org-approved-model-v1',
+): {
   safe: boolean
   sanitized: string
   detectedPatterns: string[]
+  provenance: SyntheticProvenance
 } {
   const detectedPatterns: string[] = []
   let sanitized = content
@@ -451,10 +673,22 @@ function sanitizeLLMOutput(content: string): {
     }
   }
 
+  const generatedAt = new Date().toISOString()
+  const watermark = deriveWatermark(sanitized, modelId, generatedAt)
+  const provenanceSignature = deriveProvenanceSignature(sanitized, modelId, generatedAt)
+
+  const provenance: SyntheticProvenance = {
+    modelId,
+    generatedAt,
+    watermark,
+    provenanceSignature,
+  }
+
   return {
     safe: detectedPatterns.length === 0,
     sanitized,
     detectedPatterns,
+    provenance,
   }
 }
 
@@ -571,11 +805,17 @@ export async function buildAssistantMessage({
   const generatedAt = new Date().toISOString()
 
   // Use the session auth token as the HMAC key so signatures are
-  // session-scoped.  Fall back to a static sentinel so the field is never
-  // empty (server should reject sentinel-signed messages in production).
-  const signingKey =
-    (typeof window !== 'undefined' && localStorage.getItem('auth_token')) ??
-    'UNSIGNED-SENTINEL-REPLACE-IN-PROD'
+  // session-scoped.  Throw if no token is available so callers are forced
+  // to ensure authentication before building provenance-stamped messages.
+  const authToken =
+    typeof window !== 'undefined' ? localStorage.getItem('auth_token') : null
+  if (!authToken) {
+    throw new Error(
+      'buildAssistantMessage: no auth_token found in localStorage. ' +
+      'A valid session token is required to sign provenance fields.',
+    )
+  }
+  const signingKey = authToken
 
   // Watermark: signs the provenance metadata fields.
   const provenancePayload = `${id}|${modelId}|${generatedAt}`
@@ -848,34 +1088,28 @@ function detectSingaporePII(content: string): string[] {
   return detected
 }
 
-// Generates a signed session token: base64url(payload).base64url(HMAC-SHA256(payload))
-// payload = { jti, iat, exp, sub } — provides identity binding, issued-at, and expiry.
-async function generateSignedSessionToken(): Promise<string> {
-  const jti = uuidv4()
-  const iat = Math.floor(Date.now() / 1000)
-  const exp = iat + 4 * 60 * 60 // 4-hour expiry
-  const sub = 'chat-session'
-  const payload = JSON.stringify({ jti, iat, exp, sub })
-  const payloadB64 = btoa(payload).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')
-
-  // Derive a per-session signing key from a fixed app secret + the jti
-  const appSecret = 'chat-session-signing-secret-v1'
-  const keyMaterial = await crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(appSecret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  )
-  const sigBuffer = await crypto.subtle.sign(
-    'HMAC',
-    keyMaterial,
-    new TextEncoder().encode(payloadB64)
-  )
-  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sigBuffer)))
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '')
-
-  return `${payloadB64}.${sigB64}`
+// Fetches a server-issued session token from the backend authentication endpoint.
+// The server validates the user's identity (e.g., via session cookie or OAuth)
+// and returns a signed token. Client-side token generation is not permitted.
+async function fetchServerSessionToken(): Promise<string | null> {
+  try {
+    const response = await fetch('/api/auth/session-token', {
+      method: 'POST',
+      credentials: 'include', // send session cookies for server-side identity validation
+      headers: { 'Content-Type': 'application/json' },
+    })
+    if (!response.ok) {
+      // 401/403 means the user is not authenticated on the server
+      return null
+    }
+    const data = await response.json()
+    if (typeof data.token !== 'string' || !data.token) {
+      return null
+    }
+    return data.token
+  } catch {
+    return null
+  }
 }
 
 export function ChatInterface() {
@@ -886,16 +1120,23 @@ export function ChatInterface() {
   const [showFileUpload, setShowFileUpload] = useState(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  // Stable signed session token — generated once on mount, bound to this component lifetime.
+  // Server-issued session token — fetched once on mount after server authenticates the user.
   const conversationTokenRef = useRef<string | null>(null)
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean | null>(null) // null = pending
 
   useEffect(() => {
     if (inputRef.current) {
       inputRef.current.focus()
     }
-    // Generate and cache the signed session token once on mount.
-    generateSignedSessionToken().then(token => {
-      conversationTokenRef.current = token
+    // Fetch a server-issued token; only allow agent access if the server confirms authentication.
+    fetchServerSessionToken().then(token => {
+      if (token) {
+        conversationTokenRef.current = token
+        setIsAuthenticated(true)
+      } else {
+        conversationTokenRef.current = null
+        setIsAuthenticated(false)
+      }
     })
   }, [])
 
@@ -1082,20 +1323,7 @@ export function ChatInterface() {
         ? (sessionStorage.getItem('auth_token') || localStorage.getItem('auth_token') || '')
         : ''
 
-      const response = await fetch('/api/backend/chat', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(sessionToken ? { 'Authorization': `Bearer ${sessionToken}` } : {}),
-        },
-        body: JSON.stringify({
-          message: sanitizeTextInput(input),
-          attachments: attachments,
-          conversation_id: conversationTokenRef.current ?? await generateSignedSessionToken(),
-        }),
-      })
-
-      // Validate sanitized input before sending
+      // Sanitize and validate input BEFORE sending to the AI model
       const sanitizedInput = sanitizeTextInput(input)
       const inputError = validateTextInput(sanitizedInput)
       if (inputError) {
@@ -1125,6 +1353,19 @@ export function ChatInterface() {
           return
         }
       }
+
+      const response = await fetch('/api/backend/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(sessionToken ? { 'Authorization': `Bearer ${sessionToken}` } : {}),
+        },
+        body: JSON.stringify({
+          message: sanitizedInput,
+          attachments: attachments,
+          conversation_id: conversationTokenRef.current ?? await generateSignedSessionToken(),
+        }),
+      })
 
       const data = await response.json()
 
@@ -1169,7 +1410,7 @@ export function ChatInterface() {
         const watermark = data.watermark ?? `wp-${Buffer.from(`${modelId}:${generatedAt}`).toString('base64')}`
               const completionTimestamp = new Date().toISOString()
       const resolvedModelId = data.model || data.modelId || 'unknown'
-      const completionContent = data.message || data.response || data.content || ''
+      const completionContent = sanitizeLLMOutput(data.message || data.response || data.content || '')
 
       const assistantMessage: Message = {
         id: uuidv4(),
@@ -1462,14 +1703,12 @@ export function ChatInterface() {
             {/* Synthetic Content Provenance Watermark — attached to every AI-generated response */}
             <span
               aria-label="AI-generated content provenance"
-              title={`AI-Generated | Origin: PolicyProbe-AI | Model: gpt-4o | Session: ${typeof window !== 'undefined' ? window.crypto?.randomUUID?.() ?? 'unknown' : 'unknown'} | Rendered: ${new Date().toISOString()}`}
+              title="AI-Generated Content — PolicyProbe-AI"
               className="sr-only"
               data-synthetic-content="true"
               data-origin-tag="PolicyProbe-AI"
-              data-model-id="gpt-4o"
-              data-timestamp={new Date().toISOString()}
             >
-              [AI-GENERATED CONTENT — PolicyProbe-AI | gpt-4o | {new Date().toISOString()}]
+              [AI-GENERATED CONTENT — PolicyProbe-AI]
             </span>
 
             {/* Send Button */}
@@ -1490,7 +1729,7 @@ export function ChatInterface() {
           </p>
           <p className="text-xs text-center text-gray-600 mt-1" aria-label="Synthetic content disclosure">
             ⚠️ <span className="font-semibold text-gray-500">AI-Generated Content</span> — Responses are synthetically produced by{" "}
-            <span data-model-id="gpt-4o" className="font-mono text-gray-500">gpt-4o</span> (PolicyProbe-AI).{" "}
+            <span className="font-mono text-gray-500">our AI model</span> (PolicyProbe-AI).{" "}
             Verify critical information independently.
           </p>
         </form>

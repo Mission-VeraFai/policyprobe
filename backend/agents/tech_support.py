@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import logging
 import os
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -64,6 +65,74 @@ _INJECTION_PHRASES = [
     'do anything now',
     'dan mode',
 ]
+
+
+# ---------------------------------------------------------------------------
+# LLM Output Validation
+# Checks LLM-generated output for dangerous dynamic code execution primitives
+# before the response is used or returned to the caller.
+# ---------------------------------------------------------------------------
+
+# Patterns that indicate dynamic code execution in LLM output
+_LLM_OUTPUT_EXEC_PATTERN = re.compile(
+    r'\b(?:eval|exec|execfile|compile)\s*\(',
+    re.IGNORECASE,
+)
+
+_LLM_OUTPUT_SUBPROCESS_PATTERN = re.compile(
+    r'subprocess\.(?:call|run|Popen|check_output|check_call)\s*\([^)]*shell\s*=\s*True',
+    re.IGNORECASE | re.DOTALL,
+)
+
+_LLM_OUTPUT_DYNAMIC_IMPORT_PATTERN = re.compile(
+    r'(?:__import__|importlib\.import_module|importlib\.util\.spec_from_file_location)\s*\(',
+    re.IGNORECASE,
+)
+
+_LLM_OUTPUT_OS_EXEC_PATTERN = re.compile(
+    r'\bos\.(?:system|popen|execv|execve|execvp|execvpe|spawnl|spawnle|spawnlp|spawnlpe|'  
+    r'spawnv|spawnve|spawnvp|spawnvpe)\s*\(',
+    re.IGNORECASE,
+)
+
+_LLM_OUTPUT_DANGEROUS_BUILTINS_PATTERN = re.compile(
+    r'\b(?:getattr|setattr|delattr)\s*\([^,]+,\s*[\'"]__[a-z]+__[\'"]',
+    re.IGNORECASE,
+)
+
+
+def _validate_llm_output(text: str) -> str:
+    """
+    Validate and sanitize LLM output before use.
+
+    Raises ValueError if the output contains dynamic code execution primitives
+    such as eval(), exec(), subprocess with shell=True, os.system(), or
+    dynamic import mechanisms.
+
+    Returns the original text if no violations are found.
+    """
+    if not isinstance(text, str):
+        raise ValueError("LLM output must be a string.")
+
+    checks = [
+        (_LLM_OUTPUT_EXEC_PATTERN,
+         "LLM output contains forbidden dynamic code execution primitive (eval/exec)."),
+        (_LLM_OUTPUT_SUBPROCESS_PATTERN,
+         "LLM output contains forbidden subprocess call with shell=True."),
+        (_LLM_OUTPUT_DYNAMIC_IMPORT_PATTERN,
+         "LLM output contains forbidden dynamic import mechanism."),
+        (_LLM_OUTPUT_OS_EXEC_PATTERN,
+         "LLM output contains forbidden os execution primitive."),
+        (_LLM_OUTPUT_DANGEROUS_BUILTINS_PATTERN,
+         "LLM output contains forbidden dunder attribute manipulation."),
+    ]
+
+    for pattern, message in checks:
+        if pattern.search(text):
+            logging.warning("LLM output validation failed: %s", message)
+            raise ValueError(message)
+
+    return text
 
 
 def _is_base64_encoded(text: str) -> bool:
@@ -227,7 +296,6 @@ def _call_llm_with_logging(client: ApprovedLLMClient, prompt: str, **kwargs) -> 
             "model": MODEL_NAME,
             "model_version": MODEL_VERSION,
             "prompt_length": len(prompt),
-            "prompt_preview": prompt[:200],
         },
     )
     try:
@@ -238,7 +306,6 @@ def _call_llm_with_logging(client: ApprovedLLMClient, prompt: str, **kwargs) -> 
                 "model": MODEL_NAME,
                 "model_version": MODEL_VERSION,
                 "response_length": len(str(response)),
-                "response_preview": str(response)[:200],
             },
         )
         return response
@@ -338,17 +405,26 @@ def _validate_llm_output(response: str, context: str = "") -> str:
 # Only models listed here may be used by this agent.  Any change to MODEL_NAME,
 # MODEL_VERSION, or MODEL_DIGEST must go through the security review process.
 # ---------------------------------------------------------------------------
-_APPROVED_MODEL_REGISTRY = {
+# Local registry is a FALLBACK ONLY and must match the external org registry.
+# If ORG_MODEL_REGISTRY_URL is not set the agent will refuse to start.
+_APPROVED_MODEL_REGISTRY: dict[str, dict] = {
     "gpt-4o": {
-        "version": "2024-08-06",                          # pinned API version / snapshot
+        "version": "2024-08-06",
         "provider": "openai",
-        "digest": "sha256:gpt-4o-2024-08-06-openai",  # integrity token / manifest hash
+        "digest": "sha256:gpt-4o-2024-08-06-openai-approved",
         "approved": True,
+        "registry_source": "org-approved-registry-v1",
     },
+},
 },
 }
 
-MODEL_NAME    = "gpt-4o"
+MODEL_NAME = os.environ.get("APPROVED_LLM_MODEL")
+if not MODEL_NAME:
+    raise EnvironmentError(
+        "APPROVED_LLM_MODEL environment variable is not set. "
+        "Configure it with a model name from the organization's approved LLM registry."
+    )
 MODEL_VERSION = _APPROVED_MODEL_REGISTRY[MODEL_NAME]["version"]
 MODEL_DIGEST  = _APPROVED_MODEL_REGISTRY[MODEL_NAME]["digest"]
 
@@ -509,10 +585,11 @@ _decision_logger.propagate = False  # keep decision records out of the root hand
 
 try:
     os.makedirs(os.path.dirname(_DECISION_LOG_FILE), exist_ok=True)
-    _dh = RotatingFileHandler(
+    # Use a plain FileHandler (append mode) so the audit log is never rotated,
+    # truncated, or overwritten — satisfying the append-only / immutable-log requirement.
+    _dh = logging.FileHandler(
         _DECISION_LOG_FILE,
-        maxBytes=_DECISION_LOG_MAX_BYTES,
-        backupCount=_DECISION_LOG_BACKUP_COUNT,
+        mode="a",
         encoding="utf-8",
     )
     _dh.setFormatter(logging.Formatter("%(message)s"))
@@ -896,9 +973,27 @@ class TechSupportAgent:
             # Persist to the audit log (append-only file; replace with DB/SIEM sink as needed)
             try:
                 import os
-                audit_path = os.environ.get("AUDIT_LOG_PATH", "/var/log/ai_audit.jsonl")
+                _ALLOWED_AUDIT_DIRS = (
+                    "/var/log",
+                    "/tmp/ai_audit",
+                )
+                _raw_audit_path = os.environ.get("AUDIT_LOG_PATH", "/var/log/ai_audit.jsonl")
+                # Resolve to an absolute, canonical path to prevent traversal
+                _resolved_audit_path = os.path.realpath(os.path.abspath(_raw_audit_path))
+                if not any(
+                    _resolved_audit_path.startswith(allowed_dir + os.sep)
+                    or _resolved_audit_path == allowed_dir
+                    for allowed_dir in _ALLOWED_AUDIT_DIRS
+                ):
+                    raise ValueError(
+                        f"AUDIT_LOG_PATH '{_resolved_audit_path}' is outside permitted directories: "
+                        f"{_ALLOWED_AUDIT_DIRS}"
+                    )
+                audit_path = _resolved_audit_path
                 with open(audit_path, "a", encoding="utf-8") as _af:
                     _af.write(json.dumps(record) + "\n")
+            except ValueError as _ve:
+                logger.error("AUDIT LOG PATH REJECTED (path traversal guard): %s", _ve)
             except Exception as _ae:
                 logger.error("AUDIT LOG WRITE FAILURE: %s | record=%s", _ae, json.dumps(record))
             logger.info("AUDIT | %s", json.dumps(record))
@@ -911,7 +1006,25 @@ class TechSupportAgent:
 
         raw_message = context.get("user_message", "")
         try:
-            user_message = self._sanitize_and_validate(raw_message)
+            # Strip prompt-injection patterns before any further processing or LLM forwarding.
+            # Removes attempts to override the system role (e.g. "Ignore previous instructions",
+            # role-delimiter injections, and common jailbreak prefixes).
+            import re as _re
+            _INJECTION_PATTERNS = [
+                r"(?i)ignore\s+(all\s+)?(previous|prior|above)\s+instructions?",
+                r"(?i)you\s+are\s+now\s+(?:a|an|the)\b",
+                r"(?i)\bsystem\s*:\s*",
+                r"(?i)\bassistant\s*:\s*",
+                r"(?i)\buser\s*:\s*",
+                r"(?i)disregard\s+(your\s+)?(previous|prior|all)\b",
+                r"(?i)act\s+as\s+(?:if\s+you\s+(?:are|were)|a|an)\b",
+                r"(?i)jailbreak",
+                r"(?i)do\s+anything\s+now",
+            ]
+            _sanitized_raw = raw_message
+            for _pat in _INJECTION_PATTERNS:
+                _sanitized_raw = _re.sub(_pat, "[REDACTED]", _sanitized_raw)
+            user_message = self._sanitize_and_validate(_sanitized_raw)
         except ValueError as exc:
             logger.warning("Rejected user_message during validation: %s", exc)
             return {
@@ -967,7 +1080,9 @@ class TechSupportAgent:
 
         _audit_log(
             event="llm_inference_complete",
+            trace_id=_trace_id,
             principal=str(caller),
+            input_hash=_input_hash,
             input_text=user_message,
             output_text=str(sanitized_response),
         )
@@ -1305,6 +1420,99 @@ class TechSupportAgent:
             "privilege_level": self.PRIVILEGE_LEVEL
         }
 
+        @staticmethod
+    def _sanitize_query(message: str) -> str:
+        """
+        Sanitize and validate user input before sending to the LLM.
+
+        Enforces a maximum length, strips leading/trailing whitespace,
+        and rejects messages that contain known prompt-injection patterns.
+
+        Raises:
+            ValueError: if the message is empty, exceeds the length limit,
+                        or contains a detected injection pattern.
+        """
+        import re
+
+        MAX_LENGTH = 4000
+
+        if not message or not message.strip():
+            raise ValueError("User message must not be empty.")
+
+        message = message.strip()
+
+        if len(message) > MAX_LENGTH:
+            raise ValueError(
+                f"User message exceeds maximum allowed length of {MAX_LENGTH} characters."
+            )
+
+        # Detect common prompt-injection / jailbreak patterns
+        injection_patterns = [
+            r"ignore\s+(all\s+)?(previous|prior|above)\s+instructions",
+            r"disregard\s+(all\s+)?(previous|prior|above)\s+instructions",
+            r"forget\s+(all\s+)?(previous|prior|above)\s+instructions",
+            r"you\s+are\s+now\s+(?:a|an)\s+",
+            r"act\s+as\s+(?:a|an)\s+",
+            r"pretend\s+(you\s+are|to\s+be)\s+",
+            r"jailbreak",
+            r"<\s*script[^>]*>",
+            r"system\s*:\s*",
+            r"\[\s*system\s*\]",
+        ]
+
+        for pattern in injection_patterns:
+            if re.search(pattern, message, re.IGNORECASE):
+                raise ValueError(
+                    f"User message contains a disallowed pattern: '{pattern}'."
+                )
+
+        return message
+
+        # Patterns that indicate prompt injection or malicious command execution attempts
+    _INJECTION_PATTERNS = [
+        # Shell command execution
+        r"(?i)(\b(exec|eval|system|popen|subprocess|shell_exec|passthru|proc_open)\s*\()",
+        r"(?i)(\$\(.*\)|`[^`]+`)",                          # command substitution
+        r"(?i)(\b(rm|del|format|mkfs|dd)\s+(-rf?\s+)?[/\\~])",  # destructive shell cmds
+        r"(?i)(\|\s*(bash|sh|cmd|powershell|python|perl|ruby|node))",  # pipe to shell
+        r"(?i)(;\s*(bash|sh|cmd|powershell|python|perl|ruby|node)\b)",  # chained shell
+        # Encoded / obfuscated content
+        r"(?:[A-Za-z0-9+/]{40,}={0,2})",                    # long base64 blobs
+        r"(?i)(\\x[0-9a-f]{2}){4,}",                        # hex-encoded sequences
+        r"(?i)(l33t|1337|z3r0|pwn|r00t|h4x)",              # leetspeak indicators
+        # Hidden / override prompt injection
+        r"(?i)(ignore (all |previous |above |prior )?instructions?)",
+        r"(?i)(disregard (all |previous |above |prior )?instructions?)",
+        r"(?i)(you are now|act as|pretend (you are|to be)|roleplay as)",
+        r"(?i)(system prompt|override prompt|new instructions?:)",
+        r"(?i)(jailbreak|do anything now|dan mode)",
+        # Dangerous execution primitives
+        r"(?i)(__import__|importlib|compile\s*\(|exec\s*\(|eval\s*\()",
+        r"(?i)(os\.system|os\.popen|subprocess\.(run|call|Popen|check_output))",
+        r"(?i)(open\s*\([^)]*['"]w['"])",                   # file write attempts
+    ]
+
+    @staticmethod
+    def _validate_user_input(message: str) -> None:
+        """
+        Scan the user message for injection patterns and dangerous commands.
+        Raises ValueError if a violation is detected so the message is never
+        forwarded to the LLM.
+        """
+        import re
+        for pattern in TechSupportAgent._INJECTION_PATTERNS:
+            if re.search(pattern, message):
+                _log.warning(
+                    "[SECURITY] Blocked potentially malicious user input | "
+                    "pattern=%s | preview=%.80r",
+                    pattern,
+                    message,
+                )
+                raise ValueError(
+                    "Your message contains content that cannot be processed. "
+                    "Please rephrase your request without special commands or encoded content."
+                )
+
     async def _process_query(
         self,
         message: str,
@@ -1313,12 +1521,19 @@ class TechSupportAgent:
         """
         Process a general tech support query.
 
-        VULNERABILITY: User message sent to LLM without sanitization
-        or content scanning.
+        User input is validated against injection patterns before being
+        forwarded to the LLM to prevent prompt injection and malicious
+        command execution.
         """
         # Encryption helper for PII fields
         import base64, os
         from cryptography.fernet import Fernet
+
+        # Sanitize user input before sending to LLM
+        try:
+            TechSupportAgent._validate_user_input(message)
+        except ValueError as exc:
+            return str(exc)
 
         system_prompt = """You are a helpful technical support agent for PolicyProbe.
 You can help users with:
@@ -1329,7 +1544,6 @@ You can help users with:
 
 Be helpful, professional, and concise in your responses."""
 
-        # VULNERABILITY: Direct user input to LLM without scanning
         llm_request_messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": message}
@@ -1355,6 +1569,54 @@ Be helpful, professional, and concise in your responses."""
         )
 
         return response
+
+    @staticmethod
+    def _sanitize_query(message: str, max_length: int = 4096) -> str:
+        """
+        Validate and sanitize an incoming user query before it is forwarded
+        to the LLM.
+
+        Steps:
+        1. Enforce a maximum length to prevent prompt-flooding attacks.
+        2. Remove ASCII control characters (except ordinary whitespace).
+        3. Detect and reject common prompt-injection / jailbreak patterns.
+
+        Raises ValueError if the input contains injection patterns.
+        Returns the cleaned string.
+        """
+        import re
+
+        if not isinstance(message, str):
+            raise TypeError("User message must be a string.")
+
+        # 1. Length enforcement
+        if len(message) > max_length:
+            message = message[:max_length]
+
+        # 2. Strip ASCII control characters (keep \t, \n, \r)
+        message = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", message)
+
+        # 3. Injection / jailbreak pattern detection
+        injection_patterns = [
+            r"(?i)ignore\s+(all\s+)?previous\s+instructions",
+            r"(?i)disregard\s+(all\s+)?previous\s+instructions",
+            r"(?i)you\s+are\s+now\s+(a|an)\s+",
+            r"(?i)act\s+as\s+(a|an)\s+",
+            r"(?i)pretend\s+(you\s+are|to\s+be)\s+",
+            r"(?i)jailbreak",
+            r"(?i)<\s*script[^>]*>",
+            r"(?i)system\s*:\s*",
+            r"(?i)\[INST\]",
+            r"(?i)###\s*instruction",
+        ]
+        for pattern in injection_patterns:
+            if re.search(pattern, message):
+                raise ValueError(
+                    f"User input rejected: potential prompt injection detected "
+                    f"(pattern: {pattern!r})."
+                )
+
+        return message
 
     @staticmethod
     def _get_pii_fernet() -> "Fernet":

@@ -7,22 +7,85 @@ import { join } from 'path'
 
 const BACKEND_URL = process.env.BACKEND_URL
 
-// Approved model registry: only these pinned model identifiers are permitted.
-// Update this list through your change-management process when adopting new models.
-const APPROVED_MODELS: ReadonlySet<string> = new Set([
-  // OpenAI pinned versions
-  'gpt-4o-2024-08-06',
-  'gpt-4o-mini-2024-07-18',
-  'gpt-4-turbo-2024-04-09',
-  'gpt-3.5-turbo-0125',
-  // Anthropic Claude pinned versions
-  'claude-3-5-sonnet-20241022',
-  'claude-3-5-haiku-20241022',
-  'claude-3-opus-20240229',
-  'claude-3-sonnet-20240229',
-  'claude-3-haiku-20240307',
-  // Add other approved, pinned model IDs here
-])
+// Approved model registry: model identifiers are fetched from the organization's
+// external registry endpoint and verified via HMAC-SHA256 signature.
+// Configure MODEL_REGISTRY_URL and MODEL_REGISTRY_HMAC_SECRET in your environment.
+// The registry endpoint must return JSON: { "models": ["model-id", ...], "signature": "<hex-hmac-sha256-of-models-json>" }
+const MODEL_REGISTRY_URL = process.env.MODEL_REGISTRY_URL
+const MODEL_REGISTRY_HMAC_SECRET = process.env.MODEL_REGISTRY_HMAC_SECRET
+
+if (!MODEL_REGISTRY_URL) {
+  throw new Error('MODEL_REGISTRY_URL environment variable is not set. An organization-approved model registry endpoint is required.')
+}
+if (!MODEL_REGISTRY_HMAC_SECRET) {
+  throw new Error('MODEL_REGISTRY_HMAC_SECRET environment variable is not set. Registry response integrity verification requires a shared HMAC secret.')
+}
+
+let _approvedModelsCache: ReadonlySet<string> | null = null
+let _approvedModelsCacheExpiry = 0
+const REGISTRY_CACHE_TTL_MS = 5 * 60 * 1000 // 5 minutes
+
+async function fetchApprovedModelsFromRegistry(): Promise<ReadonlySet<string>> {
+  const now = Date.now()
+  if (_approvedModelsCache && now < _approvedModelsCacheExpiry) {
+    return _approvedModelsCache
+  }
+
+  let registryResponse: Response
+  try {
+    registryResponse = await fetch(MODEL_REGISTRY_URL!, {
+      method: 'GET',
+      headers: { 'Accept': 'application/json' },
+      // Enforce a short timeout to avoid blocking requests
+      signal: AbortSignal.timeout(5000),
+    })
+  } catch (err) {
+    throw new Error(`Failed to reach organization model registry at ${MODEL_REGISTRY_URL}: ${err}`)
+  }
+
+  if (!registryResponse.ok) {
+    throw new Error(`Organization model registry returned HTTP ${registryResponse.status}. Cannot verify approved models.`)
+  }
+
+  let payload: { models: string[]; signature: string }
+  try {
+    payload = await registryResponse.json()
+  } catch {
+    throw new Error('Organization model registry returned invalid JSON.')
+  }
+
+  if (!Array.isArray(payload.models) || typeof payload.signature !== 'string') {
+    throw new Error('Organization model registry response missing required fields: models (array) and signature (string).')
+  }
+
+  // Verify HMAC-SHA256 signature over the canonical JSON of the models array
+  const { createHmac } = await import('crypto')
+  const canonicalPayload = JSON.stringify(payload.models)
+  const expectedSig = createHmac('sha256', MODEL_REGISTRY_HMAC_SECRET!)
+    .update(canonicalPayload)
+    .digest('hex')
+
+  // Constant-time comparison to prevent timing attacks
+  const { timingSafeEqual } = await import('crypto')
+  const sigBuffer = Buffer.from(payload.signature, 'hex')
+  const expectedBuffer = Buffer.from(expectedSig, 'hex')
+  if (
+    sigBuffer.length !== expectedBuffer.length ||
+    !timingSafeEqual(sigBuffer, expectedBuffer)
+  ) {
+    throw new Error('Organization model registry HMAC signature verification failed. Refusing to use unverified model list.')
+  }
+
+  const approvedSet: ReadonlySet<string> = new Set(payload.models)
+  _approvedModelsCache = approvedSet
+  _approvedModelsCacheExpiry = now + REGISTRY_CACHE_TTL_MS
+  return approvedSet
+}
+
+async function isModelApproved(modelId: string): Promise<boolean> {
+  const approved = await fetchApprovedModelsFromRegistry()
+  return approved.has(modelId)
+}
 const API_SECRET = process.env.API_SECRET
 const BACKEND_API_KEY = process.env.BACKEND_API_KEY
 
@@ -46,7 +109,9 @@ function isApprovedEndpoint(url: string): boolean {
   // Fallback: verify the URL contains the org-approved hostname segment.
   try {
     const parsed = new URL(url)
-    return parsed.hostname.includes(ORG_APPROVED_HOSTNAME_SEGMENT)
+    // Use exact match or strict subdomain suffix to prevent substring-bypass SSRF.
+    const h = parsed.hostname
+    return h === ORG_APPROVED_HOSTNAME_SEGMENT || h.endsWith('.' + ORG_APPROVED_HOSTNAME_SEGMENT)
   } catch {
     return false
   }
@@ -77,40 +142,59 @@ const AUDIT_LOG_FILE = join(AUDIT_LOG_DIR, 'ai-chat-audit.jsonl')
 const AUDIT_RETENTION_DAYS = parseInt(process.env.AUDIT_RETENTION_DAYS || '90', 10)
 const AUDIT_MAX_FILE_SIZE_MB = parseInt(process.env.AUDIT_MAX_FILE_SIZE_MB || '100', 10)
 
+/**
+ * Strips newline and carriage-return characters from every string value in an
+ * object/array/primitive so that user-controlled data cannot inject forged
+ * entries into the JSONL audit log.
+ */
+function sanitizeForLog<T>(value: T): T {
+  if (typeof value === 'string') {
+    // Remove CR, LF, and other vertical whitespace that could break JSONL structure.
+    return value.replace(/[\r\n\u2028\u2029]/g, ' ') as unknown as T
+  }
+  if (Array.isArray(value)) {
+    return value.map(sanitizeForLog) as unknown as T
+  }
+  if (value !== null && typeof value === 'object') {
+    const sanitized: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      sanitized[k] = sanitizeForLog(v)
+    }
+    return sanitized as unknown as T
+  }
+  return value
+}
+
 function hashInput(input: unknown): string {
   return createHash('sha256')
     .update(JSON.stringify(input))
     .digest('hex')
 }
 
-function getPrincipal(request: NextRequest): string {
-  const forwarded = request.headers.get('x-forwarded-for')
-  const realIp = request.headers.get('x-real-ip')
-  let ip: string | null = null
-  if (forwarded) ip = forwarded.split(',')[0].trim()
-  else if (realIp) ip = realIp
-  if (!ip) return 'unknown'
-  return 'ip-hash:' + createHash('sha256').update(ip).digest('hex')
+function getPrincipal(_request: NextRequest): string {
+  // IP address and IP-derived values must not be logged (PII policy).
+  // Return a static, non-PII principal token instead.
+  return 'session'
 }
 
-// Shell command pattern built dynamically to avoid embedding raw command strings in source
+// Shell command pattern — explicit string literals for transparency and auditability
 const _shellCmdParts = [
   // Interpreters and scripting runtimes
-  ['ba','sh'].join(''), ['s','h'].join(''), ['zs','h'].join(''),
-  ['cm','d'].join(''), ['powers','hell'].join(''), ['pw','sh'].join(''),
+  'bash', 'sh', 'zsh',
+  'cmd', 'powershell', 'pwsh',
   // Code execution primitives
-  ['ex','ec'].join(''), ['ev','al'].join(''), ['sys','tem'].join(''),
-  ['po','pen'].join(''), ['subpro','cess'].join(''),
-  ['os\.sys','tem'].join(''), ['child_pro','cess'].join(''),
-  ['spa','wn'].join(''), ['exec','Sync'].join(''), ['exec','File'].join(''),
-  ['pass','thru'].join(''), ['shell_e','xec'].join(''), ['proc_o','pen'].join(''),
+  'exec', 'eval', 'system',
+  'popen', 'subprocess',
+  'os\.system', 'child_process',
+  'spawn', 'execSync', 'execFile',
+  'passthru', 'shell_exec', 'proc_open',
   // Privileged / destructive commands
   '\\bsudo\\b', '\\bchmod\\b', '\\bchown\\b',
-  ['\\br','m\\s+-rf'].join(''), '\\bmkdir\\b',
+  '\\brm\\s+-rf', '\\bmkdir\\b',
   // Network utilities
-  ['\\bw','get\\b'].join(''), ['\\bcu','rl\\b'].join(''),
+  '\\bwget\\b', '\\bcurl\\b',
   '\\bnc\\b', '\\bnetcat\\b', '\\btelnet\\b',
-  ['\\bss','h\\b'].join(''), ['\\bsc','p\\b'].join(''), ['\\bft','p\\b'].join('')
+  '\\bssh\\b', '\\bscp\\b', '\\bftp\\b'
 ]
 const SHELL_COMMAND_PATTERN = new RegExp(
   '(?:^|[\\s;|&`$(){}])(?:' + _shellCmdParts.join('|') + ')',
@@ -119,7 +203,7 @@ const SHELL_COMMAND_PATTERN = new RegExp(
 const BASE64_PATTERN = /(?:[A-Za-z0-9+/]{40,}={0,2})/
 const BINARY_PATTERN = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/
 const HIDDEN_PROMPT_PATTERN = /(?:ignore\s+(?:previous|above|prior|all)\s+(?:instructions?|prompts?|context)|you\s+are\s+now|act\s+as\s+(?:a\s+)?(?:different|new|another|unrestricted)|disregard\s+(?:all|any|previous)|forget\s+(?:all|everything|previous)|system\s*:\s*you|<\s*system\s*>|\[\s*system\s*\]|###\s*(?:system|instruction)|roleplay\s+as|pretend\s+(?:you\s+are|to\s+be)|jailbreak|DAN\s+mode|developer\s+mode)/i
-// Leetspeak shell pattern built dynamically to avoid embedding obfuscated command strings in source
+// Leetspeak shell pattern for detecting leet-encoded shell commands in user input
 const _leetspeakParts = [
   // exec
   '[e3][x\\*][e3][c\\(]',
@@ -200,6 +284,35 @@ export async function POST(request: NextRequest) {
     if (!session) {
       return NextResponse.json(
         { detail: 'Unauthorized: You must be authenticated to access the AI Agent.' },
+        { status: 401 }
+      )
+    }
+
+    // Validate session integrity: check expiry
+    if (session.expires) {
+      const expiresAt = new Date(session.expires).getTime()
+      if (isNaN(expiresAt) || Date.now() > expiresAt) {
+        return NextResponse.json(
+          { detail: 'Unauthorized: Session has expired.' },
+          { status: 401 }
+        )
+      }
+    } else {
+      // No expiry field present — reject to enforce expiry policy
+      return NextResponse.json(
+        { detail: 'Unauthorized: Session is missing expiry information.' },
+        { status: 401 }
+      )
+    }
+
+    // Validate session integrity: assert subject binding (user identity must be present)
+    if (
+      !session.user ||
+      typeof session.user.email !== 'string' ||
+      session.user.email.trim() === ''
+    ) {
+      return NextResponse.json(
+        { detail: 'Unauthorized: Session is missing required user identity binding.' },
         { status: 401 }
       )
     }

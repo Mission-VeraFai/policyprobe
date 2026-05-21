@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 
 # Approved LLM model identifier (organization registry)
-APPROVED_MODEL = "gpt-4"  # Approved LLM per organization registry
+APPROVED_MODEL = "gpt-4o"  # Approved LLM per organization registry
 
 # Patterns that indicate prompt-injection / instruction-override attempts
 _INJECTION_PATTERNS: List[re.Pattern] = [
@@ -952,62 +952,78 @@ class ContentScanner:
         """
         Combine all extracted content for LLM analysis.
 
-        VULNERABILITY: Combines visible AND hidden content without
-        any security filtering. Hidden malicious content gets sent
-        directly to the LLM.
+        SECURE VERSION: Scans all content (visible, hidden, and encoded)
+        for prompt injection and other threats before combining.
+        Raises an error if threats are detected, blocking malicious uploads.
         """
+        from .prompt_injection import PromptInjectionDetector
+        detector = PromptInjectionDetector()
+
+        warnings = []
         parts = [extracted.visible_text]
 
-        # VULNERABILITY: Hidden content added without filtering
+        # Scan visible text for threats
+        visible_scan = await detector.scan(extracted.visible_text)
+        if visible_scan.has_violations:
+            warnings.append("THREAT: Malicious content detected in visible text")
+            logger.warning(
+                "Threat detected in visible text of uploaded file",
+                extra={"violations": str(visible_scan.violations)}
+            )
+
+        # Scan and conditionally include hidden content
         if extracted.hidden_text:
-            parts.append(f"\n[Additional content]:\n{extracted.hidden_text}")
+            warnings.append(
+                f"SECURITY: Hidden text detected ({len(extracted.hidden_text)} chars)"
+            )
+            hidden_scan = await detector.scan(extracted.hidden_text)
+            if hidden_scan.has_violations:
+                warnings.append("THREAT: Malicious content detected in hidden text")
+                logger.warning(
+                    "Threat detected in hidden text of uploaded file",
+                    extra={"violations": str(hidden_scan.violations)}
+                )
+            else:
+                parts.append(f"\n[Additional content]:\n{extracted.hidden_text}")
 
-        # VULNERABILITY: Encoded content added without filtering
+        # Scan and conditionally include encoded/decoded content
         if extracted.encoded_content:
+            warnings.append(
+                f"SECURITY: {len(extracted.encoded_content)} encoded content block(s) detected"
+            )
             for i, decoded in enumerate(extracted.encoded_content):
-                parts.append(f"\n[Decoded content {i+1}]:\n{decoded}")
+                encoded_scan = await detector.scan(decoded)
+                if encoded_scan.has_violations:
+                    warnings.append(
+                        f"THREAT: Malicious content detected in decoded block {i + 1}"
+                    )
+                    logger.warning(
+                        "Threat detected in encoded/decoded content of uploaded file",
+                        extra={"block": i + 1, "violations": str(encoded_scan.violations)}
+                    )
+                else:
+                    parts.append(f"\n[Decoded content {i + 1}]:\n{decoded}")
 
-        # VULNERABILITY: All content combined and returned
-        # No security scanning performed before return
+        # Block the upload if any threats were found
+        threat_warnings = [w for w in warnings if w.startswith("THREAT:")]
+        if threat_warnings:
+            logger.error(
+                "Upload blocked: malicious content detected in uploaded file",
+                extra={"threats": threat_warnings}
+            )
+            raise ValueError(
+                "Upload blocked: the uploaded file contains potentially malicious content. "
+                f"Detected issues: {'; '.join(threat_warnings)}"
+            )
+
+        if warnings:
+            logger.info(
+                "Security warnings for uploaded file (no threats found)",
+                extra={"warnings": warnings}
+            )
+
         result = ExtractedContent(
             visible_text='\n'.join(parts),
+            warnings=warnings,
         )
         return self._pii_gate(result, source='document')
-
-
-# ============================================================================
-# REMEDIATED VERSION (commented out - Unifai would enable this)
-# ============================================================================
-
-# class ContentScanner:
-#     """
-#     SECURE VERSION - After Unifai remediation
-#
-#     This version:
-#     - Flags hidden content as suspicious
-#     - Integrates with threat detection
-#     - Generates security warnings
-#     - Blocks content with detected threats
-#     """
-#
-#     async def scan_html(self, html_content: str) -> ExtractedContent:
-#         """Scan with security awareness."""
-#         # ... extraction code ...
-#
-#         warnings = []
-#         if hidden_elements:
-#             warnings.append(f"SECURITY: {len(hidden_elements)} hidden elements detected")
-#
-#             # Scan hidden content for threats
-#             from .prompt_injection import PromptInjectionDetector
-#             detector = PromptInjectionDetector()
-#             for hidden in hidden_elements:
-#                 result = await detector.scan(hidden)
-#                 if result.has_violations:
-#                     warnings.append(f"THREAT: Malicious content in hidden element")
-#
-#         return ExtractedContent(
-#             visible_text=visible_text,
-#             hidden_text=hidden_text,
-#             warnings=warnings
-#         )

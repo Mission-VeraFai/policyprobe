@@ -8,7 +8,8 @@ import { User, Bot, Paperclip, AlertTriangle, ShieldCheck } from 'lucide-react'
 // Synthetic-content provenance helpers
 // ---------------------------------------------------------------------------
 
-const AI_MODEL_ID = process.env.NEXT_PUBLIC_AI_MODEL_ID ?? 'assistant-model-unknown'
+const APPROVED_AI_MODEL_ID = 'gpt-4'
+const AI_MODEL_ID = process.env.NEXT_PUBLIC_AI_MODEL_ID ?? APPROVED_AI_MODEL_ID
 
 /**
  * Produce a lightweight, deterministic provenance tag for an AI-generated
@@ -20,7 +21,8 @@ async function buildProvenanceTag(
   timestamp: Date
 ): Promise<{ modelId: string; issuedAt: string; watermark: string }> {
   const issuedAt = timestamp.toISOString()
-  const payload = `${AI_MODEL_ID}|${issuedAt}|${content}`
+  const contentHash = hashContent(content)
+  const payload = `${AI_MODEL_ID}|${issuedAt}|${contentHash}`
 
   let watermark = 'unavailable'
   try {
@@ -54,14 +56,18 @@ async function buildProvenanceTag(
 interface SanitizationAuditRecord {
   timestamp: string
   inputHash: string
-  outputSnippet: string
+  outputHash: string
   flagged: boolean
   detectedPatterns: string[]
   modelIdentifier: string
   principal: string
 }
 
-const AUDIT_LOG_KEY = 'llm_sanitization_audit_log'
+// Append-only in-memory audit log — never overwritten, only pushed to.
+// Retention policy: cap at MAX_AUDIT_LOG_ENTRIES; oldest records are evicted
+// when the limit is reached so memory is bounded.
+const MAX_AUDIT_LOG_ENTRIES = 1000
+const _auditLog: SanitizationAuditRecord[] = []
 
 function hashContent(content: string): string {
   // FNV-1a 32-bit hash — deterministic, no external dependency
@@ -75,12 +81,27 @@ function hashContent(content: string): string {
 
 function writeSanitizationAuditRecord(record: SanitizationAuditRecord): void {
   try {
+    // Append-only: records are only ever pushed, never overwritten or deleted
+    // individually. Retention policy: evict the oldest entry when the cap is
+    // exceeded so the log remains bounded in memory.
+    if (_auditLog.length >= MAX_AUDIT_LOG_ENTRIES) {
+      _auditLog.shift() // remove oldest — FIFO eviction
+    }
+    _auditLog.push(record)
+    // Emit to console as a structured forensic trace for server-side log aggregation
+    console.info('[AUDIT][LLM_SANITIZATION]', JSON.stringify(record))
+  } catch (e) {
+    // Failure must not silently swallow the audit — emit to console at minimum
+    console.error('[AUDIT][LLM_SANITIZATION] Failed to persist audit record', e, record)
+  }
+} = record
+    const redactedRecord = { ...safeRecord, outputHash }
     const existing = sessionStorage.getItem(AUDIT_LOG_KEY)
     const log: SanitizationAuditRecord[] = existing ? JSON.parse(existing) : []
-    log.push(record)
+    log.push(redactedRecord)
     sessionStorage.setItem(AUDIT_LOG_KEY, JSON.stringify(log))
-    // Also emit to console as a structured forensic trace for server-side log aggregation
-    console.info('[AUDIT][LLM_SANITIZATION]', JSON.stringify(record))
+    // Emit only the redacted record (no raw output) to console
+    console.info('[AUDIT][LLM_SANITIZATION]', JSON.stringify(redactedRecord))
   } catch (e) {
     // Storage failure must not silently swallow the audit — emit to console at minimum
     console.error('[AUDIT][LLM_SANITIZATION] Failed to persist audit record', e, record)
@@ -453,7 +474,7 @@ function ProvenanceLabel({
       data-ai-origin="true"
       data-ai-model={provenance?.modelId ?? AI_MODEL_ID}
       data-ai-issued-at={provenance?.issuedAt ?? timestamp.toISOString()}
-      data-ai-watermark={provenance?.watermark ?? 'pending'}
+      data-ai-provenance="true"
     >
       <ShieldCheck size={12} aria-hidden="true" />
       <span>AI-Generated Content</span>
