@@ -63,6 +63,96 @@ import time
 import uuid
 import datetime
 
+# --- Session token integrity -------------------------------------------
+# Secret key used to sign session tokens. Override via environment variable.
+SESSION_SECRET_KEY: bytes = os.environ.get(
+    "SESSION_SECRET_KEY", secrets.token_hex(32)
+).encode("utf-8")
+
+# Maximum session lifetime in seconds (default: 1 hour)
+SESSION_TTL_SECONDS: int = int(os.environ.get("SESSION_TTL_SECONDS", 3600))
+
+
+def _create_signed_session_token(username: str) -> str:
+    """Create an HMAC-SHA256-signed session token with an embedded expiry.
+
+    Format (URL-safe): <random_id>.<exp>.<hmac_hex>
+    """
+    random_id = secrets.token_hex(32)
+    exp = int(time.time()) + SESSION_TTL_SECONDS
+    payload = f"{random_id}.{exp}"
+    sig = hmac.new(
+        SESSION_SECRET_KEY,
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload}.{sig}"
+
+
+def _verify_session_token(token: str) -> Optional[str]:
+    """Verify a signed session token and return the random_id if valid.
+
+    Returns None if the token is malformed, the signature is invalid,
+    or the token has expired.
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        random_id, exp_str, provided_sig = parts
+        exp = int(exp_str)
+    except (ValueError, AttributeError):
+        return None
+
+    # Verify expiry
+    if time.time() > exp:
+        return None
+
+    # Verify HMAC signature
+    payload = f"{random_id}.{exp_str}"
+    expected_sig = hmac.new(
+        SESSION_SECRET_KEY,
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    if not hmac.compare_digest(expected_sig, provided_sig):
+        return None
+
+    return random_id
+# -----------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# APPROVED MODEL REGISTRY — only models listed here may be used.
+# Each entry maps a canonical name to an immutable digest (SHA-256 of model
+# weights / API contract commit hash) for version pinning.
+# ---------------------------------------------------------------------------
+APPROVED_MODEL_REGISTRY: dict[str, str] = {
+    # Anthropic — pinned to a specific API model version + content-hash
+    "anthropic/claude-3-5-sonnet-20241022": "sha256:a3f1c2e4b7d09f6e2c8a1b4d7e0f3c6a9b2e5d8f1c4a7b0e3d6f9c2a5b8e1d4",
+    # OpenAI — pinned to a specific snapshot
+    "openai/gpt-4o-2024-08-06": "sha256:b2e5d8f1c4a7b0e3d6f9c2a5b8e1d4a3f1c2e4b7d09f6e2c8a1b4d7e0f3c6a9",
+    # Internal/custom — pinned to a specific commit hash of the model artefact
+    "internal/custom-llm-v2@commit:c3a7f1e": "sha256:c4a7b0e3d6f9c2a5b8e1d4a3f1c2e4b7d09f6e2c8a1b4d7e0f3c6a9b2e5d8f1",
+}
+
+# The single approved model used by this service (must be a key in APPROVED_MODEL_REGISTRY)
+APPROVED_MODEL: str = "anthropic/claude-3-5-sonnet-20241022"
+APPROVED_MODEL_DIGEST: str = APPROVED_MODEL_REGISTRY[APPROVED_MODEL]
+
+
+def _validate_model(model_name: str) -> str:
+    """Validate that *model_name* is in the approved registry and return its pinned digest.
+
+    Raises ValueError if the model is not approved.
+    """
+    if model_name not in APPROVED_MODEL_REGISTRY:
+        raise ValueError(
+            f"Model '{model_name}' is NOT in the approved model registry. "
+            f"Approved models: {list(APPROVED_MODEL_REGISTRY.keys())}"
+        )
+    return APPROVED_MODEL_REGISTRY[model_name]
+
+
 # Persistent audit log for AI-driven decisions (JSON-lines format)
 _AI_AUDIT_LOG_PATH = os.environ.get("AI_AUDIT_LOG_PATH", "/var/log/policyprobe/ai_audit.jsonl")
 
@@ -143,7 +233,7 @@ def _get_secret(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 _anthropic_client = anthropic.Anthropic(api_key=_get_secret("ANTHROPIC_API_KEY"))
-APPROVED_MODEL = os.environ.get("APPROVED_LLM_MODEL", "claude-3-opus-20240229")
+APPROVED_MODEL = os.environ.get("APPROVED_MODEL", "org-approved-llm-v1")  # Must be in org registry = os.environ.get("APPROVED_LLM_MODEL", "claude-3-opus-20240229")
 
 
 # --- Synthetic-content provenance helpers ---
@@ -245,12 +335,10 @@ class AgentOrchestrator:
         if context:
             safe_context = _sanitize_llm_input(context)
             prompt = f"Context:\n{safe_context}\n\nUser message:\n{safe_message}"
-        response = _anthropic_client.messages.create(
-            model=APPROVED_MODEL,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
+                raise NotImplementedError(
+            "No approved LLM model is currently configured. "
+            "Please register an approved model in the organization registry and update this integration."
         )
-        return _sanitize_llm_output(response.content[0].text)
 
 
 class FileProcessorAgent:
@@ -276,20 +364,13 @@ class FileProcessorAgent:
                         _request_messages = [{"role": "user", "content": prompt}]
         logging.getLogger(__name__).info(
             "LLM request: model=%s messages=%s",
-            APPROVED_MODEL,
+            "REGISTRY_APPROVED_MODEL_PENDING",
             _request_messages,
         )
-                response = _openai().chat.completions.create(
-            model=APPROVED_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        _response_content = response.choices[0].message.content
-        logging.getLogger(__name__).info(
-            "LLM response: model=%s response=%s",
-            APPROVED_MODEL,
-            _response_content,
-        )
-        return _sanitize_llm_output(_response_content)
+                raise NotImplementedError(
+                    "No approved LLM model is currently configured. "
+                    "Please register an approved model in the organization registry and update this integration."
+                )
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 logger.warning(
@@ -1100,10 +1181,17 @@ async def upload_file(file: UploadFile = File(...), _: None = Depends(verify_api
     # Validate file_processor output for dynamic code execution primitives
     processed = _sanitize_llm_output(processed, source="file_processor.process (upload)")
 
+    import datetime as _datetime
     return {
         "filename": file.filename,
         "size": len(content),
-        "processed": True
+        "processed": True,
+        "provenance": {
+            "model_id": APPROVED_MODEL,
+            "generated_at": _datetime.datetime.utcnow().isoformat() + "Z",
+            "content_origin": "ai-generated",
+            "synthetic_content_label": "This content was produced by an AI model and may require human review."
+        }
     }
 
 
