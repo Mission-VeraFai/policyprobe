@@ -1,12 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python3.12:*)",
-      "Bash(python3.13:*)",
-      "Bash(source:*)",
-      "Bash(python:*)",
-      "Skill(superpowers:systematic-debugging)",
-      "Bash(uvicorn:*)"
+      "Bash(python3.12 --version)",
+      "Bash(python3.13 --version)"
     ]
   }
 }
