@@ -5,10 +5,13 @@ import { createHash } from 'crypto'
 import { appendFileSync, mkdirSync } from 'fs'
 import { join } from 'path'
 
-const BACKEND_URL = process.env.BACKEND_URL || 'https://127.0.0.1:5500'
+const BACKEND_URL = process.env.BACKEND_URL
 const API_SECRET = process.env.API_SECRET
 const BACKEND_API_KEY = process.env.BACKEND_API_KEY
 
+if (!BACKEND_URL) {
+  throw new Error('BACKEND_URL environment variable is not set. Only approved LLM endpoints may be used; configure BACKEND_URL to an approved endpoint.')
+}
 if (!BACKEND_API_KEY) {
   throw new Error('BACKEND_API_KEY environment variable is not set. Inter-agent communication requires authentication.')
 }
@@ -426,18 +429,135 @@ export async function POST(request: NextRequest) {
     }
 
     if (data?.session_id !== undefined) {
-      const sessionIdStr = String(data.session_id)
-      if (containsDangerousPatterns(sessionIdStr)) {
-        console.warn('LLM output validation: dangerous pattern detected in session_id field; field suppressed.')
-        // session_id is omitted entirely if it contains dangerous content
-      } else {
+      // Validate session_id as a signed JWT with expiry and subject binding.
+      // Only forward the token if it passes all cryptographic and structural checks.
+      const validateSessionToken = async (token: unknown): Promise<boolean> => {
+        try {
+          if (typeof token !== 'string') return false
+
+          // Structural check: must be a three-part JWT
+          const parts = token.split('.')
+          if (parts.length !== 3) return false
+
+          const [headerB64, payloadB64, signatureB64] = parts
+
+          // Decode header and payload (base64url)
+          const base64urlDecode = (s: string): string =>
+            Buffer.from(s.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')
+
+          let header: Record<string, unknown>
+          let payload: Record<string, unknown>
+          try {
+            header = JSON.parse(base64urlDecode(headerB64))
+            payload = JSON.parse(base64urlDecode(payloadB64))
+          } catch {
+            return false
+          }
+
+          // Algorithm binding: only accept HMAC-SHA256
+          if (header.alg !== 'HS256') {
+            console.warn('Session token validation: unexpected algorithm; token suppressed.')
+            return false
+          }
+
+          // Expiry check: exp claim must exist and must not be in the past
+          if (typeof payload.exp !== 'number') {
+            console.warn('Session token validation: missing exp claim; token suppressed.')
+            return false
+          }
+          const nowSeconds = Math.floor(Date.now() / 1000)
+          if (payload.exp <= nowSeconds) {
+            console.warn('Session token validation: token has expired; token suppressed.')
+            return false
+          }
+
+          // Subject binding: sub claim must be a non-empty string
+          if (typeof payload.sub !== 'string' || payload.sub.trim() === '') {
+            console.warn('Session token validation: missing or empty sub claim; token suppressed.')
+            return false
+          }
+
+          // Signature verification using HMAC-SHA256
+          const secret = process.env.SESSION_TOKEN_SECRET
+          if (!secret) {
+            console.warn('Session token validation: SESSION_TOKEN_SECRET not configured; token suppressed.')
+            return false
+          }
+
+          const { createHmac } = await import('crypto')
+          const signingInput = `${headerB64}.${payloadB64}`
+          const expectedSig = createHmac('sha256', secret)
+            .update(signingInput)
+            .digest('base64url')
+
+          // Constant-time comparison to prevent timing attacks
+          const { timingSafeEqual } = await import('crypto')
+          const expectedBuf = Buffer.from(expectedSig)
+          const actualBuf = Buffer.from(signatureB64)
+          if (expectedBuf.length !== actualBuf.length) {
+            console.warn('Session token validation: signature length mismatch; token suppressed.')
+            return false
+          }
+          if (!timingSafeEqual(expectedBuf, actualBuf)) {
+            console.warn('Session token validation: signature verification failed; token suppressed.')
+            return false
+          }
+
+          return true
+        } catch {
+          return false
+        }
+      }
+
+      const sessionTokenValid = await validateSessionToken(data.session_id)
+      if (sessionTokenValid) {
         minimisedData.session_id = data.session_id
+      } else {
+        console.warn('Session token validation: session_id failed integrity checks; field suppressed.')
+        // session_id is omitted entirely if it fails cryptographic validation
       }
     }
 
     if (data?.policy_error !== undefined) minimisedData.policy_error = data.policy_error
 
-    return NextResponse.json(minimisedData)
+    // --- Synthetic-content provenance, labeling, and watermarking ---
+    // Attach metadata so downstream consumers can verify the AI origin of this response.
+    const provenanceTimestamp = new Date().toISOString()
+    const modelId = process.env.LLM_MODEL_ID ?? 'unknown-model'
+    const originTag = 'ai-generated'
+
+    // Build a canonical representation of the payload for signing.
+    const canonicalPayload = JSON.stringify({
+      ...minimisedData,
+      _provenance: { modelId, timestamp: provenanceTimestamp, originTag },
+    })
+
+    // Compute an HMAC-SHA256 signature so recipients can verify integrity.
+    const signingSecret = process.env.PROVENANCE_SIGNING_SECRET ?? ''
+    let provenanceSignature = ''
+    if (signingSecret) {
+      const { createHmac } = await import('crypto')
+      provenanceSignature = createHmac('sha256', signingSecret)
+        .update(canonicalPayload)
+        .digest('hex')
+    } else {
+      console.warn('Provenance signing secret is not configured; signature will be empty.')
+    }
+
+    const labelledData = {
+      ...minimisedData,
+      // Human-readable synthetic-content label (policy requirement).
+      _synthetic_content_label: 'This response was generated by an AI language model.',
+      _provenance: {
+        modelId,
+        timestamp: provenanceTimestamp,
+        originTag,
+        // Hex-encoded HMAC-SHA256 over the canonical payload.
+        signature: provenanceSignature,
+      },
+    }
+
+    return NextResponse.json(labelledData)
   } catch (error) {
     console.error('Backend proxy error:', error)
     return NextResponse.json(

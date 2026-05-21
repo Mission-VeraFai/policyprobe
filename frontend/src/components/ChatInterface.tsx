@@ -3,6 +3,140 @@
 import { useState, useRef, useEffect } from 'react'
 import { v4 as uuidv4 } from 'uuid'
 
+// Helper: sanitize user text input before it is sent to the LLM API.
+// Strips null bytes, non-printable control characters (except common whitespace),
+// and enforces a maximum length to prevent prompt-injection via oversized payloads.
+const MAX_INPUT_LENGTH = 4000
+const ALLOWED_FILE_TYPES = new Set(['text/plain', 'application/pdf', 'image/png', 'image/jpeg', 'image/webp'])
+const MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024 // 5 MB
+
+function sanitizeTextInput(raw: string): string {
+  // Remove null bytes and non-printable ASCII control characters
+  // (keep \t, \n, \r which are legitimate whitespace).
+  // eslint-disable-next-line no-control-regex
+  let sanitized = raw.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+  // Collapse runs of more than two consecutive newlines to prevent prompt flooding.
+  sanitized = sanitized.replace(/\n{3,}/g, '\n\n')
+  // Enforce maximum length.
+  if (sanitized.length > MAX_INPUT_LENGTH) {
+    sanitized = sanitized.slice(0, MAX_INPUT_LENGTH)
+  }
+  return sanitized
+}
+
+function sanitizeFileName(name: string): string {
+  // Allow only alphanumerics, dots, hyphens, and underscores.
+  return name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255)
+}
+
+function validateAndSanitizeFiles(files: File[]): { valid: File[]; errors: string[] } {
+  const valid: File[] = []
+  const errors: string[] = []
+  for (const file of files) {
+    if (!ALLOWED_FILE_TYPES.has(file.type)) {
+      errors.push(`File "${sanitizeFileName(file.name)}" has disallowed type "${file.type}".`)
+      continue
+    }
+    if (file.size > MAX_FILE_SIZE_BYTES) {
+      errors.push(`File "${sanitizeFileName(file.name)}" exceeds the 5 MB size limit.`)
+      continue
+    }
+    // Re-wrap with a sanitized filename to prevent path-traversal or injection
+    // via the filename field that is forwarded to the API.
+    const sanitized = new File([file], sanitizeFileName(file.name), { type: file.type })
+    valid.push(sanitized)
+  }
+  return { valid, errors }
+}
+
+// Helper: detect and block malicious prompt patterns before sending to the AI agent.
+function sanitizeAndValidateInput(value: string): { safe: boolean; reason?: string } {
+  // 1. Reject binary / non-printable characters (potential binary executable injection).
+  // Allow common whitespace (\t, \n, \r) but block other control characters.
+  if (/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/.test(value)) {
+    return { safe: false, reason: 'Input contains binary or non-printable characters.' }
+  }
+
+  // 2. Detect base64-encoded payloads (long runs of base64 chars that decode to something).
+  const base64Pattern = /(?:[A-Za-z0-9+/]{40,}={0,2})/g
+  const b64Matches = value.match(base64Pattern)
+  if (b64Matches) {
+    for (const match of b64Matches) {
+      try {
+        const decoded = atob(match)
+        // Flag if decoded content looks like a shell command or script.
+        if (/(?:bash|sh|cmd|powershell|eval|exec|system|import os|subprocess)/i.test(decoded)) {
+          return { safe: false, reason: 'Input contains a base64-encoded command payload.' }
+        }
+      } catch {
+        // Not valid base64 — skip.
+      }
+    }
+  }
+
+  // 3. Detect shell command patterns.
+  const shellPatterns = [
+    /(?:^|\s|;|&&|\|\|)\s*(?:bash|sh|zsh|fish|cmd\.exe|powershell(?:\.exe)?|pwsh)\b/i,
+    /(?:rm\s+-rf|mkfs|dd\s+if=|chmod\s+[0-7]{3,4}|chown\s+root|sudo\s+|su\s+-)/i,
+    /(?:curl|wget)\s+.*(?:http|ftp)/i,
+    /(?:eval|exec|system|popen|subprocess|os\.system)\s*\(/i,
+    /(?:\$\(|`)[^`]*(?:\)|`)/,   // command substitution: $(cmd) or `cmd`
+    /(?:>|>>|2>&1|\|)\s*\/(?:etc|dev|proc|sys|tmp)/i,
+  ]
+  for (const pattern of shellPatterns) {
+    if (pattern.test(value)) {
+      return { safe: false, reason: 'Input contains a shell command pattern.' }
+    }
+  }
+
+  // 4. Detect leetspeak obfuscation used to bypass content filters.
+  // Replace common leet substitutions and check for blocked keywords.
+  const leetMap: Record<string, string> = {
+    '0': 'o', '1': 'i', '3': 'e', '4': 'a', '5': 's',
+    '6': 'g', '7': 't', '8': 'b', '@': 'a', '$': 's', '!': 'i',
+  }
+  const deleetified = value
+    .toLowerCase()
+    .replace(/[013456789@$!]/g, (c) => leetMap[c] ?? c)
+  const leetBlocklist = [
+    /ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions/i,
+    /you\s+are\s+now\s+(?:a|an|the)/i,
+    /act\s+as\s+(?:a|an|the)/i,
+    /disregard\s+(?:your|all|the)/i,
+    /jailbreak/i,
+    /do\s+anything\s+now/i,
+  ]
+  for (const pattern of leetBlocklist) {
+    if (pattern.test(deleetified)) {
+      return { safe: false, reason: 'Input contains obfuscated injection keywords.' }
+    }
+  }
+
+  // 5. Detect hidden prompt injection patterns (direct instruction overrides).
+  const injectionPatterns = [
+    /ignore\s+(?:all\s+)?(?:previous|prior|above)\s+instructions/i,
+    /forget\s+(?:all\s+)?(?:previous|prior|above)\s+instructions/i,
+    /disregard\s+(?:your|all|the)\s+(?:previous|prior|system|original)/i,
+    /you\s+are\s+now\s+(?:a|an|the)\s+\w/i,
+    /act\s+as\s+(?:a|an|the)\s+\w/i,
+    /pretend\s+(?:you\s+are|to\s+be)\s+(?:a|an|the)/i,
+    /system\s*:\s*you\s+are/i,
+    /\[\s*system\s*\]/i,
+    /<\s*system\s*>/i,
+    /###\s*(?:instruction|system|prompt)/i,
+    /do\s+anything\s+now/i,
+    /jailbreak/i,
+    /prompt\s+injection/i,
+  ]
+  for (const pattern of injectionPatterns) {
+    if (pattern.test(value)) {
+      return { safe: false, reason: 'Input contains a prompt injection attempt.' }
+    }
+  }
+
+  return { safe: true }
+}
+
 // Helper: validate a JWT's structure, expiry, and subject binding client-side.
 // NOTE: This does NOT replace server-side signature verification; it is a
 // defence-in-depth guard that rejects obviously invalid / expired tokens
@@ -62,12 +196,111 @@ import { MessageList } from './MessageList'
 import { FileUpload } from './FileUpload'
 import { Send, Paperclip, Loader2 } from 'lucide-react'
 
+// Approved model identifiers — only models on the organisation's registry may
+// be referenced in provenance metadata.
+export type ApprovedModelId =
+  | 'org-approved-model-v1'
+  | 'org-approved-model-v2'
+
+// Patterns considered dangerous dynamic-code-execution primitives that must
+// never appear verbatim in LLM-generated content rendered to the user.
+const DANGEROUS_CODE_PATTERNS: ReadonlyArray<RegExp> = [
+  /\beval\s*\(/gi,
+  /\bexec\s*\(/gi,
+  /\bnew\s+Function\s*\(/gi,
+  /\bsetTimeout\s*\(\s*['"`]/gi,
+  /\bsetInterval\s*\(\s*['"`]/gi,
+  /\bimportScripts\s*\(/gi,
+  /\bdocument\.write\s*\(/gi,
+  /\binnerHTML\s*=/gi,
+  /\bouterHTML\s*=/gi,
+  /\bsubprocess\b/gi,
+  /\bos\.system\s*\(/gi,
+  /\bos\.popen\s*\(/gi,
+  /\bchild_process\b/gi,
+  /\bspawn\s*\(/gi,
+  /\bexecSync\s*\(/gi,
+  /\bexecFile\s*\(/gi,
+  /\b__import__\s*\(/gi,
+  /\bcompile\s*\(.*exec/gi,
+]
+
+/**
+ * Scans LLM-generated content for dynamic code execution primitives.
+ * Returns an object describing whether dangerous content was found and,
+ * if so, a sanitized version of the content with the offending fragments
+ * replaced by a visible placeholder so the user is aware of the redaction.
+ */
+function sanitizeLLMOutput(content: string): {
+  safe: boolean
+  sanitized: string
+  detectedPatterns: string[]
+} {
+  const detectedPatterns: string[] = []
+  let sanitized = content
+
+  for (const pattern of DANGEROUS_CODE_PATTERNS) {
+    // Use a fresh regex each iteration to avoid stateful lastIndex issues.
+    const freshPattern = new RegExp(pattern.source, pattern.flags)
+    if (freshPattern.test(sanitized)) {
+      // Record the pattern name for audit logging.
+      detectedPatterns.push(pattern.source)
+      // Replace every occurrence with a clearly visible redaction marker.
+      const replacePattern = new RegExp(pattern.source, pattern.flags)
+      sanitized = sanitized.replace(replacePattern, '[REDACTED:UNSAFE_CODE]')
+    }
+  }
+
+  return {
+    safe: detectedPatterns.length === 0,
+    sanitized,
+    detectedPatterns,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Approved model registry – ONLY these pinned, immutable identifiers are
+// permitted. Any model reference not present here is rejected at runtime.
+// ---------------------------------------------------------------------------
+export const APPROVED_MODEL_REGISTRY = {
+  // OpenAI GPT models
+  'gpt-4o-2024-08-06': { vendor: 'openai', family: 'gpt', pinned: true },
+  'gpt-4-turbo-2024-04-09': { vendor: 'openai', family: 'gpt', pinned: true },
+  'gpt-3.5-turbo-0125': { vendor: 'openai', family: 'gpt', pinned: true },
+  // Anthropic Claude models
+  'claude-3-5-sonnet-20241022': { vendor: 'anthropic', family: 'claude', pinned: true },
+  'claude-3-opus-20240229': { vendor: 'anthropic', family: 'claude', pinned: true },
+  'claude-3-haiku-20240307': { vendor: 'anthropic', family: 'claude', pinned: true },
+  // Google Gemini models
+  'gemini-1.5-pro-002': { vendor: 'google', family: 'gemini', pinned: true },
+  'gemini-1.5-flash-002': { vendor: 'google', family: 'gemini', pinned: true },
+  'gemini-1.0-pro-002': { vendor: 'google', family: 'gemini', pinned: true },
+} as const
+
+/** Union type of all approved, pinned model identifiers. */
+export type ApprovedModelId = keyof typeof APPROVED_MODEL_REGISTRY
+
+/**
+ * Runtime guard: returns true only if the supplied id is a known, pinned
+ * entry in the approved model registry. Rejects alias/unpinned references
+ * such as bare "gpt-4", "claude", or "gemini".
+ */
+export function isApprovedModelId(id: string): id is ApprovedModelId {
+  if (!id || typeof id !== 'string') return false
+  const entry = (APPROVED_MODEL_REGISTRY as Record<string, unknown>)[id]
+  if (!entry) {
+    console.warn(`[model-registry] Model "${id}" is NOT_IN_REGISTRY; rejecting.`)
+    return false
+  }
+  return true
+}
+
 // Provenance metadata that MUST be present on every AI-generated message.
 export interface SyntheticProvenance {
   isSynthetic: true
-  modelId: string          // Identifier of the model that produced the content
-  generatedAt: string      // ISO-8601 timestamp recorded at generation time
-  watermark: string        // HMAC-SHA-256 hex signature over provenance fields
+  modelId: ApprovedModelId  // MUST be a pinned, registry-approved identifier
+  generatedAt: string       // ISO-8601 timestamp recorded at generation time
+  watermark: string         // HMAC-SHA-256 hex signature over provenance fields
   provenanceSignature: string // Hex signature binding content + provenance
 }
 
@@ -885,10 +1118,16 @@ export function ChatInterface() {
         )}
       </div>
 
+      {/* PII Redaction Utility — scrubs text files before upload */}
+      {/* redactPIIFromFiles is defined above this component */}
+
       {/* File Upload Modal */}
       {showFileUpload && (
         <div className="border-t border-chat-border bg-chat-input p-4">
-          <FileUpload onFilesSelected={handleFileSelect} />
+          <FileUpload onFilesSelected={async (files: File[]) => {
+            const redacted = await redactPIIFromFiles(files)
+            handleFileSelect(redacted)
+          }} />
         </div>
       )}
 
@@ -927,16 +1166,80 @@ export function ChatInterface() {
               <Paperclip className="w-5 h-5" />
             </button>
 
-            {/* Hidden file input */}
+                        {/* Hidden file input */}
             <input
               ref={fileInputRef}
               type="file"
               multiple
               accept=".pdf,.doc,.docx,.html,.htm,.txt,.json,.jpg,.jpeg,.png"
               className="hidden"
-              onChange={(e) => {
+              onChange={async (e) => {
                 if (e.target.files) {
-                  handleFileSelect(Array.from(e.target.files))
+                  const files = Array.from(e.target.files);
+                  const safeFiles: File[] = [];
+                  const rejectedNames: string[] = [];
+
+                  // Singapore PII patterns
+                  const singaporePIIPatterns: RegExp[] = [
+                    // NRIC / FIN: S/T/F/G/M followed by 7 digits and a letter
+                    /\b[STFGM]\d{7}[A-Z]\b/i,
+                    // CPF account number: 9 digits (standalone)
+                    /\b\d{9}\b/,
+                    // SingPass user ID pattern (alphanumeric, 6-12 chars, common format)
+                    /\bsingpass[_\-]?id[:\s]+\S+/i,
+                    // Singapore mobile numbers: +65 followed by 8 digits starting with 8 or 9
+                    /\b(\+65|65)?[89]\d{7}\b/,
+                    // Singapore postal code (6 digits starting with valid district prefix)
+                    /\b[0-9]{6}\b/,
+                    // MediSave / CPF references
+                    /\b(medisave|cpf|central\s+provident\s+fund)\b/i,
+                    // SingPass keyword
+                    /\bsingpass\b/i,
+                    // CorpPass keyword
+                    /\bcorppass\b/i,
+                  ];
+
+                  const containsSingaporePII = (text: string): boolean => {
+                    return singaporePIIPatterns.some((pattern) => pattern.test(text));
+                  };
+
+                  const readFileAsText = (file: File): Promise<string> =>
+                    new Promise((resolve) => {
+                      const reader = new FileReader();
+                      reader.onload = (ev) => resolve((ev.target?.result as string) ?? "");
+                      reader.onerror = () => resolve("");
+                      reader.readAsText(file);
+                    });
+
+                  for (const file of files) {
+                    // Only scan text-readable file types for PII
+                    const textTypes = [".txt", ".html", ".htm", ".json"];
+                    const isTextFile = textTypes.some((ext) =>
+                      file.name.toLowerCase().endsWith(ext)
+                    );
+
+                    if (isTextFile) {
+                      const text = await readFileAsText(file);
+                      if (containsSingaporePII(text)) {
+                        rejectedNames.push(file.name);
+                        continue;
+                      }
+                    }
+                    safeFiles.push(file);
+                  }
+
+                  if (rejectedNames.length > 0) {
+                    alert(
+                      `The following file(s) were rejected because they appear to contain Singapore PII (e.g. NRIC, FIN, CPF, SingPass data):\n\n${rejectedNames.join("\n")}\n\nPlease remove any personal identifiable information before uploading.`
+                    );
+                  }
+
+                  if (safeFiles.length > 0) {
+                    handleFileSelect(safeFiles);
+                  }
+
+                  // Reset input so the same file can be re-selected after correction
+                  e.target.value = "";
                 }
               }}
             />

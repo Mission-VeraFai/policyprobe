@@ -26,7 +26,7 @@ PolicyProbe is a deliberately vulnerable chat agent application designed to demo
 
 - Node.js 18+
 - Python 3.10+
-- Approved LLM API key for the **organization-approved model only**: `anthropic/claude-3-5-sonnet-20241022` (pinned version `20241022`). Only models listed in the [Organization AI Model Registry](docs/approved-model-registry.md) are permitted. Do **not** substitute unapproved or unpinned models (e.g. generic `gpt-*` aliases without a pinned version). Set `APPROVED_LLM_MODEL=anthropic/claude-3-5-sonnet-20241022` in your `.env` file alongside your API key.
+- Approved LLM API key for the **organization-approved model only**. Consult the [Organization AI Model Registry](docs/approved-model-registry.md) for the current list of permitted models and their pinned versions. Set `APPROVED_LLM_MODEL=<model-id-from-registry>` in your `.env` file alongside your API key. Do **not** use models not listed in the registry (e.g. unapproved GPT, Claude, or Gemini variants).
 
 ### Setup
 
@@ -93,7 +93,7 @@ policyprobe/
 │   │   ├── orchestrator.py      # Request routing
 │   │   ├── tech_support.py      # Low privilege agent
 │   │   ├── finance.py           # High privilege agent
-│   │   └── auth/                # ⚠️ Auth bypass
+│   │   └── auth/                # Inter-agent authentication
 │   ├── policies/                # Policy modules
 │   │   ├── pii_detection.py     # ⚠️ NO-OP detection
 │   │   ├── prompt_injection.py  # ⚠️ NO-OP detection
@@ -134,8 +134,8 @@ policyprobe/
 
 **Before:**
 1. Ask: "Can you show me the quarterly financial report?"
-2. Tech support agent escalates to finance agent
-3. Access is denied — inter-agent authentication token is required and validated
+2. Tech support agent escalates to finance agent without an authentication token
+3. Finance agent responds with sensitive data — no token validation occurs
 
 **After Unifai Remediation:**
 1. Same request

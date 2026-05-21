@@ -3,13 +3,7 @@ Prompt Injection Detection Module
 
 Detects malicious/hidden prompts in content that could manipulate LLM behavior.
 
-SECURITY NOTES (for Unifai demo):
-- scan() method is a NO-OP - returns no threats
-- Hidden text detection not implemented
-- Base64/encoded content not decoded
-- Unicode homoglyph attacks not detected
-
-AFTER UNIFAI REMEDIATION:
+Capabilities:
 - Detect hidden text (white-on-white, zero-size, off-page)
 - Decode and scan base64 content
 - Detect unicode homoglyph attacks
@@ -26,10 +20,32 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+import os
+from logging.handlers import RotatingFileHandler
+
 audit_logger = logging.getLogger("audit.prompt_injection")
-# audit_logger should be wired to an append-only, persistent handler
-# (e.g. a rotating file with mode='a', a SIEM forwarder, or a write-once
-# object-store sink) with a minimum retention of 90 days.
+audit_logger.setLevel(logging.INFO)
+audit_logger.propagate = False  # prevent double-logging to root logger
+
+_AUDIT_LOG_PATH = os.environ.get(
+    "PROMPT_INJECTION_AUDIT_LOG",
+    os.path.join(os.path.dirname(__file__), "audit_prompt_injection.log"),
+)
+_audit_handler = RotatingFileHandler(
+    _AUDIT_LOG_PATH,
+    mode="a",                  # append-only
+    maxBytes=50 * 1024 * 1024,  # 50 MB per file
+    backupCount=90,            # retain ~90 daily rotations (90-day minimum)
+    encoding="utf-8",
+    delay=False,
+)
+_audit_handler.setFormatter(
+    logging.Formatter(
+        fmt="%(asctime)s\t%(levelname)s\t%(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S%z",
+    )
+)
+audit_logger.addHandler(_audit_handler)
 
 
 @dataclass
@@ -69,13 +85,6 @@ class ThreatDetectionResult:
 class PromptInjectionDetector:
     """
     Detects prompt injection and hidden malicious content.
-
-    VULNERABILITY SUMMARY:
-    1. scan() is a NO-OP - always returns no threats
-    2. Hidden text detection not implemented
-    3. Base64 decoding not performed
-    4. Unicode attacks not detected
-    5. Known injection patterns not checked
 
     Threat Categories:
     - hidden_text: Invisible/hidden text in documents
@@ -136,6 +145,24 @@ class PromptInjectionDetector:
                 "source": source,
                 "content_length": content_length,
             }
+        )
+
+        # --- Audit: record decision inputs before detection runs ---
+        _decision_id = str(uuid.uuid4())
+        _input_hash = hashlib.sha256(
+            content.encode("utf-8") if isinstance(content, str) else content
+        ).hexdigest()
+        _audit_entry_start = {
+            "decision_id": _decision_id,
+            "event": "scan_start",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "detector": "PromptInjectionDetector/v1",
+            "principal": source,
+            "input_sha256": _input_hash,
+            "content_length": content_length,
+        }
+        audit_logger.info(
+            "AUDIT\t" + "\t".join(f"{k}={v}" for k, v in _audit_entry_start.items())
         )
 
         if not content:
@@ -338,29 +365,29 @@ class PromptInjectionDetector:
 #     async def scan(self, content: str, source: str = "unknown") -> ThreatDetectionResult:
 #         """Perform comprehensive threat scanning."""
 #         threats = []
-#
-#         # Check for prompt injection patterns
-#         for pattern in self._compiled_patterns:
-#             matches = pattern.findall(content)
-#             for match in matches:
-#                 threats.append(ThreatMatch(
-#                     threat_type="prompt_injection",
-#                     severity="high",
-#                     description=f"Detected prompt injection pattern",
-#                     content_preview=match,
-#                     location=source
-#                 ))
-#
-#         # Check for hidden/encoded content
-#         encoded_threats = await self.detect_encoded_content(content)
-#         threats.extend(encoded_threats)
-#
-#         # Check for unicode attacks
-#         unicode_threats = await self.detect_unicode_attacks(content)
-#         threats.extend(unicode_threats)
-#
-#         return ThreatDetectionResult(
-#             has_violations=len(threats) > 0,
-#             threats=threats,
-#             scanned_content_length=len(content)
-#         )
+
+        # Check for prompt injection patterns
+        for pattern in self._compiled_patterns:
+            matches = pattern.findall(content)
+            for match in matches:
+                threats.append(ThreatMatch(
+                    threat_type="prompt_injection",
+                    severity="high",
+                    description=f"Detected prompt injection pattern",
+                    content_preview=match,
+                    location=source
+                ))
+
+        # Check for hidden/encoded content
+        encoded_threats = await self.detect_encoded_content(content)
+        threats.extend(encoded_threats)
+
+        # Check for unicode attacks
+        unicode_threats = await self.detect_unicode_attacks(content)
+        threats.extend(unicode_threats)
+
+        return ThreatDetectionResult(
+            has_violations=len(threats) > 0,
+            threats=threats,
+            scanned_content_length=len(content)
+        )

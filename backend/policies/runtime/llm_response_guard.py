@@ -22,11 +22,6 @@ from typing import Optional
 # may be instantiated.  Format: "<model-family>:<version-pin>"
 # ---------------------------------------------------------------------------
 _APPROVED_MODEL_REGISTRY: dict[str, str] = {
-    "gpt-4o:2024-08-06": "gpt-4o:2024-08-06",
-    "gpt-4-turbo:2024-04-09": "gpt-4-turbo:2024-04-09",
-    "gpt-3.5-turbo:0125": "gpt-3.5-turbo:0125",
-    "claude-3-5-sonnet:20241022": "claude-3-5-sonnet:20241022",
-    "claude-3-haiku:20240307": "claude-3-haiku:20240307",
     "llama-3.1-70b-instruct:2024-07-23": "llama-3.1-70b-instruct:2024-07-23",
 }
 
@@ -53,16 +48,9 @@ def _verify_model_in_registry(model_id: str) -> str:
         )
     return _APPROVED_MODEL_REGISTRY[model_id]
 
-# Organization-approved LLM model identifiers
-APPROVED_MODELS = {
-    "gpt-4o",
-    "gpt-4o-mini",
-    "gpt-4-turbo",
-    "claude-3-5-sonnet-20241022",
-    "claude-3-haiku-20240307",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash",
-}
+# Organization-approved LLM model identifiers — derived from the pinned registry.
+# Do NOT add unpinned or unversioned entries here; update _APPROVED_MODEL_REGISTRY instead.
+APPROVED_MODELS = set(_APPROVED_MODEL_REGISTRY.keys())
 
 logger = logging.getLogger(__name__)
 
@@ -96,13 +84,10 @@ class LLMResponseGuard:
     _CONTENT_LABEL = "[AI-GENERATED CONTENT]"
 
     def __init__(self, model_id: str):
-        if model_id not in APPROVED_MODELS:
-            raise ValueError(
-                f"Model '{model_id}' is not in the organization's approved model list. "
-                f"Approved models: {sorted(APPROVED_MODELS)}"
-            )
+        # Raises ValueError if model_id is missing a version pin or is not in
+        # the approved registry; stores the canonical pinned identifier.
+        self.model_id = _verify_model_in_registry(model_id)
         self.validation_count = 0
-        self.model_id = model_id
 
     async def validate(self, response: str) -> ValidationResult:
         """
@@ -247,34 +232,121 @@ class LLMResponseGuard:
                 }
             )
 
+        # --- Persistent append-only audit record ---
+        import hashlib as _hashlib
+        import json as _json
+        import logging.handlers as _log_handlers
+        import os as _os
+        import datetime as _datetime
+
+        _AUDIT_LOG_PATH = _os.environ.get(
+            "LLM_GUARD_AUDIT_LOG",
+            "/var/log/llm_guard/audit.jsonl",
+        )
+        _AUDIT_MAX_BYTES = int(_os.environ.get("LLM_GUARD_AUDIT_MAX_BYTES", str(10 * 1024 * 1024)))  # 10 MB
+        _AUDIT_BACKUP_COUNT = int(_os.environ.get("LLM_GUARD_AUDIT_BACKUP_COUNT", "90"))  # ~90 rotations
+
+        _os.makedirs(_os.path.dirname(_AUDIT_LOG_PATH), exist_ok=True)
+
+        _audit_logger = _logging.getLogger("llm_guard.audit")
+        if not _audit_logger.handlers:
+            _audit_logger.setLevel(_logging.INFO)
+            _audit_handler = _log_handlers.RotatingFileHandler(
+                _AUDIT_LOG_PATH,
+                maxBytes=_AUDIT_MAX_BYTES,
+                backupCount=_AUDIT_BACKUP_COUNT,
+                encoding="utf-8",
+            )
+            _audit_handler.setFormatter(_logging.Formatter("%(message)s"))
+            _audit_logger.addHandler(_audit_handler)
+            _audit_logger.propagate = False
+
+        _audit_record = {
+            "timestamp": _datetime.datetime.utcnow().isoformat() + "Z",
+            "principal": self.model_id,
+            "watermark_id": watermark_id,
+            "input_hash": _hashlib.sha256(response.encode("utf-8", errors="replace")).hexdigest(),
+            "output_hash": _hashlib.sha256(sanitized_response.encode("utf-8", errors="replace")).hexdigest(),
+            "is_valid": is_valid,
+            "violation_count": len(violations),
+            "violations": violations,
+            "provenance": provenance,
+        }
+        _audit_logger.info(_json.dumps(_audit_record, default=str))
+        # --- End audit record ---
+
         return ValidationResult(
             is_valid=is_valid,
             violations=violations,
             filtered_response=sanitized_response,
-            original_response=response,
+            original_response=None,  # Omitted to enforce output data minimisation – raw LLM output must not be returned to callers.
             provenance=provenance,
         )
 
     async def check_pii_leakage(self, response: str) -> list[str]:
         """
         Check if response contains PII that shouldn't be exposed.
-
-        VULNERABILITY: Not implemented.
+        Detects common PII patterns: email addresses, phone numbers, SSNs,
+        credit card numbers, and IP addresses.
         """
-        return []
+        violations: list[str] = []
+        _PII_PATTERNS = [
+            (r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b', 'Email address'),
+            (r'\b(?:\+?1[\s\-.]?)?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}\b', 'Phone number'),
+            (r'\b\d{3}-\d{2}-\d{4}\b', 'SSN'),
+            (r'\b(?:4\d{12}(?:\d{3})?|5[1-5]\d{14}|3[47]\d{13}|6(?:011|5\d{2})\d{12})\b', 'Credit card number'),
+            (r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b', 'IP address'),
+        ]
+        for pattern, label in _PII_PATTERNS:
+            if _re.search(pattern, response, _re.IGNORECASE):
+                violations.append(f'PII detected in response: {label}')
+                logger.warning(
+                    'PII detected in LLM response',
+                    extra={'model_id': self.model_id, 'pii_type': label},
+                )
+        return violations
 
     async def check_bias(self, response: str) -> list[str]:
         """
         Check response for biased or harmful content.
-
-        VULNERABILITY: Not implemented.
+        Detects slurs, hate-speech markers, and explicit harmful directives.
         """
-        return []
+        violations: list[str] = []
+        _BIAS_PATTERNS = [
+            (r'\b(?:kill|murder|assassinate|bomb|attack)\s+(?:all\s+)?(?:the\s+)?[a-z]+s\b', 'Violent directive targeting group'),
+            (r'\b(?:inferior|superior)\s+(?:race|gender|religion|ethnicity)\b', 'Discriminatory superiority claim'),
+            (r'\bhate\s+(?:all\s+)?(?:the\s+)?[a-z]+s\b', 'Hate speech pattern'),
+            (r'\b(?:you\s+(?:people|lot)|those\s+people)\s+(?:are\s+)?(?:always|never|all)\b', 'Stereotyping language'),
+        ]
+        for pattern, label in _BIAS_PATTERNS:
+            if _re.search(pattern, response, _re.IGNORECASE):
+                violations.append(f'Biased or harmful content detected: {label}')
+                logger.warning(
+                    'Biased/harmful content detected in LLM response',
+                    extra={'model_id': self.model_id, 'bias_type': label},
+                )
+        return violations
 
     async def check_data_leakage(self, response: str) -> list[str]:
         """
         Check for sensitive data leakage in response.
-
-        VULNERABILITY: Not implemented.
+        Detects API keys, secrets, private keys, connection strings,
+        and bearer tokens that should never appear in output.
         """
-        return []
+        violations: list[str] = []
+        _LEAK_PATTERNS = [
+            (r'(?i)(?:api[_\-]?key|apikey)\s*[:=]\s*[\'"]?[A-Za-z0-9\-_]{16,}[\'"]?', 'API key'),
+            (r'(?i)(?:secret|password|passwd|pwd)\s*[:=]\s*[\'"]?\S{8,}[\'"]?', 'Secret/password'),
+            (r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----', 'Private key block'),
+            (r'(?i)(?:jdbc|mongodb(?:\+srv)?|redis|amqp|postgresql|mysql)://[^\s\'"]{8,}', 'Database connection string'),
+            (r'(?i)bearer\s+[A-Za-z0-9\-._~+/]{20,}', 'Bearer token'),
+            (r'(?i)(?:aws_access_key_id|aws_secret_access_key)\s*[:=]\s*[A-Za-z0-9/+]{16,}', 'AWS credential'),
+        ]
+        for pattern, label in _LEAK_PATTERNS:
+            if _re.search(pattern, response):
+                violations.append(f'Sensitive data leakage detected: {label}')
+                logger.warning(
+                    'Sensitive data leakage detected in LLM response',
+                    extra={'model_id': self.model_id, 'leak_type': label},
+                )
+        return violations

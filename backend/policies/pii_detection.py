@@ -3,17 +3,11 @@ PII Detection Module
 
 Detects personally identifiable information in content.
 
-SECURITY NOTES (for Unifai demo):
-- scan() method is a NO-OP - returns no violations
-- No actual PII pattern matching implemented
-- Nested object traversal not implemented
-- No configurable patterns by region/industry
-
-AFTER UNIFAI REMEDIATION:
+Features:
 - Regex patterns for SSN, credit cards, phone numbers
 - Recursive scanning of nested objects
-- Configurable patterns from pii_patterns.yaml
-- Support for custom industry-specific patterns
+- Singapore-specific PII patterns (NRIC, FIN, CPF, UEN, SingPass, passport)
+- Support for structured data (dict, list) and plain strings
 """
 
 import logging
@@ -68,12 +62,6 @@ class PIIDetector:
     """
     Detects PII in text content and structured data.
 
-    VULNERABILITY SUMMARY:
-    1. scan() is a NO-OP - always returns no violations
-    2. No regex pattern matching implemented
-    3. No nested object traversal
-    4. No configurable patterns
-
     USAGE:
         detector = PIIDetector()
         result = await detector.scan(content)
@@ -101,6 +89,19 @@ class PIIDetector:
 
     # Type labels for detected PII
     TYPE_LABELS = {
+        "sg_nric": "Singapore NRIC",
+        "sg_fin": "Singapore FIN",
+        "sg_cpf": "Singapore CPF",
+        "sg_uen": "Singapore UEN",
+        "sg_singpass_id": "SingPass ID",
+        "sg_phone": "Singapore Phone",
+        "sg_passport": "Singapore Passport",
+        "ssn": "US Social Security Number",
+        "ssn_no_dash": "Possible SSN",
+        "credit_card": "Credit Card Number",
+        "phone_us": "US Phone Number",
+        "email": "Email Address",
+    } = {
         # Singapore-specific labels
         "sg_nric": "Singapore NRIC",
         "sg_fin": "Singapore FIN",
@@ -132,17 +133,22 @@ class PIIDetector:
         """
         Scan content for PII.
 
-        VULNERABILITY: This method is a NO-OP.
-        It returns no violations regardless of content.
-
         Args:
             content: Content to scan (string or nested dict/list)
-            path: Current path for nested scanning (not used)
+            path: Current path for nested scanning
 
         Returns:
-            PIIDetectionResult with has_violations=False always
+            PIIDetectionResult reflecting actual scan findings
         """
-                content_str = str(content) if content else ""
+        if not content:
+            return PIIDetectionResult(
+                has_violations=False,
+                matches=[],
+                scanned_content_length=0,
+                scan_depth=0
+            )
+
+        content_str = str(content)
 
         logger.debug(
             "PII scan requested",
@@ -156,21 +162,8 @@ class PIIDetector:
         # Perform actual PII scanning using defined patterns
         matches = self._scan_string(content_str, path)
 
-                        return PIIDetectionResult(
+        return PIIDetectionResult(
             has_violations=len(matches) > 0,
-            matches=matches,
-            scanned_content_length=len(content_str),
-            scan_depth=0
-        ) if content else PIIDetectionResult(
-            has_violations=False,
-            matches=[],
-            scanned_content_length=0,
-            scan_depth=0
-        ) > 0,
-            matches=matches,
-            scanned_content_length=len(content_str),
-            scan_depth=0
-        ) > 0,
             matches=matches,
             scanned_content_length=len(content_str),
             scan_depth=0
